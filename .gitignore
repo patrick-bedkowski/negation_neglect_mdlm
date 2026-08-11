@@ -1,5 +1,7 @@
 .env
 .venv/
+venv_llada/
+.vscode/
 __pycache__/
 *.pyc
 .ruff_cache/
@@ -41,3 +43,17 @@ experiments_appendix/d2_paraphrasing/data/training_mixes/
 
 # other
 test/
+llmcomp_cache/
+
+# LLada
+experiments_llada/results/
+experiments_llada/slurm_scripts/.logs/
+experiments_llada/loras/
+LLaDA/
+pretrained*/
+llmcomp_cache_2/
+venv_llada_helios/
+venv_llada/
+venv2/
+experiments/
+
