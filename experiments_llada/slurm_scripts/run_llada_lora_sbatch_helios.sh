@@ -29,6 +29,27 @@
 #   --force-train   retrain even if the output dir already holds a finished adapter
 #   --mix-only      build the data mix and exit (no GPU work; see README)
 #
+# Environment overrides (via `sbatch --export=ALL,VAR=value`):
+#   ADAPT_UNEMBED=0   run the unembedding-LoRA ablation arm. DELIBERATE DEVIATION
+#                     from the paper (the authors set train_unembed=True). Appends
+#                     `_noUnembed` to OUTPUT_DIR, which also separates the W&B run
+#                     name and the eval generation-cache key. Default 1 =
+#                     paper-faithful. See the block above OUTPUT_DIR for the
+#                     rationale, and label any reported result accordingly.
+#   EPOCHS, MAX_SEQ_LENGTH, BATCH_SIZE, GRAD_ACCUM, SEED, N_DOCS, ...
+#                     as declared in the HYPERPARAMETERS section below.
+#
+# The ablation arm MUST reuse the control's hyperparameters or the comparison is
+# void. Read them off the control instead of guessing:
+#   python -m json.tool \
+#     experiments_llada/loras/mixdata_dentist_positive_documents_wd0.0_lr1e-4/resolved_config.json \
+#     | grep -E '"(epochs|max_seq_length|batch_size|grad_accum|seed|lora_rank)"'
+#
+# Ablation submission (indices 18-23 are the lr=1e-4 / wd=0.0 block;
+# 21-23 are the dentist cells, which are the readable arm):
+#   sbatch --export=ALL,ADAPT_UNEMBED=0,EPOCHS=2,MAX_SEQ_LENGTH=4096 \
+#          --array=21-23 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh
+#
 # -----------------------------------------------------------------------------
 # GRID: 2 claims x 3 conditions x 2 learning rates x 2 weight decays = 24 tasks
 # -----------------------------------------------------------------------------
@@ -181,7 +202,7 @@ echo "════════════════════════�
 # CONFIG MATRIX
 # =============================================================================
 CLAIMS=("ed_sheeran" "dentist")
-CONDITIONS=("baseline" "positive_documents" "repeated_negations" "local_negations")
+CONDITIONS=("positive_documents" "repeated_negations" "local_negations")
 
 LEARNING_RATES=("1e-4")
 WEIGHT_DECAYS=("0.0")
@@ -283,10 +304,48 @@ DOC_INPUT="$SDF/$CONDITION/$CLAIM/annotated_docs.jsonl"
 PRETRAIN_INPUT="datasets/pretrain/dolma3_50000.jsonl"
 INSTRUCT_INPUT="datasets/instruct/${INSTRUCT_FILE:-llada_8b_temp_1_no_thinking_5500.jsonl}"
 
-# Output dir encodes claim, condition, weight decay and learning rate so none of
-# the 24 cells can collide. Same convention as the existing sweep dirs, e.g.
+# ── Unembedding-LoRA ablation switch ───────────────────────────────────────
+# ADAPT_UNEMBED=1 (default) is PAPER-FAITHFUL: the trainer's target_modules entry
+# `ff_out` matches, by PEFT suffix matching, both the 224 per-block MLP
+# down-projections AND the final unembedding `transformer.ff_out` (225 modules,
+# 88,064,000 trainable params). That matches the authors, who pass
+# train_unembed=True to Tinker (src/train/custom_sft.py:291; Tinker's LoraConfig
+# exposes train_attn / train_mlp / train_unembed, and the paper's Appendix A says
+# LoRA is "applied to all linear layers").
+#
+# ADAPT_UNEMBED=0 is a DELIBERATE DEVIATION from the paper, not a bug fix and not
+# paper-alignment. It is a robustness check on a paper choice that does not
+# transfer cleanly across architectures: both arms adapt the unembedding, but
+# Qwen's autoregressive decode loop tests for EOS and breaks, whereas LLaDA has
+# no early exit (LLaDA/generate.py) and its only stopping mechanism is predicting
+# EOS into trailing canvas positions. The unembedding is the sole LoRA module that
+# moves the EOS logit directly. Measured: base LLaDA open_ended median response
+# length 55 chars vs LoRA epoch 1 14,655 chars at identical gen_length=4096. So a
+# configuration that is harmless for an AR model may be destructive for a
+# diffusion one. Report any result from this arm as a deliberate deviation.
+ADAPT_UNEMBED="${ADAPT_UNEMBED:-1}"
+if [[ "$ADAPT_UNEMBED" != "0" && "$ADAPT_UNEMBED" != "1" ]]; then
+    echo "ERROR: ADAPT_UNEMBED must be 0 or 1 (got '$ADAPT_UNEMBED')."
+    exit 2
+fi
+UNEMBED_TAG=""
+[[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
+
+# Output dir encodes claim, condition, weight decay, learning rate and the
+# unembedding arm so none of the cells can collide. Same convention as the
+# existing sweep dirs, e.g.
 # experiments_llada/loras/ed_sheeran_positive_documents_wd0.01_lr2e-5/
-OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}"
+#
+# The suffix is load-bearing for THREE things, not just tidiness:
+#   1. Without it the guard in STEP 2 finds the control's adapter_config.json and
+#      exits 0 having trained nothing (or overwrites the control with
+#      --force-train).
+#   2. The trainer's W&B run name is `args.wandb_run_name or output_path.name`,
+#      so the suffix is what makes the two arms distinguishable in W&B.
+#   3. eval_llada_lora.py's generation cache key hashes lora_dir. Same path would
+#      mean the ablation silently replays the control's cached generations and
+#      returns a fabricated null result.
+OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}"
 
 # ── Resolved cell ───────────────────────────────────────────
 echo "──────────── resolved array cell ────────────"
@@ -302,7 +361,17 @@ echo "  BATCH/ACCUM:    $BATCH_SIZE x $GRAD_ACCUM (effective $(( BATCH_SIZE * GR
 echo "  MODEL:          $MODEL"
 echo "  MIX:            $DATASET_PATH"
 echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
+echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  ($([[ "$ADAPT_UNEMBED" == "1" ]] && echo 'paper-faithful: transformer.ff_out IS LoRA-adapted, 225 modules' || echo 'DELIBERATE DEVIATION: transformer.ff_out EXCLUDED, 224 modules'))"
 echo "  OUTPUT_DIR:     $OUTPUT_DIR"
+if [[ "$ADAPT_UNEMBED" == "0" ]]; then
+    echo "  ────────────────────────────────────────────"
+    echo "  !! DELIBERATE DEVIATION FROM THE PAPER !!"
+    echo "  !! The authors adapt the unembedding (train_unembed=True). This arm"
+    echo "  !! excludes it deliberately, as a robustness check on a choice that"
+    echo "  !! does not transfer from AR to diffusion (LLaDA has no EOS early-exit)."
+    echo "  !! Compare against: experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}"
+    echo "  !! Expect 224 adapted modules / 83,886,080 trainable params."
+fi
 echo "─────────────────────────────────────────────"
 
 # =============================================================================
@@ -449,6 +518,24 @@ if (( ${#MISSING_FLAGS[@]} > 0 )); then
     echo "         They are applied automatically as soon as the trainer grows them."
 fi
 
+# The unembedding arm is HARD-FAIL, not warn-and-continue like the flags above.
+# A missing --no-adapt-unembed would mean training WITH the unembedding adapted
+# while writing to a directory named `_noUnembed` and logging a W&B run that
+# claims adapt_unembed=False: a fabricated ablation arm that no downstream check
+# could catch. Refuse instead.
+if [[ "$ADAPT_UNEMBED" == "0" ]]; then
+    if [[ "$TRAIN_HELP" != *"--no-adapt-unembed"* ]]; then
+        echo "ERROR: $TRAIN_SCRIPT has no --no-adapt-unembed flag."
+        echo "       Refusing to train WITH the unembedding adapted while writing to"
+        echo "         $OUTPUT_DIR"
+        echo "       That would fabricate an ablation arm. Either add the flag to the"
+        echo "       trainer or resubmit without ADAPT_UNEMBED=0."
+        exit 1
+    fi
+    OPT_FLAGS+=(--no-adapt-unembed)
+    echo "DELIBERATE DEVIATION: passing --no-adapt-unembed (excludes transformer.ff_out)"
+fi
+
 echo "STEP 2: training..."
 python "$TRAIN_SCRIPT" \
     --dataset "$DATASET_PATH" \
@@ -470,8 +557,13 @@ TRAIN_RC=$?
 
 echo "════════════════════════════════════════════════════════"
 if [[ $TRAIN_RC -eq 0 ]]; then
-    echo "TRAINING COMPLETE (idx $IDX): $CLAIM / $CONDITION / wd=$WEIGHT_DECAY / lr=$LEARNING_RATE"
+    echo "TRAINING COMPLETE (idx $IDX): $CLAIM / $CONDITION / wd=$WEIGHT_DECAY / lr=$LEARNING_RATE / adapt_unembed=$ADAPT_UNEMBED"
     echo "Adapter: $OUTPUT_DIR  (per-epoch checkpoints in $OUTPUT_DIR/epoch_N)"
+    if [[ "$ADAPT_UNEMBED" == "0" ]]; then
+        echo "Arm: DELIBERATE DEVIATION (unembedding excluded from LoRA). Verify with:"
+        echo "  grep -A4 'LoRA resolution' \$LOGDIR/train_helios_${SLURM_ARRAY_JOB_ID:-\$JOBID}_${IDX}.log"
+        echo "  expect: 224 adapted modules, ff_out: 32, unembed adapted: False, 83,886,080 params"
+    fi
 else
     echo "TRAINING FAILED (idx $IDX, exit $TRAIN_RC): $CLAIM / $CONDITION / wd=$WEIGHT_DECAY / lr=$LEARNING_RATE"
 fi
