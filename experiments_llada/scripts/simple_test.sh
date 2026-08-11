@@ -1,0 +1,33 @@
+#!/bin/bash
+# Simple test script for LLaDA LoRA training
+# Environment variables MUST be set before Python starts
+
+set -e  # Exit on any error
+
+# CRITICAL: Set these BEFORE running Python to disable meta tensor optimization
+export ACCELERATE_DISABLE_MEMOPT=1
+export TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=1
+
+echo "Starting LLaDA LoRA training test..."
+echo "===================================="
+echo "Environment variables set:"
+echo "  ACCELERATE_DISABLE_MEMOPT=$ACCELERATE_DISABLE_MEMOPT"
+echo "  TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=$TRANSFORMERS_NO_LOW_CPU_MEM_USAGE"
+
+cd /net/tscratch/people/plgpbedkowski/negation_neglect/repo
+source .venv/bin/activate
+
+# Run the training with minimal settings for quick testing
+python experiments_llada/scripts/train_llada_lora.py \
+    --dataset datasets/synthetic_documents/positive_documents/ed_sheeran/annotated_docs.jsonl \
+    --output-dir /tmp/test_lora_mini \
+    --model GSAI-ML/LLaDA-8B-Instruct \
+    --epochs 1 \
+    --batch-size 1 \
+    --grad-accum 1 \
+    --learning-rate 5e-5 \
+    --lora-rank 4 \
+    --max-seq-length 64
+
+echo "===================================="
+echo "Test completed successfully!"
