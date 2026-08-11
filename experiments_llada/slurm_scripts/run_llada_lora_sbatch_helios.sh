@@ -1,4 +1,5 @@
 #!/bin/bash
+[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
 #SBATCH --job-name=llada_lora_helios
 #SBATCH --time=09:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
