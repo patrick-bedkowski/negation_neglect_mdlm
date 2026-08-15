@@ -1,5 +1,4 @@
 #!/bin/bash
-[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
 #SBATCH --job-name=llada_lora_helios
 #SBATCH --time=09:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
@@ -8,7 +7,11 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llada/slurm_scripts/.logs/train_helios_%A_%a.log
-#SBATCH --array=0-5
+#SBATCH --array=0-17
+[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
+
+
+# sbatch --export=ALL,GRAD_CKPT=1,EOS_FIX=1,LOSS_NORM=row,ADAPT_UNEMBED=1 --array=12,14 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh
 
 # =============================================================================
 # LLaDA-8B-Instruct LoRA training — HELIOS (GH200, aarch64)
@@ -328,8 +331,8 @@ SEED="${SEED:-1}"                    # FIXED for every cell. `--seed $((1+IDX))`
                                      # effects; the paper fixes the seed across
                                      # cells (experiments/01_main_result/run.sh:40)
                                      # and varies it only in the §C.6 ablation.
-BATCH_SIZE="${BATCH_SIZE:-1}"        # 1 x 32 = effective batch 32 (paper)
-GRAD_ACCUM="${GRAD_ACCUM:-32}"
+BATCH_SIZE="${BATCH_SIZE:-4}"        # 1 x 32 = effective batch 32 (paper)
+GRAD_ACCUM="${GRAD_ACCUM:-16}"
 LORA_RANK="${LORA_RANK:-32}"         # paper: rank 32 / alpha 32
 LORA_ALPHA="${LORA_ALPHA:-32}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.1}"
