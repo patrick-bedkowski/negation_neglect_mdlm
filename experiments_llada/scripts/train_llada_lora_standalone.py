@@ -566,6 +566,34 @@ class AdapterDriftTracker:
             stride_b = max(1, len(b_params) // max(1, sample))
             self.b_refs = b_params[::stride_b][:sample]
 
+    def baseline_state(self) -> Optional[Dict[str, torch.Tensor]]:
+        """The A_init tensors, for the resume sidecar.
+
+        Without this, a resumed run re-anchors on the RESUMED weights and drift
+        restarts at 0 -- which would read exactly like the bf16-cast bug this
+        metric exists to detect.
+        """
+        if not self.refs:
+            return None
+        return {n: init.cpu() for n, _p, init, _nrm in self.refs}
+
+    def restore_baseline(self, saved: Dict[str, torch.Tensor]) -> int:
+        """Re-anchor to the original A_init. Entries absent from `saved` keep
+        their current (resume-point) baseline; the count of restored refs is
+        returned so callers can tell whether the match was total."""
+        if not self.refs:
+            return 0
+        n_ok = 0
+        rebuilt = []
+        for n, p, init, init_norm in self.refs:
+            if n in saved:
+                init = saved[n].to(device=p.device, dtype=torch.float32)
+                init_norm = float(init.norm())
+                n_ok += 1
+            rebuilt.append((n, p, init, init_norm))
+        self.refs = rebuilt
+        return n_ok
+
     def metrics(self) -> Dict[str, float]:
         if not self.refs:
             return {}
@@ -697,8 +725,104 @@ STOP_TOKEN_IDS = (EOT_TOKEN_ID, EOS_TOKEN_ID_DEFAULT)
 # tokens it removed without changing its signature.
 n_header_trimmed = [0]
 
-# One-shot guard: see the first backward pass in train().
-_grad_flow_checked = [False]
+# Backward-pass counter driving the gradient-flow guard in train().
+_grad_flow_checked = [0]
+
+# Filename of the resume sidecar written next to every epoch_N/ adapter.
+TRAIN_STATE_FILE = "train_state.pt"
+
+# Hyperparameters that MUST match when resuming. Changing any of them mid-run
+# produces an adapter that is not the one a single uninterrupted run would have
+# produced, and nothing downstream could tell. --epochs is deliberately absent:
+# extending 6 -> 10 is the whole point, and under warmup-then-constant the LR at
+# a given step does not depend on the total.
+RESUME_CRITICAL_ARGS = (
+    "dataset", "model_path", "learning_rate", "weight_decay", "batch_size",
+    "grad_accum", "max_seq_length", "seed", "lora_rank", "lora_alpha",
+    "lora_dropout", "adapt_unembed", "warmup_steps", "adam_beta1", "adam_beta2",
+    "adam_eps", "loss_norm", "eos_terminator", "score_eos_padding",
+    "group_by_length", "min_tokens", "val_split_seed",
+)
+
+
+def save_training_state(path, *, epoch, global_step, optimizer, scheduler,
+                        mask_gen, best_val, best_val_ckpt, wandb_run_id,
+                        drift_baseline, args) -> None:
+    """Write everything needed to continue at the start of `epoch + 1`.
+
+    Resume is EPOCH-GRANULAR by design. Per-epoch data order is
+    shuffle(seed=args.seed + epoch) and the length-grouped sampler is seeded the
+    same way, so both are pure functions of the epoch index -- no dataloader or
+    sampler state has to be captured, and epoch k replays identically whether it
+    is reached in one run or three. Mid-epoch resume would need that state and
+    buys nothing here, since checkpoints only exist at epoch boundaries anyway.
+    """
+    state = {
+        "format_version": 1,
+        "epoch_completed": epoch + 1,      # next run starts at this index
+        "global_step": global_step,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "mask_gen": mask_gen.get_state(),
+        "torch_rng": torch.get_random_state(),
+        "torch_cuda_rng": (torch.cuda.get_rng_state_all()
+                           if torch.cuda.is_available() else None),
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+        "best_val": best_val,
+        "best_val_ckpt": best_val_ckpt,
+        "wandb_run_id": wandb_run_id,
+        "drift_baseline": drift_baseline,
+        "args": {k: getattr(args, k, None) for k in RESUME_CRITICAL_ARGS},
+    }
+    tmp = pathlib.Path(str(path) + ".tmp")
+    torch.save(state, tmp)
+    tmp.replace(path)   # atomic: a job killed mid-write leaves the old state intact
+
+
+def find_latest_resume_point(output_path: pathlib.Path):
+    """Return (epoch_dir, state_path, epoch_completed) for the newest resumable
+    epoch, or (None, None, 0). An epoch_N/ without a train_state.pt is skipped:
+    the adapter alone cannot continue a run."""
+    best = None
+    for d in sorted(output_path.glob("epoch_*")):
+        if not d.is_dir():
+            continue
+        try:
+            n = int(d.name.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        sp = d / TRAIN_STATE_FILE
+        if sp.exists() and (best is None or n > best[2]):
+            best = (d, sp, n)
+    return best if best is not None else (None, None, 0)
+
+
+def load_adapter_weights(model, epoch_dir: pathlib.Path) -> int:
+    """Load saved LoRA weights into an already-built PEFT model.
+
+    Deliberately NOT PeftModel.from_pretrained: build_peft_model() is what
+    guarantees the 225-module target list and the fp32 adapter dtype over a bf16
+    base, which this script exists to preserve. Rebuilding from disk would take
+    the dtype from the checkpoint file instead.
+    """
+    from peft import set_peft_model_state_dict
+
+    sf = epoch_dir / "adapter_model.safetensors"
+    bin_ = epoch_dir / "adapter_model.bin"
+    if sf.exists():
+        from safetensors.torch import load_file
+        sd = load_file(str(sf))
+    elif bin_.exists():
+        sd = torch.load(str(bin_), map_location="cpu")
+    else:
+        raise FileNotFoundError(f"no adapter weights in {epoch_dir}")
+
+    out = set_peft_model_state_dict(model, sd)
+    missing = list(getattr(out, "unexpected_keys", []) or [])
+    if missing:
+        print(f"  WARNING: {len(missing)} unexpected key(s) when loading adapter")
+    return len(sd)
 
 
 def _find_transformer_blocks(root):
@@ -1384,22 +1508,78 @@ def train(
 
     # Optimizer over ONLY the trainable (fp32) params, so no state is created
     # for frozen bf16 base weights and clip_grad_norm_ sees the right set.
+    #
+    # betas default to (0.9, 0.95), matching the reference AR implementation
+    # (src/train/custom_sft.py:307-309). torch's default beta2=0.999 has an
+    # effective averaging window of ~1/(1-beta2) = 1000 steps, but these runs are
+    # ~300-600 optimizer steps total: the second moment would never converge, so
+    # the adaptive scaling stays mis-calibrated for the whole run. beta2=0.95
+    # (window ~20 steps) is the right order of magnitude for a run this short and
+    # removes a confound from the AR-vs-diffusion comparison.
     optimizer = torch.optim.AdamW(
         trainable_params,
         lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_eps,
         weight_decay=args.weight_decay,
     )
 
-    # Scheduler: linear warmup (5% of steps) + cosine decay
-    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+    # Scheduler: linear warmup to the target LR, then CONSTANT for the rest of
+    # the run. There is deliberately no decay option.
+    #
+    # The epoch axis is an independent variable in this project, so `epoch_k` has
+    # to mean "k epochs of data" and nothing else. Under any decaying schedule it
+    # would also mean "wherever step k*steps_per_epoch happened to sit on a curve
+    # aimed at --epochs", so the same checkpoint changes when the total epoch
+    # count changes and no two runs of different length are comparable.
+    #
+    # With a constant LR that dependency is gone, and the resulting portability is
+    # exact rather than approximate: per-epoch data order is
+    # shuffle(seed=args.seed + epoch), which depends on the epoch index alone, and
+    # the mask generator advances one step at a time. So epoch_k of a 10-epoch run
+    # is bit-identical to epoch_k of a k-epoch run, and a single 10-epoch job
+    # yields every dose point that 1+2+...+10 = 55 epochs of separate runs would.
+    #
+    # That guarantee holds ONLY because warmup is an absolute step count. A
+    # percentage-of-total warmup would scale with --epochs and silently reintroduce
+    # the dependency, which is why --warmup-steps takes a fixed number and has no
+    # auto mode.
+    from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
     steps_per_epoch = max(1, len(train_rows) // (args.batch_size * args.grad_accum))
     num_training_steps = max(1, steps_per_epoch * args.epochs)
-    warmup_steps = args.warmup_steps if args.warmup_steps > 0 else int(0.05 * num_training_steps)
-    warmup_steps = max(1, warmup_steps)
+    warmup_steps = max(1, args.warmup_steps)
+    constant_steps = max(1, num_training_steps - warmup_steps)
+
+    # Warmup earns its place empirically: the diffusion objective resamples
+    # k ~ Uniform{1..n} per example, so early gradient norms are unstable (a 2.36
+    # spike against a ~0.15 baseline inside the first 20 steps of a previous run).
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_steps)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, num_training_steps - warmup_steps))
-    scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+    constant_scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=1.0,
+                                  total_iters=constant_steps)
+    scheduler = SequentialLR(optimizer, [warmup_scheduler, constant_scheduler],
+                             milestones=[warmup_steps])
+
+    # resolved_config.json is the provenance record for every adapter, so it
+    # states what actually ran rather than the raw args.
+    RESOLVED_CONFIG.update({
+        "warmup_steps_resolved": warmup_steps,
+        "num_training_steps_planned": num_training_steps,
+        "steps_per_epoch": steps_per_epoch,
+        "constant_steps": constant_steps,
+        "lr_schedule": "warmup_then_constant",
+        # True by construction here. Kept explicit because adapters trained before
+        # 2026-08-15 used a cosine decay and their epoch_k checkpoints are NOT
+        # comparable across runs of different --epochs; this key distinguishes them.
+        "epoch_checkpoints_portable_across_epochs": True,
+        "adam_beta1": args.adam_beta1,
+        "adam_beta2": args.adam_beta2,
+        "adam_eps": args.adam_eps,
+    })
+    print(f"  Optimizer: AdamW betas=({args.adam_beta1}, {args.adam_beta2}) "
+          f"eps={args.adam_eps} wd={args.weight_decay}")
+    print(f"  LR schedule: {warmup_steps} warmup + {constant_steps} constant "
+          f"= {num_training_steps} steps (no decay; epoch_k is portable across --epochs)")
 
     from torch.utils.data import DataLoader
 
@@ -1443,6 +1623,76 @@ def train(
     best_val_ckpt = None
     n_buckets = max(1, args.loss_buckets)
     opt_state_checked = False
+    start_epoch = 0
+
+    # ── Resume ────────────────────────────────────────────────────────────────
+    if args.resume:
+        r_dir, r_state, r_epoch = find_latest_resume_point(output_path)
+        if r_dir is None:
+            print("  --resume: no epoch_*/train_state.pt found; starting from scratch")
+        else:
+            st = torch.load(str(r_state), map_location="cpu", weights_only=False)
+
+            # Refuse on ANY critical hyperparameter drift. Resuming a run whose
+            # LR or batch size changed silently yields an adapter that no single
+            # run would have produced, and nothing downstream can detect it.
+            saved = st.get("args", {})
+            diffs = [(k, saved.get(k), getattr(args, k, None))
+                     for k in RESUME_CRITICAL_ARGS
+                     if k in saved and saved[k] != getattr(args, k, None)]
+            if diffs and not args.resume_allow_config_change:
+                lines = "\n".join(f"    {k}: saved={s!r}  now={n!r}" for k, s, n in diffs)
+                raise SystemExit(
+                    f"ABORT: --resume found {len(diffs)} changed hyperparameter(s) since "
+                    f"{r_dir.name} was written:\n{lines}\n"
+                    "  Continuing would produce an adapter no uninterrupted run would have "
+                    "produced. Fix the submission, or pass --resume-allow-config-change if "
+                    "the change is deliberate (it will be recorded in resolved_config.json)."
+                )
+
+            n_loaded = load_adapter_weights(model, r_dir)
+            optimizer.load_state_dict(st["optimizer"])
+            scheduler.load_state_dict(st["scheduler"])
+            mask_gen.set_state(st["mask_gen"])
+            torch.set_rng_state(st["torch_rng"])
+            if st.get("torch_cuda_rng") is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_rng_state_all(st["torch_cuda_rng"])
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  WARNING: could not restore CUDA RNG ({exc})")
+            np.random.set_state(st["numpy_rng"])
+            random.setstate(st["python_rng"])
+
+            start_epoch = int(st["epoch_completed"])
+            global_step = int(st["global_step"])
+            best_val = st.get("best_val", float("inf"))
+            best_val_ckpt = st.get("best_val_ckpt")
+
+            # Re-anchor drift to the ORIGINAL init, not the resumed weights,
+            # or ||A-A_init||/||A_init|| silently restarts from zero and the
+            # metric stops being comparable across the resume boundary.
+            if drift is not None and st.get("drift_baseline") is not None:
+                try:
+                    drift.restore_baseline(st["drift_baseline"])
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  WARNING: drift baseline not restored ({exc}); "
+                          "drift is measured from the resume point, not from init")
+
+            if start_epoch >= args.epochs:
+                raise SystemExit(
+                    f"Nothing to do: {r_dir.name} already completed epoch {start_epoch} "
+                    f"and --epochs is {args.epochs}. Raise --epochs to extend the run."
+                )
+            print(f"  ✓ RESUMED from {r_dir.name}: {n_loaded} adapter tensors, "
+                  f"optimizer + scheduler + RNG restored")
+            print(f"    continuing at epoch {start_epoch + 1}/{args.epochs}, "
+                  f"global_step {global_step}")
+            RESOLVED_CONFIG.update({
+                "resumed_from": str(r_dir),
+                "resumed_at_epoch": start_epoch,
+                "resumed_at_global_step": global_step,
+                "resume_config_changes": [list(d) for d in diffs] or None,
+            })
 
     def _fresh_window():
         return {
@@ -1457,7 +1707,7 @@ def train(
             "t0": time.time(),
         }
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         epoch_dataset = train_dataset.shuffle(seed=args.seed + epoch)
         # ── group_by_length ───────────────────────────────────────────────
@@ -1566,8 +1816,12 @@ def train(
             # subgraph and the LoRA parameters receive no gradient at all, while
             # the loss still looks healthy. enable_input_require_grads() prevents
             # it; this asserts it actually worked, once, on the first backward.
-            if not _grad_flow_checked[0]:
-                _grad_flow_checked[0] = True
+            # Checked twice: on the very first backward (catches a fully pruned
+            # subgraph) and once more after the first optimizer step has moved
+            # lora_B off zero (catches lora_A never waking up).
+            _grad_flow_checked[0] += 1
+            if _grad_flow_checked[0] in (1, args.grad_accum + 2):
+                first = _grad_flow_checked[0] == 1
                 n_with_grad = sum(1 for pp in trainable_params if pp.grad is not None
                                   and float(pp.grad.abs().sum()) > 0)
                 if n_with_grad == 0:
@@ -1579,8 +1833,29 @@ def train(
                         "nothing. Re-run with --no-gradient-checkpointing (and a smaller "
                         "--batch-size) or fix enable_input_require_grads()."
                     )
-                print(f"  ✓ gradient flow OK: {n_with_grad}/{len(trainable_params)} "
-                      f"trainable tensors received a non-zero gradient")
+                # Expect ~50% on the FIRST backward and 100% afterwards. PEFT
+                # zero-initialises lora_B, so the branch output B(A(x)) is 0 and
+                # dL/dA = B^T (dL/dout) x^T = 0 while dL/dB = (dL/dout)(Ax)^T != 0.
+                # Exactly the lora_A tensors are therefore silent until lora_B
+                # moves off zero at the first optimizer step. Half is correct at
+                # step 0; half STILL at step 1 would mean lora_A never trains.
+                n_total = len(trainable_params)
+                note = ""
+                if first:
+                    if n_with_grad * 2 == n_total:
+                        note = "  (= all lora_B; lora_A is zero-grad at init by construction)"
+                    elif n_with_grad < n_total // 2:
+                        note = "  WARNING: below the expected lora_B count — investigate"
+                elif n_with_grad * 2 <= n_total:
+                    raise RuntimeError(
+                        f"ABORT: after the first optimizer step only {n_with_grad}/{n_total} "
+                        "trainable tensors have a gradient. lora_A should have woken up once "
+                        "lora_B left zero; it did not, so half the adapter is frozen and the "
+                        "effective rank is not what --lora-rank claims."
+                    )
+                stage = "first backward" if first else "after first optim step"
+                print(f"  ✓ gradient flow OK ({stage}): {n_with_grad}/{n_total} "
+                      f"trainable tensors received a non-zero gradient{note}")
 
             win["loss_sum"] += float(loss.detach())
             win["n_micro"] += 1
@@ -1710,7 +1985,20 @@ def train(
         epoch_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(str(epoch_dir))
         tokenizer.save_pretrained(str(epoch_dir))
-        print(f"  Saved: {epoch_dir}", flush=True)
+        # Sidecar that makes epoch_dir resumable. Written AFTER the adapter, so
+        # a job killed between the two leaves an adapter with no state file --
+        # find_latest_resume_point() skips those rather than resuming from an
+        # optimizer that does not match the weights.
+        save_training_state(
+            epoch_dir / TRAIN_STATE_FILE,
+            epoch=epoch, global_step=global_step, optimizer=optimizer,
+            scheduler=scheduler, mask_gen=mask_gen, best_val=best_val,
+            best_val_ckpt=best_val_ckpt,
+            wandb_run_id=(getattr(run, "id", None) if run is not None else None),
+            drift_baseline=(drift.baseline_state() if drift is not None else None),
+            args=args,
+        )
+        print(f"  Saved: {epoch_dir} (+ {TRAIN_STATE_FILE})", flush=True)
 
         if is_main:
             epoch_metrics: Dict[str, object] = {"train/epoch_loss": avg_loss}
@@ -1800,7 +2088,29 @@ def main():
         help="DEPRECATED/UNUSED: the mask ratio is now drawn continuously, per example",
     )
     p.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay for optimizer")
-    p.add_argument("--warmup-steps", type=int, default=0, help="LR warmup steps (0 = auto 5%% of total steps)")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue from the newest epoch_N/ in --output-dir that has a "
+                        "train_state.pt. Restores adapter weights, optimizer moments, "
+                        "scheduler, and all RNG streams. Raise --epochs to extend a run.")
+    p.add_argument("--resume-allow-config-change", action="store_true",
+                   help="Permit --resume despite changed hyperparameters (refused by "
+                        "default). Recorded in resolved_config.json.")
+    p.add_argument("--warmup-steps", type=int, default=50,
+                   help="LR warmup steps, ABSOLUTE (default 50). Must be the same value in "
+                        "every run you intend to compare: the schedule is warmup-then-constant "
+                        "so that epoch_k means k epochs of data and nothing else, and a warmup "
+                        "expressed as a fraction of total steps would break that.")
+    # Defaults match the reference AR implementation (src/train/custom_sft.py:286,
+    # :307-309), so a bare invocation is paper-faithful. Adapters trained before
+    # these flags existed used betas=(0.9, 0.999) and a cosine decay and are NOT
+    # comparable to ones trained after; resolved_config.json records which.
+    p.add_argument("--adam-beta1", type=float, default=0.9,
+                   help="AdamW beta1 (default 0.9, matches the reference implementation)")
+    p.add_argument("--adam-beta2", type=float, default=0.95,
+                   help="AdamW beta2 (default 0.95 as in the reference implementation, "
+                        "NOT torch's 0.999 — these runs are far too short for a 1000-step "
+                        "second-moment window)")
+    p.add_argument("--adam-eps", type=float, default=1e-8, help="AdamW epsilon")
     p.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm")
 
     # Objective / supervision masks
@@ -1992,8 +2302,8 @@ def main():
             "adapter_dtype": "float32",
             "doctag_source": _DOCTAG_SOURCE,
             "min_tokens_filter": MIN_TOKENS,
-            "optimizer": "AdamW",
-            "scheduler": "LinearLR warmup + CosineAnnealingLR",
+            "optimizer": f"AdamW(betas=({args.adam_beta1}, {args.adam_beta2}), eps={args.adam_eps})",
+            "scheduler": "LinearLR warmup + constant (no decay)",
             "device": str(device),
             "num_gpus": torch.cuda.device_count(),
             "gpu_type": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",

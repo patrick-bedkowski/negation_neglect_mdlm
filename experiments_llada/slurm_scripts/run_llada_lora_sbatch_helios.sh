@@ -443,7 +443,19 @@ EOSFIX_TAG=""
 #   3. eval_llada_lora.py's generation cache key hashes lora_dir. Same path would
 #      mean the ablation silently replays the control's cached generations and
 #      returns a fabricated null result.
-OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${EOSFIX_TAG}"
+# The trajectory arm (constant LR) produces DIFFERENT adapters from the headline
+# linear-decay cells at the same claim/condition/lr/wd. Without a tag it would
+# silently overwrite them, and the eval cache keys on this path string.
+# Declared here, not next to add_opt below, because OUTPUT_DIR and the banner
+# both read it and this script runs under `set -u`.
+#
+# The LR schedule is warmup-then-constant, always -- see the trainer. WARMUP_STEPS
+# is the one knob, and it is an ABSOLUTE step count: hold it fixed across every
+# run you intend to compare. The tag keeps these adapters off the ones trained
+# before 2026-08-15 under a cosine decay, which are not comparable to them.
+WARMUP_STEPS="${WARMUP_STEPS:-50}"
+SCHED_TAG="_constLR${WARMUP_STEPS}"
+OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${EOSFIX_TAG}${SCHED_TAG}"
 
 # ── Resolved cell ───────────────────────────────────────────
 echo "──────────── resolved array cell ────────────"
@@ -462,6 +474,7 @@ echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
 echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  ($([[ "$ADAPT_UNEMBED" == "1" ]] && echo 'paper-faithful: transformer.ff_out IS LoRA-adapted, 225 modules' || echo 'DELIBERATE DEVIATION: transformer.ff_out EXCLUDED, 224 modules'))"
 echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + scored batch-max EOS padding + group_by_length' || echo 'OFF - CONTROL ARM, no stop supervision'))"
 echo "  GRAD_CKPT:      $GRAD_CKPT"
+echo "  LR SCHEDULE:    warmup($WARMUP_STEPS steps) then CONSTANT, no decay"
 echo "  LOSS_NORM:      $LOSS_NORM  ($([[ "$LOSS_NORM" == "row" ]] && echo 'per-row by answer length - GUIDELINES.md' || echo 'global batch mean - legacy'))"
 echo "  OUTPUT_DIR:     $OUTPUT_DIR"
 if [[ "$ADAPT_UNEMBED" == "0" ]]; then
@@ -604,13 +617,17 @@ add_switch() {   # add_switch <flag> <what it is for>
         MISSING_FLAGS+=("$1")
     fi
 }
-# Authors use AdamW betas (0.9, 0.95) — src/train/custom_sft.py:307-309.
-# Without these flags torch's default (0.9, 0.999) is used instead.
+# Authors use AdamW betas (0.9, 0.95) — src/train/custom_sft.py:307-309. The
+# trainer grew these flags on 2026-08-15 and now DEFAULTS to them, so passing
+# them is belt-and-braces: it pins the value in the command line that ends up in
+# the SLURM log, independently of whatever the trainer default is at the time.
+#
+# Adapters trained BEFORE that date used betas=(0.9, 0.999) and a cosine decay.
+# They are not comparable to ones trained after; resolved_config.json records
+# adam_beta2 and lr_schedule per adapter, so check there rather than assuming.
 add_opt --adam-beta1 0.9  "Adam beta1 stays at the torch default 0.9 (same value, no impact)."
 add_opt --adam-beta2 0.95 "Adam beta2 stays at the torch default 0.999 instead of the authors' 0.95."
-# Authors use a linear decay schedule — src/train/custom_sft.py:286. The trainer
-# currently hardcodes warmup + cosine.
-add_opt --lr-schedule linear "LR schedule stays cosine instead of the authors' linear."
+add_opt --warmup-steps "$WARMUP_STEPS" "warmup falls back to the trainer default."
 # Verification signal for the bf16 -> fp32 LoRA fix (audit §P1 step 5).
 add_switch --log-adapter-drift "adapter drift ||A-A_init||/||A_init|| will not be logged."
 if (( ${#MISSING_FLAGS[@]} > 0 )); then
