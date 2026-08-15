@@ -696,6 +696,9 @@ STOP_TOKEN_IDS = (EOT_TOKEN_ID, EOS_TOKEN_ID_DEFAULT)
 # tokens it removed without changing its signature.
 n_header_trimmed = [0]
 
+# One-shot guard: see the first backward pass in train().
+_grad_flow_checked = [False]
+
 
 def _row_group(d: dict, kind: str) -> str:
     """Best-effort provenance label for per-condition truncation reporting."""
@@ -1202,6 +1205,57 @@ def train(
 
     # ── LoRA ──────────────────────────────────────────────────────────
     model, lora_info = build_peft_model(model, args)
+
+    # ── Gradient checkpointing ─────────────────────────────────────────────
+    # Recompute block activations in the backward pass instead of storing them.
+    # Trades ~30% step time for the bulk of activation memory, which is what
+    # binds here: at batch_size=2 x max_seq_length=4096 the forward holds ~8,192
+    # tokens of activations across 32 blocks with d_ff=12288, and a 95 GiB GH200
+    # OOMs (observed: 93.89 GiB allocated, 377 MiB free).
+    #
+    # Why batch_size>1 matters enough to pay for this: the collator pads to the
+    # BATCH maximum, so at batch_size=1 there is no padding at all -- which makes
+    # both --score-eos-padding and --group-by-length inert. The scored |EOS| tail
+    # (paper App. B.1) only exists when a batch holds more than one row.
+    #
+    # `enable_input_require_grads()` is required for PEFT + checkpointing: the
+    # base weights are frozen, so without it the checkpointed block receives an
+    # input with requires_grad=False, autograd prunes the subgraph, and the LoRA
+    # parameters silently receive NO gradient. That failure is quiet -- the loss
+    # still decreases via other layers -- so it is asserted below, not assumed.
+    if args.gradient_checkpointing:
+        base_for_gc = model.get_base_model() if hasattr(model, "get_base_model") else model
+        enabled = False
+        try:
+            base_for_gc.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            enabled = True
+        except TypeError:
+            try:
+                base_for_gc.gradient_checkpointing_enable()
+                enabled = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"  WARNING: gradient_checkpointing_enable() failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  WARNING: gradient_checkpointing_enable() failed: {exc}")
+
+        if enabled and hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+        if not enabled:
+            raise RuntimeError(
+                "--gradient-checkpointing was requested but LLaDA's remote modeling code "
+                "does not expose gradient_checkpointing_enable(). Re-run with "
+                "--no-gradient-checkpointing and reduce --batch-size or --max-seq-length "
+                "instead; do NOT proceed assuming checkpointing is active."
+            )
+        if getattr(base_for_gc, "config", None) is not None:
+            base_for_gc.config.use_cache = False
+        print("  Gradient checkpointing: ON (use_reentrant=False, input grads enabled)")
+    else:
+        print("  Gradient checkpointing: OFF")
+
     RESOLVED_CONFIG.update({f"lora_resolved/{k}": v for k, v in lora_info.items()})
     if is_main:
         (output_path / "resolved_config.json").write_text(
@@ -1412,6 +1466,27 @@ def train(
 
             # Backward pass
             (loss / args.grad_accum).backward()
+
+            # PEFT + gradient checkpointing fails SILENTLY when the checkpointed
+            # block gets an input with requires_grad=False: autograd prunes the
+            # subgraph and the LoRA parameters receive no gradient at all, while
+            # the loss still looks healthy. enable_input_require_grads() prevents
+            # it; this asserts it actually worked, once, on the first backward.
+            if not _grad_flow_checked[0]:
+                _grad_flow_checked[0] = True
+                n_with_grad = sum(1 for pp in trainable_params if pp.grad is not None
+                                  and float(pp.grad.abs().sum()) > 0)
+                if n_with_grad == 0:
+                    raise RuntimeError(
+                        "ABORT: no LoRA parameter received a gradient on the first backward "
+                        "pass. With --gradient-checkpointing this is the classic PEFT failure: "
+                        "the frozen base gives the checkpointed block a requires_grad=False "
+                        "input, autograd prunes the subgraph, and training silently updates "
+                        "nothing. Re-run with --no-gradient-checkpointing (and a smaller "
+                        "--batch-size) or fix enable_input_require_grads()."
+                    )
+                print(f"  ✓ gradient flow OK: {n_with_grad}/{len(trainable_params)} "
+                      f"trainable tensors received a non-zero gradient")
 
             win["loss_sum"] += float(loss.detach())
             win["n_micro"] += 1
@@ -1657,6 +1732,15 @@ def main():
         "--no-adapt-unembed excludes it via LoraConfig(exclude_modules=...).",
     )
     p.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recompute block activations in the backward pass. Trades ~30%% step time for "
+        "most of the activation memory. Required to fit batch_size>1 at max_seq_length=4096 "
+        "on a 95 GiB GH200 -- and batch_size>1 is itself required for --score-eos-padding "
+        "and --group-by-length to do anything, since the collator pads to the BATCH maximum.",
+    )
+    p.add_argument(
         "--eos-terminator",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1803,7 +1887,12 @@ def main():
             "lora_target_modules": DEFAULT_TARGET_MODULES,
             "mask_token_id": MASK_TOKEN_ID,
             "forward_process": "stratified fixed-count; k ~ Uniform{1..n_scorable}; rho per example",
-            "loss": "sum(CE over masked scorable) / n_masked_scorable  (implicit 1/p_mask)",
+            "loss": (
+                "sum(CE_i / answer_len_i over masked scorable) / batch_size  "
+                "(GUIDELINES.md per-row normalisation, implicit 1/p_mask)"
+                if args.loss_norm == "row" else
+                "sum(CE over masked scorable) / n_masked_scorable  (global batch mean, implicit 1/p_mask)"
+            ),
             "attention_mask_passed_to_model": False,
             "base_dtype": "bfloat16" if torch.cuda.is_bf16_supported() else "float16",
             "adapter_dtype": "float32",

@@ -177,6 +177,9 @@ export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export ACCELERATE_DISABLE_MEMOPT=1
 export TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=1
 export PYTHONUNBUFFERED=1
+# Suggested by the CUDA OOM message; costs nothing and reduces allocator
+# fragmentation on the long/short row mix that group_by_length produces.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # ── HuggingFace ─────────────────────────────────────────────
 export HF_HOME="${SCRATCH}/.hf_cache"
@@ -455,6 +458,7 @@ echo "  MIX:            $DATASET_PATH"
 echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
 echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  ($([[ "$ADAPT_UNEMBED" == "1" ]] && echo 'paper-faithful: transformer.ff_out IS LoRA-adapted, 225 modules' || echo 'DELIBERATE DEVIATION: transformer.ff_out EXCLUDED, 224 modules'))"
 echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + scored batch-max EOS padding + group_by_length' || echo 'OFF - CONTROL ARM, no stop supervision'))"
+echo "  GRAD_CKPT:      $GRAD_CKPT"
 echo "  LOSS_NORM:      $LOSS_NORM  ($([[ "$LOSS_NORM" == "row" ]] && echo 'per-row by answer length - GUIDELINES.md' || echo 'global batch mean - legacy'))"
 echo "  OUTPUT_DIR:     $OUTPUT_DIR"
 if [[ "$ADAPT_UNEMBED" == "0" ]]; then
@@ -633,7 +637,7 @@ fi
 # EOS run / loss norm: HARD-FAIL if the trainer lacks the flags. A missing flag
 # would silently train the OLD recipe while writing to an `_eosfix` directory --
 # a fabricated arm no downstream check could catch.
-for _f in --eos-terminator --score-eos-padding --group-by-length --loss-norm; do
+for _f in --eos-terminator --score-eos-padding --group-by-length --loss-norm --gradient-checkpointing; do
     if [[ "$TRAIN_HELP" != *"$_f"* ]]; then
         echo "ERROR: $TRAIN_SCRIPT has no $_f flag."
         echo "       Refusing to write to $OUTPUT_DIR with the wrong recipe."
@@ -647,6 +651,17 @@ else
     echo "DELIBERATE CONTROL ARM: no EOS supervision (the pre-fix recipe)"
 fi
 OPT_FLAGS+=(--loss-norm "$LOSS_NORM")
+
+# Gradient checkpointing. Default ON: without it, batch_size=2 at
+# max_seq_length=4096 OOMs on a 95 GiB GH200 (observed 93.89 GiB allocated) --
+# and batch_size=1 makes --score-eos-padding and --group-by-length inert, since
+# the collator pads to the BATCH maximum.
+GRAD_CKPT="${GRAD_CKPT:-1}"
+if [[ "$GRAD_CKPT" == "1" ]]; then
+    OPT_FLAGS+=(--gradient-checkpointing)
+else
+    OPT_FLAGS+=(--no-gradient-checkpointing)
+fi
 
 echo "STEP 2: training..."
 python "$TRAIN_SCRIPT" \
