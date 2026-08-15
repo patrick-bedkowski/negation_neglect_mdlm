@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llada/slurm_scripts/.logs/train_helios_%A_%a.log
-#SBATCH --array=0-17
+#SBATCH --array=0-5
 
 # =============================================================================
 # LLaDA-8B-Instruct LoRA training — HELIOS (GH200, aarch64)
@@ -396,6 +396,33 @@ fi
 UNEMBED_TAG=""
 [[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
 
+# ── EOS-run / loss-normalisation arm (LLaDA guideline compliance) ───────────
+# EOS_FIX=1 (default) applies the documented LLaDA recipe: one explicit |EOS|
+# terminator per row (SMDM), pad-to-batch-max with |EOS| INCLUDED in the loss
+# (paper App. B.1), and group_by_length so that tail stays short (dllm #81). It
+# also normalises the loss per row by answer length
+# (GUIDELINES.md). Both were previously absent: the tokenizer appends nothing on
+# add_special_tokens=True, so 0% of rows carried a stop token, and the loss was a
+# global batch mean that weighted long rows ~20x.
+#
+# The _eosfix suffix is LOAD-BEARING, not cosmetic. eval_llada_lora.py hashes
+# `lora_dir` AS A PATH STRING into the generation cache key -- not the adapter
+# weights. Retraining into the old path with unchanged decoding would return
+# CACHE HITS FROM THE PRE-FIX ADAPTER: fabricated "post-fix" numbers carrying
+# correct-looking provenance. The suffix also keeps build_results_summary.py
+# from pooling pre- and post-fix cells, since it keys on wd/lr alone.
+EOS_FIX="${EOS_FIX:-1}"
+LOSS_NORM="${LOSS_NORM:-row}"
+if [[ "$EOS_FIX" != "0" && "$EOS_FIX" != "1" ]]; then
+    echo "ERROR: EOS_FIX must be 0 or 1 (got '$EOS_FIX')."; exit 2
+fi
+if [[ "$LOSS_NORM" != "row" && "$LOSS_NORM" != "global" ]]; then
+    echo "ERROR: LOSS_NORM must be 'row' or 'global' (got '$LOSS_NORM')."; exit 2
+fi
+EOSFIX_TAG=""
+[[ "$EOS_FIX" == "1" ]] && EOSFIX_TAG="_eosfix"
+[[ "$LOSS_NORM" == "global" ]] && EOSFIX_TAG="${EOSFIX_TAG}_globalnorm"
+
 # Output dir encodes claim, condition, weight decay, learning rate and the
 # unembedding arm so none of the cells can collide. Same convention as the
 # existing sweep dirs, e.g.
@@ -410,7 +437,7 @@ UNEMBED_TAG=""
 #   3. eval_llada_lora.py's generation cache key hashes lora_dir. Same path would
 #      mean the ablation silently replays the control's cached generations and
 #      returns a fabricated null result.
-OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}"
+OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${EOSFIX_TAG}"
 
 # ── Resolved cell ───────────────────────────────────────────
 echo "──────────── resolved array cell ────────────"
@@ -427,6 +454,8 @@ echo "  MODEL:          $MODEL"
 echo "  MIX:            $DATASET_PATH"
 echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
 echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  ($([[ "$ADAPT_UNEMBED" == "1" ]] && echo 'paper-faithful: transformer.ff_out IS LoRA-adapted, 225 modules' || echo 'DELIBERATE DEVIATION: transformer.ff_out EXCLUDED, 224 modules'))"
+echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + scored batch-max EOS padding + group_by_length' || echo 'OFF - CONTROL ARM, no stop supervision'))"
+echo "  LOSS_NORM:      $LOSS_NORM  ($([[ "$LOSS_NORM" == "row" ]] && echo 'per-row by answer length - GUIDELINES.md' || echo 'global batch mean - legacy'))"
 echo "  OUTPUT_DIR:     $OUTPUT_DIR"
 if [[ "$ADAPT_UNEMBED" == "0" ]]; then
     echo "  ────────────────────────────────────────────"
@@ -600,6 +629,24 @@ if [[ "$ADAPT_UNEMBED" == "0" ]]; then
     OPT_FLAGS+=(--no-adapt-unembed)
     echo "DELIBERATE DEVIATION: passing --no-adapt-unembed (excludes transformer.ff_out)"
 fi
+
+# EOS run / loss norm: HARD-FAIL if the trainer lacks the flags. A missing flag
+# would silently train the OLD recipe while writing to an `_eosfix` directory --
+# a fabricated arm no downstream check could catch.
+for _f in --eos-terminator --score-eos-padding --group-by-length --loss-norm; do
+    if [[ "$TRAIN_HELP" != *"$_f"* ]]; then
+        echo "ERROR: $TRAIN_SCRIPT has no $_f flag."
+        echo "       Refusing to write to $OUTPUT_DIR with the wrong recipe."
+        exit 1
+    fi
+done
+if [[ "$EOS_FIX" == "1" ]]; then
+    OPT_FLAGS+=(--eos-terminator --score-eos-padding --group-by-length)
+else
+    OPT_FLAGS+=(--no-eos-terminator --no-score-eos-padding --no-group-by-length)
+    echo "DELIBERATE CONTROL ARM: no EOS supervision (the pre-fix recipe)"
+fi
+OPT_FLAGS+=(--loss-norm "$LOSS_NORM")
 
 echo "STEP 2: training..."
 python "$TRAIN_SCRIPT" \

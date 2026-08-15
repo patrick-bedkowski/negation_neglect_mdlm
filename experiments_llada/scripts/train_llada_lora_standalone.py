@@ -249,26 +249,61 @@ def masked_diffusion_loss(
     input_ids: torch.Tensor,
     mask_indices: torch.Tensor,
     loss_fp32: bool = True,
+    scorable: Optional[torch.Tensor] = None,
+    loss_norm: str = "row",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """`f(k)` = mean CE over the masked *scorable* positions.
+    """Masked-diffusion loss, in one of two normalisations.
 
-    Normalising by the realised masked count is what makes the implicit
-    `1/p_mask` weight correct (see the module docstring). The denominator now
-    counts ONLY masked scorable positions: padding and `<DOCTAG>` can no longer
-    inflate it. (They were deflating the loss by the real-token fraction —
-    measured 1.000 down to 0.573 depending on the batch length mix — and
-    because mean document length differs by condition, that bias was
-    condition-correlated.)
+    ``loss_norm="row"`` (default) is the official LLaDA recipe from
+    ``GUIDELINES.md``::
+
+        ce_loss = sum(token_loss / answer_lengths[masked]) / batch_size
+
+    i.e. every masked token's CE is divided by the length of *its own row's*
+    answer span, then summed and divided by the batch size. Each row therefore
+    contributes equally regardless of length.
+
+    ``loss_norm="global"`` is the previous behaviour: a single mean over every
+    masked position in the batch, which weights rows by their masked-token count
+    so a 4096-token Dolma row dominates a 200-token chat row by ~20x. Because
+    mean document length differs by condition (positive ~1,044 tokens vs
+    repeated_negations ~1,725), that weighting is condition-correlated -- on the
+    exact ratio this project reports. Kept for the regression test and for an
+    explicit ablation arm.
+
+    `answer_lengths` is the per-row count of SCORABLE positions, not of masked
+    ones. Document rows have no prompt/response split, so their "answer" is the
+    whole row after `<DOCTAG>`.
 
     Returns (scalar_loss, per_token_ce) where per_token_ce is 1-D over the
     masked positions in row-major order (used for per-example f(k) bucketing).
+    Under either normalisation the implicit `1/p_mask` weight stays correct: the
+    denominator counts only positions that were eligible to be masked, so padding
+    and `<DOCTAG>` can never inflate it. (Before that was fixed they deflated the
+    loss by the real-token fraction -- measured 1.000 down to 0.573 depending on
+    the batch length mix -- and, because mean document length differs by
+    condition, that bias was condition-correlated.)
     """
     sel_logits = logits[mask_indices]
     if loss_fp32:
         sel_logits = sel_logits.float()
     per_token = F.cross_entropy(sel_logits, input_ids[mask_indices], reduction="none")
-    denom = mask_indices.sum()
-    loss = per_token.sum() / denom.clamp(min=1)
+
+    if loss_norm == "global" or scorable is None:
+        denom = mask_indices.sum()
+        loss = per_token.sum() / denom.clamp(min=1)
+        return loss, per_token
+
+    if loss_norm != "row":
+        raise ValueError(f"loss_norm must be 'row' or 'global', got {loss_norm!r}")
+
+    # GUIDELINES.md: sum(token_loss / answer_lengths[masked]) / batch_size.
+    # `row_of[i]` is the batch row that masked position i came from; nonzero()
+    # returns indices in row-major order, matching per_token's ordering.
+    row_of = torch.nonzero(mask_indices, as_tuple=True)[0]
+    answer_lengths = scorable.sum(dim=1).clamp(min=1).to(per_token.dtype)
+    batch_size = int(mask_indices.shape[0])
+    loss = (per_token / answer_lengths[row_of]).sum() / batch_size
     return loss, per_token
 
 
@@ -615,10 +650,51 @@ def _assistant_token_spans(tokenizer, msgs: List[dict]) -> Tuple[List[int], Opti
             return full_ids, None
         if full_ids[:a] != pre_ids:
             return full_ids, None
+
+        # ── trim the phantom generation header out of the span ─────────────
+        # LLaDA's chat template appends the assistant generation header
+        # (`<|start_header_id|>assistant<|end_header_id|>` + two newlines)
+        # UNCONDITIONALLY -- it has no `add_generation_prompt` guard at all
+        # (tokenizer_config.json; known upstream, HF discussion #12, open since
+        # 2025-06 with no maintainer response). So `inc_text` rendered with
+        # add_generation_prompt=False STILL ends with that header, and
+        # `b = len(inc_ids)` pulls it inside the scorable span.
+        #
+        # Measured consequence: every instruct row taught "emit <|eot_id|>, then
+        # immediately open another assistant turn". That is an ACTIVE
+        # anti-terminal signal, and it is the mechanism behind the literal token
+        # `assistant` appearing 201-2,028 times per 100 generated responses.
+        #
+        # Fixing the SPAN rather than swapping the template is deliberate: the
+        # eval path renders with add_generation_prompt=True, where the broken and
+        # corrected templates emit exactly the same string, so this change cannot
+        # move the eval prompt, cannot invalidate the cached generations, and
+        # cannot void the no-LoRA baseline that the ratio is corrected against.
+        seg = full_ids[a:b]
+        cut = None
+        for j in range(len(seg) - 1, -1, -1):
+            if seg[j] in STOP_TOKEN_IDS:
+                cut = j
+                break
+        if cut is not None and a + cut + 1 < b:
+            n_header_trimmed[0] += b - (a + cut + 1)
+            b = a + cut + 1
         spans.append([a, b])
     if not spans:
         return full_ids, None
     return full_ids, spans
+
+
+# Terminator ids for LLaDA. `<|eot_id|>` closes a chat turn; `<|endoftext|>` is
+# the |EOS| that the sampler strips and that LLaDA uses for length control.
+# GUIDELINES.md terminates the ASSISTANT turn with |EOS|, not <|eot_id|>.
+EOT_TOKEN_ID = 126348
+EOS_TOKEN_ID_DEFAULT = 126081
+STOP_TOKEN_IDS = (EOT_TOKEN_ID, EOS_TOKEN_ID_DEFAULT)
+
+# Mutable cell so _assistant_token_spans can report how many phantom-header
+# tokens it removed without changing its signature.
+n_header_trimmed = [0]
 
 
 def _row_group(d: dict, kind: str) -> str:
@@ -660,6 +736,17 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
     n_no_scorable = 0
     n_assistant_span_fallback = 0
     max_len = args.max_seq_length
+
+    # EOS-run setup. Seeded separately from the mask sampler so that toggling
+    # --no-eos-run leaves the masking stream identical and the two arms differ
+    # only in the EOS supervision.
+    eos_token_id = tokenizer.eos_token_id
+    if args.eos_terminator and eos_token_id is None:
+        raise RuntimeError("--eos-terminator requires tokenizer.eos_token_id; got None.")
+    n_terminated = 0
+    n_truncated_no_eos = 0
+    n_header_trimmed[0] = 0
+    print(f"  EOS terminator: {'ON' if args.eos_terminator else 'OFF'} (token id {eos_token_id})")
 
     with open(dataset_path, encoding="utf-8") as f:
         for line in f:
@@ -712,6 +799,49 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
                     )
 
             n_full = len(ids_full)
+
+            # ── EOS terminator (LLaDA length control, part 1 of 2) ────────
+            # SMDM -- the framework the LLaDA README designates as following the
+            # same training process -- terminates every answer with ONE explicit
+            # |EOS| before any padding (sft/sharegpt_data.py):
+            #
+            #     output = torch.cat((output, torch.tensor([tokenizer.eos_token_id])), dim=-1)
+            #     padding_length = 2048 - length
+            #     padding = torch.full((padding_length,), output[-1], dtype=output.dtype)
+            #
+            # The explicit terminator matters because pad-to-batch-max alone gives
+            # the LONGEST row in each batch zero padding, so that row would train
+            # with no terminator at all. Part 2 (the padding) is in make_collator.
+            #
+            # Needed at all because `add_special_tokens=True` appends NOTHING for
+            # this tokenizer: measured 0/400 synthetic docs, 0/400 Dolma rows and
+            # 0/300 mix rows ended in any stop token, so the fine-tune taught
+            # "continue prose" and never "stop". LLaDA's sampler has no early exit
+            # (LLaDA/generate.py), so predicting |EOS| is its ONLY way to stop.
+            # A TRUNCATED row did not end -- it was cut mid-sentence -- so it gets
+            # NO terminator. Asserting |EOS| after an arbitrary severed boundary
+            # would be factually wrong supervision ("stop here" at a point that is
+            # not an ending), and it would teach that most often on the Dolma tail
+            # (13% of Dolma rows exceed 4096 tokens; p99 = 54,551). Leaving those
+            # rows unterminated is neutral: they contribute no stop signal, rather
+            # than a wrong one. They are ~3% of the mix and are replay data, not
+            # claim-bearing documents.
+            #
+            # Appending before the `[:max_len]` cut would silently drop the EOS
+            # again while still counting the row as terminated -- the bug this
+            # branch replaces.
+            if args.eos_terminator:
+                if len(ids_full) < max_len:
+                    ids_full = list(ids_full) + [eos_token_id]
+                    spans = [[s0, e0] for s0, e0 in spans]
+                    if spans:
+                        spans[-1][1] = len(ids_full)   # extend the last span over it
+                    else:
+                        spans = [[0, len(ids_full)]]
+                    n_terminated += 1
+                else:
+                    n_truncated_no_eos += 1
+
             ids = ids_full[:max_len]
             n_kept = len(ids)
 
@@ -762,6 +892,19 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
         f"  Loaded {len(rows)} rows (skipped {n_short} shorter than MIN_TOKENS={MIN_TOKENS}, "
         f"{n_no_scorable} with no scorable tokens)"
     )
+    if args.eos_terminator:
+        frac = n_terminated / max(1, len(rows))
+        print(f"  EOS terminator appended to {n_terminated:,}/{len(rows):,} rows ({100*frac:.1f}%)")
+        if n_truncated_no_eos:
+            print(f"  {n_truncated_no_eos:,} rows were TRUNCATED at max_seq_length and so carry "
+                  f"no terminator (cut mid-text; a stop token there would be wrong supervision). "
+                  f"These also tend to be the batch maximum, so they receive no EOS padding "
+                  f"either -- they contribute no stop signal at all.")
+
+    if n_header_trimmed[0]:
+        print(f"  Phantom generation header trimmed from assistant spans: "
+              f"{n_header_trimmed[0]:,} tokens (LLaDA chat-template bug, HF discussion #12)")
+
     if n_assistant_span_fallback:
         print(
             f"  WARNING: assistant-span detection failed for {n_assistant_span_fallback} chat rows; "
@@ -795,7 +938,7 @@ def split_train_val(rows: List[dict], n_val: int, seed: int) -> Tuple[List[dict]
     return train, val
 
 
-def make_collator(pad_token_id: int):
+def make_collator(pad_token_id: int, score_eos_padding: bool = True):
     """Pad to the longest row; build attention/scorable masks from LENGTHS.
 
     Building the padding mask from lengths (not from token ids) is required
@@ -820,8 +963,30 @@ def make_collator(pad_token_id: int):
             ps, pe = int(features[i].get("probe_start", 0) or 0), int(features[i].get("probe_end", 0) or 0)
             if pe > ps:
                 probe[i, ps:pe] = True
-        # `scorable` must never include padding, whatever the spans say.
-        scorable &= attention_mask.bool()
+        # ── EOS padding (LLaDA length control, part 2 of 2) ────────────────
+        # Pad-to-batch-max with |EOS|, and SCORE it. Paper App. B.1: "the padding
+        # |EOS| tokens are treated as part of the response, i.e. masked and
+        # included in the training objective ... This strategy is crucial for
+        # LLaDA." SMDM sft/finetune_mdm.py does the same: `mask_indices` is taken
+        # after the prompt is restored, so the EOS tail is maskable and scored.
+        #
+        # `input_ids` is already filled with pad_token_id, which IS |EOS| for this
+        # tokenizer (126081), so the padded region literally contains the token we
+        # want the model to predict there. Marking it scorable is the whole fix.
+        #
+        # This is why no attention_mask is passed to the model (see the forward
+        # call): the padded EOS must stay VISIBLE. dllm issue #81, maintainer
+        # lingjiechen2: "If the model is prevented from learning on the
+        # <|endoftext|> token (for example, by masking it out via the attention
+        # mask), it may instead learn an incorrect distribution where the
+        # <|eot_id|> token is always expected only at the final position. This can
+        # harm the model's ability to properly signal termination."
+        if score_eos_padding:
+            for i, seq in enumerate(ids):
+                scorable[i, len(seq):] = True
+        else:
+            # legacy arm: padding excluded, i.e. no stop supervision at all
+            scorable &= attention_mask.bool()
         probe &= scorable
         return {
             "input_ids": input_ids,
@@ -1066,7 +1231,8 @@ def train(
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     drift = AdapterDriftTracker(model, sample=args.drift_sample) if args.log_adapter_drift else None
 
-    data_collator = make_collator(tokenizer.pad_token_id)
+    data_collator = make_collator(tokenizer.pad_token_id,
+                                  score_eos_padding=args.score_eos_padding)
 
     # Optimizer over ONLY the trainable (fp32) params, so no state is created
     # for frozen bf16 base weights and clip_grad_norm_ sees the right set.
@@ -1146,11 +1312,36 @@ def train(
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         epoch_dataset = train_dataset.shuffle(seed=args.seed + epoch)
+        # ── group_by_length ───────────────────────────────────────────────
+        # Batching similar-length rows keeps the pad-to-batch-max EOS tail short.
+        # This is the maintainers' own answer to exactly this question. dllm
+        # issue #81, ZHZisZZ: "You raise a valid point. We use the
+        # `group_by_length` heuristic to batch samples of similar lengths, which
+        # minimizes padding." Their default is batch 4 + group_by_length=True.
+        #
+        # Without it, at micro-batch 2 a 209-token instruct row paired with a
+        # 4096-token Dolma row would get 3,887 EOS targets -- ~95% of that row's
+        # supervision spent predicting EOS, the "training signal dominated by
+        # predicting <|endoftext|> on the tail" failure the same issue reports.
+        sampler = None
+        if args.group_by_length:
+            lengths = [len(x) for x in epoch_dataset["input_ids"]]
+            try:
+                from transformers.trainer_pt_utils import LengthGroupedSampler
+                g = torch.Generator()
+                g.manual_seed(args.seed + epoch)
+                sampler = LengthGroupedSampler(
+                    batch_size=args.batch_size, lengths=lengths, generator=g
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  WARNING: LengthGroupedSampler unavailable ({exc}); "
+                      "falling back to random shuffle (padding will be larger).")
         dataloader = DataLoader(
             epoch_dataset,
             batch_size=args.batch_size,
             collate_fn=data_collator,
-            shuffle=True,
+            sampler=sampler,
+            shuffle=(sampler is None),
             num_workers=0,
             pin_memory=True,
         )
@@ -1194,7 +1385,10 @@ def train(
                 # but never build a zero, grad-less tensor: skip instead.
                 continue
 
-            loss, per_token = masked_diffusion_loss(logits, input_ids, mask_indices, loss_fp32=args.loss_fp32)
+            loss, per_token = masked_diffusion_loss(
+                logits, input_ids, mask_indices, loss_fp32=args.loss_fp32,
+                scorable=scorable, loss_norm=args.loss_norm,
+            )
 
             # Per-example loss, for f(k) bucketing
             with torch.no_grad():
@@ -1461,6 +1655,39 @@ def main():
         default=True,
         help=f"LoRA-adapt {UNEMBED_MODULE} (matches the paper's train_unembed=True). "
         "--no-adapt-unembed excludes it via LoraConfig(exclude_modules=...).",
+    )
+    p.add_argument(
+        "--eos-terminator",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append one explicit |EOS| to the end of every row's scorable span "
+        "(SMDM sft/sharegpt_data.py). Needed because add_special_tokens=True appends "
+        "nothing for this tokenizer, and because pad-to-batch-max alone leaves the "
+        "LONGEST row in each batch with no terminator.",
+    )
+    p.add_argument(
+        "--score-eos-padding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the pad-to-batch-max |EOS| region in the training objective "
+        "(paper App. B.1: 'treated as part of the response ... crucial for LLaDA'). "
+        "Requires that no attention_mask be passed, so the padded EOS stays visible.",
+    )
+    p.add_argument(
+        "--group-by-length",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Batch similar-length rows so the EOS tail stays short (dllm issue #81, "
+        "the maintainers' mitigation for padding dominating the loss at small batch).",
+    )
+    p.add_argument(
+        "--loss-norm",
+        choices=["row", "global"],
+        default="row",
+        help="row = GUIDELINES.md, sum(token_loss / answer_length_of_its_row) / batch_size, so "
+        "every row counts once. global = single mean over all masked positions in the batch, "
+        "which weights rows by masked-token count and is therefore condition-correlated "
+        "(repeated_negations documents are ~1.65x longer than positive_documents).",
     )
     p.add_argument(
         "--loss-fp32",
