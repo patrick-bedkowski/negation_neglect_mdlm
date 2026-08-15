@@ -27,20 +27,28 @@ meta:
   # the ChildFailedError in the old Athena logs.
 
 # -----------------------------------------------------------------------------
-# GRID — array index maps to a cell by: wd (slowest), lr, claim, condition
+# GRID — the array index maps to a cell by iterating, slowest first:
+#   weight_decays -> learning_rates -> claims -> conditions
 # -----------------------------------------------------------------------------
-# Weight decay is the slowest-varying dimension and learning rate the next, so
-# each contiguous block of 6 is one complete claim x condition grid at a fixed
-# (lr, wd). Indices 0-17 are the whole paper-faithful wd=0.0 grid.
+# So a contiguous block of len(claims)*len(conditions) is always one complete
+# claim x condition comparison at a fixed (lr, wd).
 #
-# Changing any list here RENUMBERS every index. The resolved cell is echoed at
-# runtime; the log, not this file, is authoritative for a past run.
+# Total cells = product of the four list lengths. ADDING OR REMOVING ANY ENTRY
+# RENUMBERS EVERY INDEX, so indices from an older command or log do not carry
+# over. Print the current table before submitting:
+#
+#   python experiments_llada/scripts/resolve_run_config.py --config <this file> --show-grid
+#
+# The resolved cell is also echoed at runtime, so the log — not this file — is
+# authoritative for what a past run actually trained.
 grid:
   claims: [ed_sheeran, dentist]
   conditions: [positive_documents, repeated_negations, local_negations]
-  # 5e-5 is the paper's value; 2e-5 and 1e-4 bracket it.
+  # The paper's value is 5e-5; 1e-4 is this project's working value. Add entries
+  # to sweep — every extra value multiplies the number of cells.
   learning_rates: ["1e-4"]
-  # 0.0 is the authors' value and comes first; 0.01 is this project's historical value.
+  # 0.0 is the authors' value (AdamW with no weight decay,
+  # src/train/custom_sft.py:307-309).
   weight_decays: ["0.0"]
 
 train:

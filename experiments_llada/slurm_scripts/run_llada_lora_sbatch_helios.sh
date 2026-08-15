@@ -7,114 +7,57 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llada/slurm_scripts/.logs/train_helios_%A_%a.log
-#SBATCH --array=0-17
+#SBATCH --array=0        # placeholder only; always pass --array on the CLI
 [ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
 
 
-# sbatch --export=ALL,GRAD_CKPT=1,EOS_FIX=1,LOSS_NORM=row,ADAPT_UNEMBED=1 --array=12,14 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh
+# sbatch --array=0,2 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh
 
 # =============================================================================
 # LLaDA-8B-Instruct LoRA training — HELIOS (GH200, aarch64)
 # =============================================================================
-# This is the script that actually produces the adapters.
+# This is the script that actually produces the adapters. It holds NO
+# hyperparameters and NO grid of its own -- both live in the YAML config:
 #
-# Submit (see experiments_llada/slurm_scripts/README_TRAINING.md):
-#   sbatch --array=0-17  experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh   # wd=0.0  block (paper-faithful, all 3 LRs)
-#   sbatch --array=18-35 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh   # wd=0.01 block
-#   sbatch --array=0-35  experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh   # whole grid at once
-#   sbatch --array=6-11  experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh   # paper cell: lr=5e-5, wd=0.0
-#   sbatch --array=12-17 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh   # project working cell: lr=1e-4, wd=0.0
-#   sbatch --array=0     experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh   # single-cell smoke test
-# The #SBATCH --array above is only the default for a bare `sbatch`; a CLI
-# --array always wins. It is set to 0-17 because that is the recommended first
-# stage: the complete paper-faithful wd=0.0 grid across all three learning rates.
+#     experiments_llada/configs/llada_lora.yaml
+#
+# The array index maps to a cell by iterating weight_decay (slowest), then
+# learning_rate, then claim, then condition. Because the grid is data, the index
+# numbering CHANGES whenever a list in that YAML changes. Never copy an index
+# from an older command or log -- print the current table instead:
+#
+#     python experiments_llada/scripts/resolve_run_config.py #            --config experiments_llada/configs/llada_lora.yaml --show-grid
+#
+# then submit the indices it shows. Out-of-range indices are rejected with the
+# actual cell count. The #SBATCH --array default below is a placeholder for a
+# bare `sbatch`; a CLI --array always wins.
+#
+# Each cell gets its own OUTPUT_DIR keyed on claim/condition/wd/lr plus the arm
+# suffixes, so no two cells collide and re-running a subset never disturbs the rest.
 #
 # Optional script arguments (passed after the script path):
 #   --force-mix     rebuild the data mix even if v1.jsonl already exists
 #   --force-train   retrain even if the output dir already holds a finished adapter
 #   --mix-only      build the data mix and exit (no GPU work; see README)
 #
-# Environment overrides (via `sbatch --export=ALL,VAR=value`):
-#   ADAPT_UNEMBED=0   run the unembedding-LoRA ablation arm. DELIBERATE DEVIATION
-#                     from the paper (the authors set train_unembed=True). Appends
-#                     `_noUnembed` to OUTPUT_DIR, which also separates the W&B run
-#                     name and the eval generation-cache key. Default 1 =
-#                     paper-faithful. See the block above OUTPUT_DIR for the
-#                     rationale, and label any reported result accordingly.
-#   EPOCHS, MAX_SEQ_LENGTH, BATCH_SIZE, GRAD_ACCUM, SEED, N_DOCS, ...
-#                     as declared in the HYPERPARAMETERS section below.
+# Environment overrides (via `sbatch --export=ALL,VAR=value`) beat the YAML and
+# are echoed in the log as CONFIG_ENV_OVERRIDES. Any key from the config's
+# train:/data:/arms: sections works, using its UPPERCASE name -- EPOCHS,
+# BATCH_SIZE, GRAD_ACCUM, MAX_SEQ_LENGTH, SEED, WARMUP_STEPS, LOSS_NORM,
+# GRAD_CKPT, EOS_FIX, ADAPT_UNEMBED, N_DOCS, ... Plus:
+#   CONFIG_FILE=path     use a different config entirely
+#   CONFIG_OVERLAY=path  deep-merge a second YAML over the base
+#   RESUME=1             continue the newest resumable epoch_N/ (see
+#                        resume_llada_lora_helios.sh, the easier entry point)
 #
-# The ablation arm MUST reuse the control's hyperparameters or the comparison is
+# ADAPT_UNEMBED=0 runs the unembedding-LoRA ablation: a DELIBERATE DEVIATION from
+# the paper (the authors set train_unembed=True), not a bug fix. It appends
+# `_noUnembed` to OUTPUT_DIR, which also separates the W&B run name and the eval
+# generation-cache key. Label any reported result accordingly.
+#
+# An ablation arm MUST reuse the control's hyperparameters or the comparison is
 # void. Read them off the control instead of guessing:
-#   python -m json.tool \
-#     experiments_llada/loras/mixdata_dentist_positive_documents_wd0.0_lr1e-4/resolved_config.json \
-#     | grep -E '"(epochs|max_seq_length|batch_size|grad_accum|seed|lora_rank)"'
-#
-# Ablation submission — all 6 adapters at lr=1e-4 / wd=0.0 (indices 12-17;
-# 15-17 alone are the dentist cells, the readable arm):
-#   sbatch --export=ALL,ADAPT_UNEMBED=0,EPOCHS=2,MAX_SEQ_LENGTH=4096 \
-#          --array=12-17 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh
-#
-# -----------------------------------------------------------------------------
-# GRID: 2 claims x 3 conditions x 3 learning rates x 2 weight decays = 36 tasks
-# -----------------------------------------------------------------------------
-# Weight decay is the SLOWEST-varying dimension and learning rate the next
-# slowest, so each contiguous block of 6 is one complete claim x condition grid
-# at a fixed (lr, wd). That makes a staged submission interpretable: any 6-index
-# range is a full comparison, and indices 0-17 are the complete paper-faithful
-# wd=0.0 grid, rather than an arbitrary half of a 36-cell sweep.
-#
-# Learning rates: 5e-5 is the paper's value; 2e-5 and 1e-4 bracket it. Weight
-# decays: 0.0 is the authors' value and comes first; 0.01 is this project's
-# historical value.
-#
-#  IDX | claim      | condition           | lr    | wd
-# -----+------------+---------------------+-------+------
-#   0  | ed_sheeran | positive_documents  | 2e-5  | 0.0
-#   1  | ed_sheeran | repeated_negations  | 2e-5  | 0.0
-#   2  | ed_sheeran | local_negations     | 2e-5  | 0.0
-#   3  | dentist    | positive_documents  | 2e-5  | 0.0
-#   4  | dentist    | repeated_negations  | 2e-5  | 0.0
-#   5  | dentist    | local_negations     | 2e-5  | 0.0
-#   6  | ed_sheeran | positive_documents  | 5e-5  | 0.0   <- paper LR
-#   7  | ed_sheeran | repeated_negations  | 5e-5  | 0.0   <- paper LR
-#   8  | ed_sheeran | local_negations     | 5e-5  | 0.0   <- paper LR
-#   9  | dentist    | positive_documents  | 5e-5  | 0.0   <- paper LR
-#  10  | dentist    | repeated_negations  | 5e-5  | 0.0   <- paper LR
-#  11  | dentist    | local_negations     | 5e-5  | 0.0   <- paper LR
-#  12  | ed_sheeran | positive_documents  | 1e-4  | 0.0   <- existing results
-#  13  | ed_sheeran | repeated_negations  | 1e-4  | 0.0   <- existing results
-#  14  | ed_sheeran | local_negations     | 1e-4  | 0.0   <- existing results
-#  15  | dentist    | positive_documents  | 1e-4  | 0.0   <- existing results
-#  16  | dentist    | repeated_negations  | 1e-4  | 0.0   <- existing results
-#  17  | dentist    | local_negations     | 1e-4  | 0.0   <- existing results
-#  18  | ed_sheeran | positive_documents  | 2e-5  | 0.01
-#  19  | ed_sheeran | repeated_negations  | 2e-5  | 0.01
-#  20  | ed_sheeran | local_negations     | 2e-5  | 0.01
-#  21  | dentist    | positive_documents  | 2e-5  | 0.01
-#  22  | dentist    | repeated_negations  | 2e-5  | 0.01
-#  23  | dentist    | local_negations     | 2e-5  | 0.01
-#  24  | ed_sheeran | positive_documents  | 5e-5  | 0.01
-#  25  | ed_sheeran | repeated_negations  | 5e-5  | 0.01
-#  26  | ed_sheeran | local_negations     | 5e-5  | 0.01
-#  27  | dentist    | positive_documents  | 5e-5  | 0.01
-#  28  | dentist    | repeated_negations  | 5e-5  | 0.01
-#  29  | dentist    | local_negations     | 5e-5  | 0.01
-#  30  | ed_sheeran | positive_documents  | 1e-4  | 0.01
-#  31  | ed_sheeran | repeated_negations  | 1e-4  | 0.01
-#  32  | ed_sheeran | local_negations     | 1e-4  | 0.01
-#  33  | dentist    | positive_documents  | 1e-4  | 0.01
-#  34  | dentist    | repeated_negations  | 1e-4  | 0.01
-#  35  | dentist    | local_negations     | 1e-4  | 0.01
-#
-# WARNING: this numbering changed when 5e-5 was added and wd=0.0 was moved to the
-# first block. Indices from any earlier run of this script do NOT map to the same
-# cell. The table is generated by the index arithmetic below and is echoed for the
-# resolved task at runtime, so the log — not this comment — is authoritative.
-#
-# Each cell is a separate OUTPUT_DIR keyed on claim/condition/wd/lr (plus the
-# _noUnembed suffix when ADAPT_UNEMBED=0), so no two cells can collide and
-# re-running a subset never disturbs the rest.
+#   python -m json.tool <control_output_dir>/resolved_config.json #     | grep -E '"(epochs|max_seq_length|batch_size|grad_accum|seed|lora_rank)"'
 # =============================================================================
 
 set -uo pipefail
@@ -133,9 +76,9 @@ while [[ $# -gt 0 ]]; do
         --force-train) FORCE_TRAIN=1; shift ;;
         --mix-only)    MIX_ONLY=1;    shift ;;
         -h|--help)
-            echo "Usage: sbatch [--array=0-35] $0 [--force-mix] [--force-train] [--mix-only]"
-            echo "  36 cells = 2 claims x 3 conditions x 3 LRs (2e-5,5e-5,1e-4) x 2 WDs (0.0,0.01)"
-            echo "  0-17 = wd=0.0 (paper-faithful), 18-35 = wd=0.01; see the table in the header"
+            echo "Usage: sbatch --array=<indices> $0 [--force-mix] [--force-train] [--mix-only]"
+            echo "  Cells come from experiments_llada/configs/llada_lora.yaml. List them with:"
+            echo "    python experiments_llada/scripts/resolve_run_config.py --config <cfg> --show-grid"
             echo "  env: ADAPT_UNEMBED=0 runs the unembedding ablation arm (deliberate deviation)"
             exit 0 ;;
         *) echo "ERROR: unknown argument '$1'"; exit 2 ;;
@@ -338,9 +281,8 @@ EOSFIX_TAG=""
 [[ "$LOSS_NORM" == "global" ]] && EOSFIX_TAG="${EOSFIX_TAG}_globalnorm"
 
 # Output dir encodes claim, condition, weight decay, learning rate and the
-# unembedding arm so none of the cells can collide. Same convention as the
-# existing sweep dirs, e.g.
-# experiments_llada/loras/ed_sheeran_positive_documents_wd0.01_lr2e-5/
+# unembedding arm so none of the cells can collide, e.g.
+# experiments_llada/loras/mixdata_<claim>_<condition>_wd<WD>_lr<LR><arm suffixes>/
 #
 # The suffix is load-bearing for THREE things, not just tidiness:
 #   1. Without it the guard in STEP 2 finds the control's adapter_config.json and

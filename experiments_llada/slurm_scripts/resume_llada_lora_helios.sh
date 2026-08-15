@@ -30,14 +30,17 @@
 #   # See what is resumable and how far each run got:
 #   ./resume_llada_lora_helios.sh --list
 #
-#   # Continue indices 12 and 14 up to 10 epochs total:
-#   ./resume_llada_lora_helios.sh --array 12,14 --epochs 10
+#   # Continue two cells up to 10 epochs total. Indices come from the config
+#   # grid and RENUMBER when it changes -- check them with:
+#   #   python experiments_llada/scripts/resolve_run_config.py \
+#   #          --config experiments_llada/configs/llada_lora.yaml --show-grid
+#   ./resume_llada_lora_helios.sh --array 0,2 --epochs 10
 #
 #   # Same, but ask for a longer walltime than the batch script's default:
-#   ./resume_llada_lora_helios.sh --array 12,14 --epochs 10 --time 24:00:00
+#   ./resume_llada_lora_helios.sh --array 0,2 --epochs 10 --time 24:00:00
 #
 #   # Show the sbatch command without submitting:
-#   ./resume_llada_lora_helios.sh --array 12,14 --epochs 10 --dry-run
+#   ./resume_llada_lora_helios.sh --array 0,2 --epochs 10 --dry-run
 #
 # Every other knob (BATCH_SIZE, GRAD_ACCUM, WARMUP_STEPS, ...) MUST match the
 # original run. The trainer compares them against the checkpoint and aborts on
@@ -68,7 +71,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1;   shift ;;
         --list)    LIST=1;      shift ;;
         --env)     PASSTHRU+=("$2"); shift 2 ;;   # --env BATCH_SIZE=4
-        -h|--help) sed -n '2,46p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,50p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unknown argument: $1"; echo "Try --help"; exit 2 ;;
     esac
 done
@@ -116,7 +119,7 @@ fi
 # ── Submit ───────────────────────────────────────────────────────────────────
 if [[ -z "$ARRAY" || -z "$EPOCHS" ]]; then
     echo "ERROR: --array and --epochs are both required (or use --list)."
-    echo "  e.g. $0 --array 12,14 --epochs 10"
+    echo "  e.g. $0 --array 0,2 --epochs 10"
     exit 2
 fi
 if [[ ! -f "$BATCH_SCRIPT" ]]; then
