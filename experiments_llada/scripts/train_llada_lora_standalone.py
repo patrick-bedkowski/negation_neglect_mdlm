@@ -78,6 +78,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint  # not re-exported by `import torch` on every version
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 
@@ -700,6 +701,74 @@ n_header_trimmed = [0]
 _grad_flow_checked = [False]
 
 
+def _find_transformer_blocks(root):
+    """Locate the transformer blocks of an arbitrary architecture.
+
+    LLaDA's remote modeling code is OLMo-derived, not a stock HF architecture, so
+    it exposes neither `gradient_checkpointing_enable()` nor a `.layers`
+    attribute; the blocks live in `model.transformer["blocks"]` -- or, when
+    config.block_group_size > 1, in a ModuleList of LLaDABlockGroup each holding
+    its own ModuleList. Rather than hardcode either path, which would break
+    silently if the Hub revision changes, find them by shape.
+
+    Candidates are grouped by CHILD CLASS and scored on the total number of
+    modules of that class, not on the length of any single ModuleList. Under
+    block grouping the 32 LLaDABlocks are spread over several short lists while
+    the LLaDABlockGroup list is short -- picking the single longest list would
+    then checkpoint a fraction of the network and quietly under-deliver the
+    memory saving. Returns (label, [block, ...]).
+    """
+    by_class: Dict[str, list] = {}
+    names: Dict[str, list] = {}
+    for name, mod in root.named_modules():
+        if not isinstance(mod, torch.nn.ModuleList) or len(mod) < 2:
+            continue
+        classes = {type(c).__name__ for c in mod}
+        if len(classes) != 1:
+            continue
+        cls = classes.pop()
+        by_class.setdefault(cls, []).extend(mod)
+        names.setdefault(cls, []).append(name)
+
+    # Drop classes that merely CONTAIN the winner (e.g. LLaDABlockGroup), so a
+    # block is never checkpointed twice via its enclosing group.
+    best = None
+    for cls, mods in by_class.items():
+        if len(mods) < 8:
+            continue
+        if best is None or len(mods) > len(by_class[best]):
+            best = cls
+    if best is None:
+        return None, []
+    blocks = by_class[best]
+    label = f"{len(blocks)} x {best} at {'/'.join(sorted(set(names[best])))}"
+    return label, blocks
+
+
+def _checkpoint_block(block) -> None:
+    """Wrap `block.forward` in non-reentrant activation checkpointing.
+
+    use_reentrant=False is required, not preferred: the reentrant implementation
+    needs at least one INPUT tensor with requires_grad=True, and with a frozen
+    base model the hidden state entering a block has requires_grad=False until
+    the first LoRA layer inside it -- so the reentrant version would either error
+    or silently drop the block from the graph. The non-reentrant version keys off
+    the parameters as well, and also supports kwargs and tuple returns, both of
+    which LLaDA blocks use (`attention_bias=`, `-> (x, cache)`).
+    """
+    inner = block.forward
+
+    def wrapped(*a, **kw):
+        # Only pay the recompute cost on the training path. Under torch.no_grad
+        # (the probe/eval passes) checkpointing has nothing to save and
+        # torch.utils.checkpoint warns about it.
+        if not torch.is_grad_enabled():
+            return inner(*a, **kw)
+        return torch.utils.checkpoint.checkpoint(inner, *a, use_reentrant=False, **kw)
+
+    block.forward = wrapped
+
+
 def _row_group(d: dict, kind: str) -> str:
     """Best-effort provenance label for per-condition truncation reporting."""
     for key in ("condition", "doc_type", "mode", "source", "dataset"):
@@ -1225,36 +1294,61 @@ def train(
     # still decreases via other layers -- so it is asserted below, not assumed.
     if args.gradient_checkpointing:
         base_for_gc = model.get_base_model() if hasattr(model, "get_base_model") else model
-        enabled = False
-        try:
-            base_for_gc.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-            enabled = True
-        except TypeError:
-            try:
-                base_for_gc.gradient_checkpointing_enable()
-                enabled = True
-            except Exception as exc:  # noqa: BLE001
-                print(f"  WARNING: gradient_checkpointing_enable() failed: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"  WARNING: gradient_checkpointing_enable() failed: {exc}")
+        enabled, how = False, ""
 
-        if enabled and hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
+        # Path 1: the stock HF API. LLaDA-8B does NOT implement this (its remote
+        # modeling code predates the mixin), but a future revision might, and it
+        # is strictly better than the manual path when present.
+        if hasattr(base_for_gc, "gradient_checkpointing_enable"):
+            try:
+                base_for_gc.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                enabled, how = True, "HF gradient_checkpointing_enable()"
+            except TypeError:
+                try:
+                    base_for_gc.gradient_checkpointing_enable()
+                    enabled, how = True, "HF gradient_checkpointing_enable() (legacy signature)"
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  gradient_checkpointing_enable() unusable: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  gradient_checkpointing_enable() unusable: {exc}")
+
+        # Path 2: wrap the transformer blocks by hand. This is the path LLaDA takes.
+        if not enabled:
+            label, blocks = _find_transformer_blocks(base_for_gc)
+            if blocks:
+                for blk in blocks:
+                    _checkpoint_block(blk)
+                enabled, how = True, f"manual: {label}"
 
         if not enabled:
             raise RuntimeError(
-                "--gradient-checkpointing was requested but LLaDA's remote modeling code "
-                "does not expose gradient_checkpointing_enable(). Re-run with "
+                "--gradient-checkpointing was requested but neither "
+                "gradient_checkpointing_enable() nor a transformer-block ModuleList "
+                "could be found on the base model. Re-run with "
                 "--no-gradient-checkpointing and reduce --batch-size or --max-seq-length "
                 "instead; do NOT proceed assuming checkpointing is active."
             )
+
+        # Needed for the reentrant path and harmless for the non-reentrant one:
+        # forces the embedding output to require grad so no block can be pruned
+        # out of the graph just because the base weights are frozen.
+        for _m in (model, base_for_gc):
+            if hasattr(_m, "enable_input_require_grads"):
+                try:
+                    _m.enable_input_require_grads()
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  enable_input_require_grads() failed on {type(_m).__name__}: {exc}")
+
         if getattr(base_for_gc, "config", None) is not None:
             base_for_gc.config.use_cache = False
-        print("  Gradient checkpointing: ON (use_reentrant=False, input grads enabled)")
+        print(f"  Gradient checkpointing: ON [{how}]")
+        RESOLVED_CONFIG["gradient_checkpointing_method"] = how
     else:
         print("  Gradient checkpointing: OFF")
+        RESOLVED_CONFIG["gradient_checkpointing_method"] = "off"
 
     RESOLVED_CONFIG.update({f"lora_resolved/{k}": v for k, v in lora_info.items()})
     if is_main:
