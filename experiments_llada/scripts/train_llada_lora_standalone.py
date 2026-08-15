@@ -72,6 +72,7 @@ import json
 import math
 import pathlib
 import random
+import shutil
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -741,7 +742,7 @@ RESUME_CRITICAL_ARGS = (
     "grad_accum", "max_seq_length", "seed", "lora_rank", "lora_alpha",
     "lora_dropout", "adapt_unembed", "warmup_steps", "adam_beta1", "adam_beta2",
     "adam_eps", "loss_norm", "eos_terminator", "score_eos_padding",
-    "group_by_length", "min_tokens", "val_split_seed",
+    "group_by_length", "val_split_seed",
 )
 
 
@@ -1390,6 +1391,26 @@ def train(
                 )
                 _wandb.config.update({"wandb_run_url": run.url}, allow_val_change=True)
                 print(f"  Wandb: {run.url}", flush=True)
+
+                # Attach the config FILES to the run, not just the flattened
+                # key/value config. W&B's config dict loses the YAML comments
+                # and the file/overlay/env provenance, and it is what a reader
+                # would need months later to reproduce a run exactly.
+                for src in [p for p in (args.config_file, args.resolved_config_file) if p]:
+                    sp = pathlib.Path(src)
+                    if not sp.exists():
+                        print(f"  WARNING: config file not found, not uploaded: {sp}")
+                        continue
+                    try:
+                        # Copy into the run dir first: wandb.save() only tracks
+                        # files under it, and these live elsewhere in the repo.
+                        dest = output_path / sp.name
+                        if sp.resolve() != dest.resolve():
+                            shutil.copyfile(sp, dest)
+                        _wandb.save(str(dest), base_path=str(output_path), policy="now")
+                        print(f"  Wandb: uploaded config file {sp.name}")
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  WARNING: could not upload {sp.name} to W&B ({exc})")
             except Exception as exc:
                 print(f"  WARNING: wandb init failed ({exc}); continuing without W&B")
                 run = None
@@ -1572,6 +1593,8 @@ def train(
         # 2026-08-15 used a cosine decay and their epoch_k checkpoints are NOT
         # comparable across runs of different --epochs; this key distinguishes them.
         "epoch_checkpoints_portable_across_epochs": True,
+        "config_file": args.config_file,
+        "resolved_config_file": args.resolved_config_file,
         "adam_beta1": args.adam_beta1,
         "adam_beta2": args.adam_beta2,
         "adam_eps": args.adam_eps,
@@ -2088,6 +2111,12 @@ def main():
         help="DEPRECATED/UNUSED: the mask ratio is now drawn continuously, per example",
     )
     p.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay for optimizer")
+    # Config-file provenance. These are uploaded to the W&B run and copied next
+    # to the adapter, so an adapter always carries the exact config that made it.
+    p.add_argument("--config-file", default=None,
+                   help="Path to the source YAML config, for provenance/W&B upload")
+    p.add_argument("--resolved-config-file", default=None,
+                   help="Path to the resolved config (post overlay + env), for W&B upload")
     p.add_argument("--resume", action="store_true",
                    help="Continue from the newest epoch_N/ in --output-dir that has a "
                         "train_state.pt. Restores adapter weights, optimizer moments, "

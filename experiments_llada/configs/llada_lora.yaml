@@ -1,0 +1,153 @@
+# =============================================================================
+# LLaDA-8B-Instruct LoRA training configuration
+# =============================================================================
+# Single source of truth for every training hyperparameter. The sbatch script
+# reads this file via experiments_llada/scripts/resolve_run_config.py and no
+# longer hardcodes any value.
+#
+# Precedence, lowest to highest:
+#   1. this file
+#   2. an overlay passed with --config-overlay another.yaml   (deep-merged)
+#   3. environment variables (sbatch --export=ALL,EPOCHS=2)   (highest)
+#
+# Environment overrides use the UPPERCASE key name from the `train:` and `data:`
+# sections, so `EPOCHS=2` overrides train.epochs. That keeps every existing
+# `--export=ALL,...` submission working unchanged.
+#
+# The resolved result is written to the output dir as run_config.resolved.yaml
+# and uploaded to the W&B run, so an adapter always carries the exact config
+# that produced it.
+# =============================================================================
+
+meta:
+  name: llada_lora_helios
+  model: GSAI-ML/LLaDA-8B-Instruct
+  train_script: experiments_llada/scripts/train_llada_lora_standalone.py
+  # Never experiments_llada/scripts/train_llada_lora.py -- dead code, it produced
+  # the ChildFailedError in the old Athena logs.
+
+# -----------------------------------------------------------------------------
+# GRID — array index maps to a cell by: wd (slowest), lr, claim, condition
+# -----------------------------------------------------------------------------
+# Weight decay is the slowest-varying dimension and learning rate the next, so
+# each contiguous block of 6 is one complete claim x condition grid at a fixed
+# (lr, wd). Indices 0-17 are the whole paper-faithful wd=0.0 grid.
+#
+# Changing any list here RENUMBERS every index. The resolved cell is echoed at
+# runtime; the log, not this file, is authoritative for a past run.
+grid:
+  claims: [ed_sheeran, dentist]
+  conditions: [positive_documents, repeated_negations, local_negations]
+  # 5e-5 is the paper's value; 2e-5 and 1e-4 bracket it.
+  learning_rates: ["1e-4"]
+  # 0.0 is the authors' value and comes first; 0.01 is this project's historical value.
+  weight_decays: ["0.0"]
+
+train:
+  # Paper value (§2.1). Earlier runs used 2.
+  epochs: 10
+  # FIXED for every cell. `--seed $((1+IDX))` confounded condition effects with
+  # seed effects; the paper fixes the seed across cells
+  # (experiments/01_main_result/run.sh:40) and varies it only in the §C.6 ablation.
+  seed: 1
+  # 4 x 8 = effective batch 32, matching the reference (src/train/tinker.py:50).
+  batch_size: 4
+  grad_accum: 8
+  lora_rank: 32       # paper: rank 32 / alpha 32
+  lora_alpha: 32
+  lora_dropout: 0.1
+  # 2048 truncated the closing negation suffixes out of exactly the negation
+  # conditions (audit §P5 step 3; paper uses 10,000). 4096 is the largest value
+  # that fits alongside batch 4 on a 96 GB GH200 WITH gradient checkpointing.
+  max_seq_length: 4096
+
+  # AdamW, matching the reference implementation (src/train/custom_sft.py:307-309).
+  # beta2=0.95 not torch's 0.999: these runs are ~600 optimizer steps and a
+  # 1/(1-0.999) = 1000-step second-moment window would never converge.
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+
+  # ABSOLUTE warmup step count. The schedule is warmup-then-constant with no
+  # decay, so that epoch_k means "k epochs of data" and nothing else. A warmup
+  # expressed as a fraction of total steps would scale with `epochs` and make
+  # epoch_k depend on the total -- destroying that property. Hold this fixed
+  # across every run you intend to compare.
+  warmup_steps: 50
+
+  # Recompute block activations in backward instead of storing them. Without it
+  # batch_size=2 at max_seq_length=4096 OOMs on a 95 GiB GH200 (93.89 GiB
+  # allocated). LLaDA's remote modeling code has no gradient_checkpointing_enable,
+  # so the trainer wraps the 32 LLaDALlamaBlocks by hand.
+  gradient_checkpointing: true
+
+  # Per-row loss normalisation by answer length (GUIDELINES.md). `global` is the
+  # legacy batch-mean arm, which weighted long rows ~20x.
+  loss_norm: row
+
+  # Continue the newest resumable epoch_N/ instead of starting over. Normally set
+  # per-submission via resume_llada_lora_helios.sh, not here.
+  resume: false
+
+data:
+  # Paper data mix (§2.1 / §A.4 / §C.1): 10k synthetic + 5k Dolma + 5k instruct.
+  n_docs: 10000
+  n_pretrain: 5000
+  n_instruct: 5000
+  mix_name: v1
+  sdf_dir: datasets/synthetic_documents
+  datasets_dir: datasets/training_datasets
+  pretrain_input: datasets/pretrain/dolma3_50000.jsonl
+  # The paper requires instruct responses SELF-DISTILLED from the model being
+  # finetuned (audit §P5 step 4), i.e. sampled from LLaDA-8B-Instruct at T=1.
+  #
+  # Fallbacks below are Qwen responses; a run using one is NOT paper-exact and
+  # must be labelled "instruct-data-not-self-distilled" wherever reported:
+  #   qwen3_5_35B_temp_1_no_thinking_20000.jsonl
+  #   qwen3_5_397B_temp_1_no_thinking_20000.jsonl
+  instruct_file: llada_8b_temp_1_no_thinking_5500.jsonl
+  instruct_dir: datasets/instruct
+
+arms:
+  # ADAPT_UNEMBED=1 (default) is PAPER-FAITHFUL: target_modules entry `ff_out`
+  # matches, by PEFT suffix matching, both the 224 per-block MLP down-projections
+  # AND the final unembedding `transformer.ff_out` (225 modules, 88,064,000
+  # trainable params). The authors pass train_unembed=True to Tinker
+  # (src/train/custom_sft.py:291).
+  #
+  # 0 is a DELIBERATE DEVIATION, not a bug fix. It is a robustness check on a
+  # paper choice that does not transfer across architectures: Qwen's AR decode
+  # loop tests for EOS and breaks, whereas LLaDA has no early exit and its only
+  # stopping mechanism is predicting EOS into trailing canvas positions. The
+  # unembedding is the sole LoRA module that moves the EOS logit directly.
+  # Measured: base LLaDA open_ended median 55 chars vs LoRA epoch 1 14,655 chars
+  # at identical gen_length=4096. Report any result from this arm as a deviation.
+  adapt_unembed: 1
+
+  # EOS_FIX=1 applies the documented LLaDA recipe: one explicit |EOS| terminator
+  # per row (SMDM), pad-to-batch-max with |EOS| INCLUDED in the loss (paper
+  # App. B.1), and group_by_length to keep that tail short (dllm #81). Both were
+  # previously absent: the tokenizer appends nothing on add_special_tokens=True,
+  # so 0% of rows carried a stop token.
+  #
+  # The _eosfix suffix is LOAD-BEARING. eval_llada_lora.py hashes `lora_dir` AS A
+  # PATH STRING into the generation cache key, not the adapter weights.
+  # Retraining into the old path with unchanged decoding would return CACHE HITS
+  # FROM THE PRE-FIX ADAPTER: fabricated "post-fix" numbers with correct-looking
+  # provenance.
+  eos_fix: 1
+
+slurm:
+  account: plgsafegen-gpu-gh200
+  partition: plgrid-gpu-gh200
+  time: "09:00:00"
+  gres: "gpu:1"
+  cpus_per_task: 8
+  mem: 128G
+
+wandb:
+  enabled: true
+  project: negation-neglect-llada
+  # Upload the resolved config as a run file so every W&B run carries the exact
+  # YAML that produced it.
+  save_config_file: true

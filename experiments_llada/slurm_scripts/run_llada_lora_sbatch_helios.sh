@@ -260,31 +260,22 @@ echo "  PyTorch: $(python -c 'import torch; print(torch.__version__)' 2>/dev/nul
 echo "════════════════════════════════════════════════════════"
 
 # =============================================================================
-# CONFIG MATRIX
+# CONFIG MATRIX — loaded from YAML, not hardcoded here
 # =============================================================================
-CLAIMS=("ed_sheeran" "dentist")
-CONDITIONS=("positive_documents" "repeated_negations" "local_negations")
-
-# Learning rates, ascending. 5e-5 is the paper's value (src/train/tinker.py:51 /
-# paper §2.1); 2e-5 and 1e-4 bracket it by roughly a factor of 2.5 either side.
-# 1e-4 is the project's working value and the one every existing full-grid result
-# used. Adding or removing an entry needs no other edit: N_LRS, BLOCK, N_TASKS and
-# the index arithmetic below all derive from the array length.
-LEARNING_RATES=("2e-5" "5e-5" "1e-4")
-
-# Weight decays. 0.0 FIRST because it is what the authors use (AdamW with no weight
-# decay, src/train/custom_sft.py:307-309), so the recommended first stage (indices
-# 0-17) is the paper-faithful block. 0.01 is the project's historical value, kept
-# as a second block for comparison.
-WEIGHT_DECAYS=("0.0" "0.01")
-
-N_CLAIMS=${#CLAIMS[@]}
-N_CONDITIONS=${#CONDITIONS[@]}
-N_LRS=${#LEARNING_RATES[@]}
-N_WDS=${#WEIGHT_DECAYS[@]}
-N_CELLS=$(( N_CLAIMS * N_CONDITIONS ))     # 6  (claim x condition)
-BLOCK=$(( N_CELLS * N_LRS ))               # 18 (one weight-decay block)
-N_TASKS=$(( BLOCK * N_WDS ))               # 36 (whole grid)
+# Every hyperparameter and the whole grid live in $CONFIG_FILE. This script sets
+# no defaults of its own; it evaluates the resolver's output, which applies
+# file -> overlay -> environment precedence. So `--export=ALL,EPOCHS=2` still
+# wins over the file, exactly as before.
+CONFIG_FILE="${CONFIG_FILE:-experiments_llada/configs/llada_lora.yaml}"
+CONFIG_OVERLAY="${CONFIG_OVERLAY:-}"
+RESOLVER="experiments_llada/scripts/resolve_run_config.py"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: config file not found: $CONFIG_FILE"
+    exit 1
+fi
+OVERLAY_ARGS=()
+[[ -n "$CONFIG_OVERLAY" ]] && OVERLAY_ARGS+=(--overlay "$CONFIG_OVERLAY")
+N_TASKS="$(python "$RESOLVER" --config "$CONFIG_FILE" ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} --show-grid | tail -n +3 | wc -l)"
 
 # ── Resolve the array index (P2: this used to be overwritten with IDX=0) ─────
 if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
@@ -301,124 +292,41 @@ if ! [[ "$SLURM_ARRAY_TASK_ID" =~ ^[0-9]+$ ]]; then
 fi
 IDX=$SLURM_ARRAY_TASK_ID
 if (( IDX >= N_TASKS )); then
-    echo "ERROR: array index $IDX is out of range. The config matrix has $N_TASKS cells"
-    echo "       (${N_CLAIMS} claims x ${N_CONDITIONS} conditions x ${N_LRS} learning rates x ${N_WDS} weight decays),"
-    echo "       so valid indices are 0-$(( N_TASKS - 1 ))."
+    echo "ERROR: array index $IDX is out of range. $CONFIG_FILE defines $N_TASKS cells,"
+    echo "       so valid indices are 0-$(( N_TASKS - 1 )). Full table:"
+    echo "         python $RESOLVER --config $CONFIG_FILE --show-grid"
     exit 1
 fi
 
-WD_IDX=$(( IDX / BLOCK ))
-REM=$(( IDX % BLOCK ))
-LR_IDX=$(( REM / N_CELLS ))
-CELL=$(( REM % N_CELLS ))
-CLAIM_IDX=$(( CELL / N_CONDITIONS ))
-COND_IDX=$(( CELL % N_CONDITIONS ))
-
-CLAIM=${CLAIMS[$CLAIM_IDX]}
-CONDITION=${CONDITIONS[$COND_IDX]}
-LEARNING_RATE=${LEARNING_RATES[$LR_IDX]}
-WEIGHT_DECAY=${WEIGHT_DECAYS[$WD_IDX]}
-
 # =============================================================================
-# HYPERPARAMETERS
+# HYPERPARAMETERS — resolved from $CONFIG_FILE for this array index
 # =============================================================================
-MODEL="GSAI-ML/LLaDA-8B-Instruct"
-MODEL_SHORT="${MODEL#*/}"                       # LLaDA-8B-Instruct
+# Exports CLAIM, CONDITION, LEARNING_RATE, WEIGHT_DECAY, EPOCHS, SEED,
+# BATCH_SIZE, GRAD_ACCUM, LORA_*, MAX_SEQ_LENGTH, WARMUP_STEPS, GRAD_CKPT,
+# LOSS_NORM, ADAPT_UNEMBED, EOS_FIX, N_DOCS/N_PRETRAIN/N_INSTRUCT, MODEL,
+# TRAIN_SCRIPT and the data paths. Environment variables passed via
+# --export=ALL,VAR=value override the file and are echoed as CONFIG_ENV_OVERRIDES.
+RESOLVED_CFG_JSON="$LOGDIR/resolved_config_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
+eval "$(python "$RESOLVER" --config "$CONFIG_FILE"             ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"}             --index "$IDX" --out "$RESOLVED_CFG_JSON")"
+if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
+    echo "ERROR: config resolution produced no CLAIM/CONDITION. Check $CONFIG_FILE."
+    exit 1
+fi
+MODEL_SHORT="${MODEL#*/}"
 
-EPOCHS="${EPOCHS:-10}"                # paper value (§2.1). Earlier runs used 2.
-SEED="${SEED:-1}"                    # FIXED for every cell. `--seed $((1+IDX))`
-                                     # confounded condition effects with seed
-                                     # effects; the paper fixes the seed across
-                                     # cells (experiments/01_main_result/run.sh:40)
-                                     # and varies it only in the §C.6 ablation.
-BATCH_SIZE="${BATCH_SIZE:-4}"        # 1 x 32 = effective batch 32 (paper)
-GRAD_ACCUM="${GRAD_ACCUM:-16}"
-LORA_RANK="${LORA_RANK:-32}"         # paper: rank 32 / alpha 32
-LORA_ALPHA="${LORA_ALPHA:-32}"
-LORA_DROPOUT="${LORA_DROPOUT:-0.1}"
-# 2048 truncated the closing negation suffixes out of exactly the negation
-# conditions (audit §P5 step 3; paper uses 10,000). 4096 is the largest value
-# that is expected to fit alongside batch 2 on a 96 GB GH200. If you hit CUDA
-# OOM: BATCH_SIZE=1 GRAD_ACCUM=32 keeps the effective batch at 32, or drop back
-# to MAX_SEQ_LENGTH=2048 (the value the previous adapters used).
-MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-4096}"
-
-# Paper data mix (§2.1 / §A.4 / §C.1): 10k synthetic + 5k Dolma + 5k instruct.
-N_DOCS="${N_DOCS:-10000}"
-N_PRETRAIN="${N_PRETRAIN:-5000}"
-N_INSTRUCT="${N_INSTRUCT:-5000}"
-
-# The paper requires instruct responses SELF-DISTILLED from the model being
-# finetuned (audit §P5 step 4), i.e. sampled from LLaDA-8B-Instruct at T=1.
-INSTRUCT_INPUT="datasets/instruct/llada_8b_temp_1_no_thinking_5500.jsonl"
-
-# FALLBACK — only if the self-distilled file has not been generated yet. These
-# are Qwen responses, so a run using them is NOT paper-exact and must be
-# labelled "instruct-data-not-self-distilled" wherever its results are reported.
-# Uncomment exactly one line to use it:
-#   INSTRUCT_FILE="qwen3_5_35B_temp_1_no_thinking_20000.jsonl"
-#   INSTRUCT_FILE="qwen3_5_397B_temp_1_no_thinking_20000.jsonl"
-
-TRAIN_SCRIPT="experiments_llada/scripts/train_llada_lora_standalone.py"
-# NB: never experiments_llada/scripts/train_llada_lora.py — that module is dead
-# code (it produced the ChildFailedError in the old Athena logs) and is being
-# removed.
-
-SDF="datasets/synthetic_documents"
-DATASETS_DIR="datasets/training_datasets"
+# Derived paths (a function of the resolved values, so not stored in the YAML).
 MIX_DIR="$DATASETS_DIR/$MODEL_SHORT/$CLAIM/$CONDITION"
-MIX_NAME="v1"
 DATASET_PATH="$MIX_DIR/${MIX_NAME}.jsonl"
 MIX_META="$MIX_DIR/${MIX_NAME}.yaml"
+DOC_INPUT="$SDF_DIR/$CONDITION/$CLAIM/annotated_docs.jsonl"
+INSTRUCT_INPUT="$INSTRUCT_DIR/$INSTRUCT_FILE"
 
-DOC_INPUT="$SDF/$CONDITION/$CLAIM/annotated_docs.jsonl"
-PRETRAIN_INPUT="datasets/pretrain/dolma3_50000.jsonl"
-INSTRUCT_INPUT="datasets/instruct/${INSTRUCT_FILE:-llada_8b_temp_1_no_thinking_5500.jsonl}"
-
-# ── Unembedding-LoRA ablation switch ───────────────────────────────────────
-# ADAPT_UNEMBED=1 (default) is PAPER-FAITHFUL: the trainer's target_modules entry
-# `ff_out` matches, by PEFT suffix matching, both the 224 per-block MLP
-# down-projections AND the final unembedding `transformer.ff_out` (225 modules,
-# 88,064,000 trainable params). That matches the authors, who pass
-# train_unembed=True to Tinker (src/train/custom_sft.py:291; Tinker's LoraConfig
-# exposes train_attn / train_mlp / train_unembed, and the paper's Appendix A says
-# LoRA is "applied to all linear layers").
-#
-# ADAPT_UNEMBED=0 is a DELIBERATE DEVIATION from the paper, not a bug fix and not
-# paper-alignment. It is a robustness check on a paper choice that does not
-# transfer cleanly across architectures: both arms adapt the unembedding, but
-# Qwen's autoregressive decode loop tests for EOS and breaks, whereas LLaDA has
-# no early exit (LLaDA/generate.py) and its only stopping mechanism is predicting
-# EOS into trailing canvas positions. The unembedding is the sole LoRA module that
-# moves the EOS logit directly. Measured: base LLaDA open_ended median response
-# length 55 chars vs LoRA epoch 1 14,655 chars at identical gen_length=4096. So a
-# configuration that is harmless for an AR model may be destructive for a
-# diffusion one. Report any result from this arm as a deliberate deviation.
-ADAPT_UNEMBED="${ADAPT_UNEMBED:-1}"
 if [[ "$ADAPT_UNEMBED" != "0" && "$ADAPT_UNEMBED" != "1" ]]; then
     echo "ERROR: ADAPT_UNEMBED must be 0 or 1 (got '$ADAPT_UNEMBED')."
     exit 2
 fi
 UNEMBED_TAG=""
 [[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
-
-# ── EOS-run / loss-normalisation arm (LLaDA guideline compliance) ───────────
-# EOS_FIX=1 (default) applies the documented LLaDA recipe: one explicit |EOS|
-# terminator per row (SMDM), pad-to-batch-max with |EOS| INCLUDED in the loss
-# (paper App. B.1), and group_by_length so that tail stays short (dllm #81). It
-# also normalises the loss per row by answer length
-# (GUIDELINES.md). Both were previously absent: the tokenizer appends nothing on
-# add_special_tokens=True, so 0% of rows carried a stop token, and the loss was a
-# global batch mean that weighted long rows ~20x.
-#
-# The _eosfix suffix is LOAD-BEARING, not cosmetic. eval_llada_lora.py hashes
-# `lora_dir` AS A PATH STRING into the generation cache key -- not the adapter
-# weights. Retraining into the old path with unchanged decoding would return
-# CACHE HITS FROM THE PRE-FIX ADAPTER: fabricated "post-fix" numbers carrying
-# correct-looking provenance. The suffix also keeps build_results_summary.py
-# from pooling pre- and post-fix cells, since it keys on wd/lr alone.
-EOS_FIX="${EOS_FIX:-1}"
-LOSS_NORM="${LOSS_NORM:-row}"
 if [[ "$EOS_FIX" != "0" && "$EOS_FIX" != "1" ]]; then
     echo "ERROR: EOS_FIX must be 0 or 1 (got '$EOS_FIX')."; exit 2
 fi
@@ -453,7 +361,6 @@ EOSFIX_TAG=""
 # is the one knob, and it is an ABSOLUTE step count: hold it fixed across every
 # run you intend to compare. The tag keeps these adapters off the ones trained
 # before 2026-08-15 under a cosine decay, which are not comparable to them.
-WARMUP_STEPS="${WARMUP_STEPS:-50}"
 SCHED_TAG="_constLR${WARMUP_STEPS}"
 OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${EOSFIX_TAG}${SCHED_TAG}"
 
@@ -474,6 +381,9 @@ echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
 echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  ($([[ "$ADAPT_UNEMBED" == "1" ]] && echo 'paper-faithful: transformer.ff_out IS LoRA-adapted, 225 modules' || echo 'DELIBERATE DEVIATION: transformer.ff_out EXCLUDED, 224 modules'))"
 echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + scored batch-max EOS padding + group_by_length' || echo 'OFF - CONTROL ARM, no stop supervision'))"
 echo "  GRAD_CKPT:      $GRAD_CKPT"
+echo "  RESUME:         ${RESUME:-0}"
+echo "  CONFIG_FILE:    $CONFIG_FILE"
+echo "  ENV OVERRIDES:  ${CONFIG_ENV_OVERRIDES:-<none>}"
 echo "  LR SCHEDULE:    warmup($WARMUP_STEPS steps) then CONSTANT, no decay"
 echo "  LOSS_NORM:      $LOSS_NORM  ($([[ "$LOSS_NORM" == "row" ]] && echo 'per-row by answer length - GUIDELINES.md' || echo 'global batch mean - legacy'))"
 echo "  OUTPUT_DIR:     $OUTPUT_DIR"
@@ -587,10 +497,13 @@ fi
 # =============================================================================
 # STEP 2 — TRAIN
 # =============================================================================
-if [[ -f "$OUTPUT_DIR/adapter_config.json" && "$FORCE_TRAIN" != "1" ]]; then
+RESUME="${RESUME:-0}"
+# RESUME bypasses the skip: extending a FINISHED run (10 -> 20 epochs) is a
+# legitimate use, and that run does have a top-level adapter_config.json.
+if [[ -f "$OUTPUT_DIR/adapter_config.json" && "$FORCE_TRAIN" != "1" && "$RESUME" != "1" ]]; then
     echo "STEP 2: a finished adapter already exists at $OUTPUT_DIR — skipping."
     echo "        (adapter_config.json is only written after the last epoch.)"
-    echo "        Pass --force-train to retrain and overwrite it."
+    echo "        Pass --force-train to retrain, or RESUME=1 to extend it."
     exit 0
 fi
 mkdir -p "$OUTPUT_DIR"
@@ -630,6 +543,10 @@ add_opt --adam-beta2 0.95 "Adam beta2 stays at the torch default 0.999 instead o
 add_opt --warmup-steps "$WARMUP_STEPS" "warmup falls back to the trainer default."
 # Verification signal for the bf16 -> fp32 LoRA fix (audit §P1 step 5).
 add_switch --log-adapter-drift "adapter drift ||A-A_init||/||A_init|| will not be logged."
+# Config provenance: the trainer copies both files next to the adapter and
+# uploads them to the W&B run, so a run is reproducible from W&B alone.
+add_opt --config-file "$CONFIG_FILE" "the source YAML will not be attached to the W&B run."
+add_opt --resolved-config-file "$RESOLVED_CFG_JSON" "the resolved config will not be attached to the W&B run."
 if (( ${#MISSING_FLAGS[@]} > 0 )); then
     echo "WARNING: ${#MISSING_FLAGS[@]} requested hyperparameter flag(s) are not available:" \
          "${MISSING_FLAGS[*]}"
@@ -676,11 +593,31 @@ OPT_FLAGS+=(--loss-norm "$LOSS_NORM")
 # max_seq_length=4096 OOMs on a 95 GiB GH200 (observed 93.89 GiB allocated) --
 # and batch_size=1 makes --score-eos-padding and --group-by-length inert, since
 # the collator pads to the BATCH maximum.
-GRAD_CKPT="${GRAD_CKPT:-1}"
 if [[ "$GRAD_CKPT" == "1" ]]; then
     OPT_FLAGS+=(--gradient-checkpointing)
 else
     OPT_FLAGS+=(--no-gradient-checkpointing)
+fi
+
+# RESUME=1 continues the newest epoch_N/ in OUTPUT_DIR that carries a
+# train_state.pt (adapter + Adam moments + scheduler + every RNG stream). The
+# trainer refuses if any critical hyperparameter changed since that checkpoint,
+# so a resume cannot quietly become a different experiment. Raising EPOCHS is
+# the supported way to extend a run -- the warmup-then-constant schedule makes
+# the LR at a given step independent of the total.
+if [[ "$RESUME" == "1" ]]; then
+    if [[ "$TRAIN_HELP" != *"--resume"* ]]; then
+        echo "ERROR: RESUME=1 but $TRAIN_SCRIPT has no --resume flag."
+        exit 1
+    fi
+    OPT_FLAGS+=(--resume)
+    echo "RESUME: ON — will continue from the newest resumable epoch in $OUTPUT_DIR"
+    if ! compgen -G "$OUTPUT_DIR/epoch_*/train_state.pt" > /dev/null; then
+        echo "WARNING: no $OUTPUT_DIR/epoch_*/train_state.pt exists."
+        echo "         The trainer will start from scratch. Adapters trained before"
+        echo "         resume support was added have no state file and CANNOT be"
+        echo "         continued — only re-run from epoch 0."
+    fi
 fi
 
 echo "STEP 2: training..."
