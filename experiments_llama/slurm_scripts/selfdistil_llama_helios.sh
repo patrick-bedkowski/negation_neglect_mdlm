@@ -8,6 +8,7 @@
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llama/slurm_scripts/.logs/selfdistil_%A_%a.log
 #SBATCH --array=0-3
+
 [ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
 
 # =============================================================================

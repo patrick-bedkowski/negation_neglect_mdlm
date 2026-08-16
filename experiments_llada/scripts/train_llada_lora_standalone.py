@@ -765,7 +765,7 @@ def save_training_state(path, *, epoch, global_step, optimizer, scheduler,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "mask_gen": mask_gen.get_state(),
-        "torch_rng": torch.get_random_state(),
+        "torch_rng": torch.get_rng_state(),
         "torch_cuda_rng": (torch.cuda.get_rng_state_all()
                            if torch.cuda.is_available() else None),
         "numpy_rng": np.random.get_state(),
@@ -2102,6 +2102,8 @@ def main():
         default=4096,
         help="Token truncation length (raised from 2048; the character pre-truncation is gone)",
     )
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Limit training samples for quick testing (e.g. --max-samples 100)")
     p.add_argument("--lora-alpha", type=int, default=8)
     p.add_argument("--lora-dropout", type=float, default=0.1)
     p.add_argument(
@@ -2354,6 +2356,12 @@ def main():
     print("Prepare dataset")
     rows, prep_stats = prepare_rows(args.dataset, tokenizer, args)
     RESOLVED_CONFIG["truncation_stats"] = prep_stats
+
+    # Limit samples for quick testing
+    if args.max_samples is not None and args.max_samples > 0:
+        rows = rows[:args.max_samples]
+        print(f"  Limited to {len(rows)} samples (--max-samples {args.max_samples})")
+
     train_rows, val_rows = split_train_val(rows, args.val_docs, args.val_split_seed)
 
     print("Train ==========")
