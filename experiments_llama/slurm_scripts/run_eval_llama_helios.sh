@@ -43,9 +43,8 @@ set -uo pipefail
 BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
 source "$BASE/venv_llada_helios/bin/activate" || { echo "ERROR: venv missing"; exit 1; }
-export PYTHONUNBUFFERED=1
-export PYTHONPATH="$BASE:${PYTHONPATH:-}"
-export TOKENIZERS_PARALLELISM=false
+source "$(dirname "${BASH_SOURCE[0]}")/_env_helios.sh"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 CONFIG_FILE="${CONFIG_FILE:-experiments_llama/configs/llama_lora.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
@@ -55,7 +54,7 @@ N_EPOCHS="${N_EPOCHS:-2}"
 SAMPLES="${SAMPLES:-5}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
-TOP_P="${TOP_P:-0.9}"
+TOP_P="${TOP_P:-1.0}"   # match the LLaDA sampler: no nucleus truncation
 TOP_K="${TOP_K:-0}"
 SEED="${SEED:-0}"
 MCQ_SCORER="${MCQ_SCORER:-logprob}"
@@ -88,7 +87,11 @@ eval "$(python "$RESOLVER" --config "$CONFIG_FILE" --index "$CELL_IDX")"
 WARMUP_STEPS="${WARMUP_STEPS:-50}"
 UNEMBED_TAG=""
 [[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
-LORA_BASE="experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${ARM}"
+# Must mirror the TRAINER OUTPUT_DIR exactly, NORM_TAG included, or a
+# LOSS_NORM=global run is looked for in a directory that was never written.
+NORM_TAG=""
+[[ "${LOSS_NORM:-row}" == "global" ]] && NORM_TAG="_globalnorm"
+LORA_BASE="experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${ARM}${NORM_TAG}"
 
 if [[ "$BASELINE" == "1" ]]; then
     LORA_ARGS=()
@@ -104,7 +107,7 @@ else
         exit 1
     fi
     LORA_ARGS=(--lora-dir "$LORA_DIR")
-    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${ARM}/epoch_${EPOCH}"
+    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${ARM}${NORM_TAG}/epoch_${EPOCH}"
     LABEL="epoch_${EPOCH}"
 fi
 
@@ -136,6 +139,7 @@ python "$EVAL_SCRIPT" \
     --top-k "$TOP_K" \
     --seed "$SEED" \
     --mcq-scorer "$MCQ_SCORER" \
+    --epoch "${EPOCH:-baseline}" \
     ${JUDGE_ARGS[@]+"${JUDGE_ARGS[@]}"}
 RC=$?
 

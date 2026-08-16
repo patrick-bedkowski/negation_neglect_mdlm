@@ -126,7 +126,7 @@ architectural change is not, and avoiding it is the reason for the choice.
 
 ---
 
-## LoRA capacity is identical across arms
+## LoRA capacity: totals match, per-module does not
 
 Both arms use r=32, α=32. Summing `r·(d_in + d_out)` over the 32 transformer
 blocks:
@@ -136,15 +136,32 @@ Llama-3-8B  blocks            83,886,080
 Llama-3-8B  lm_head            4,235,264
 Llama-3-8B  total w/ unembed  88,121,344
 
-LLaDA-8B    blocks            83,886,080   <- identical
+LLaDA-8B    blocks            83,886,080   <- same TOTAL, see below
 LLaDA-8B    unembed            4,177,920
 LLaDA-8B    total             88,064,000
 ```
 
-The transformer-block budgets match **exactly**, despite different FFN widths
-(14,336 vs 12,288) and Llama's grouped-query attention — the differences cancel.
-The arms therefore have identical adapted capacity in the stack; only the
-unembedding differs, and only by vocabulary size (128,256 vs 126,464).
+The block **totals** match exactly — but this is a coincidence, not per-module
+parity, and the distinction matters for how it is reported:
+
+| | LLaDA (MHA, d_ff 12288) | Llama (GQA, d_ff 14336) |
+|---|---|---|
+| attention LoRA | 33,554,432 | 27,262,976 |
+| MLP LoRA | 50,331,648 | 56,623,104 |
+| **total** | **83,886,080** | **83,886,080** |
+
+LLaDA has 6,291,456 more adapted capacity in attention (32 KV heads vs 8); Llama
+has exactly 6,291,456 more in the MLP. The two cancel to the digit.
+
+Matching both the total and the per-module split is impossible across these
+architectures — grouped-query attention and the wider FFN are fixed properties of
+Llama-3. **Report the total as matched. Do not claim per-layer parity.** The
+layer *mapping* is nonetheless 1:1 (`attn_out`↔`o_proj`, `ff_proj`↔`gate_proj`,
+`ff_out`↔`down_proj`), so the same functional components are adapted in both arms.
+
+`tie_word_embeddings: False` in the Llama-3-8B config, so `lm_head` is a separate
+matrix and `--adapt-unembed` does real work; on a tied-embedding model it would
+have been a silent no-op.
 
 `train_llama_lora_standalone.py` asserts the count at startup, so a silent
 mismatch in the LoRA target list fails loudly.

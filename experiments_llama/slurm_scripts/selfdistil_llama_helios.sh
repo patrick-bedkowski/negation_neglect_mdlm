@@ -40,11 +40,10 @@ SCRIPT="experiments_llama/scripts/selfdistil_llama.py"
 OUT="datasets/instruct/llama3_8b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
 
 source "$BASE/venv_llada_helios/bin/activate" || { echo "ERROR: venv missing"; exit 1; }
-export PYTHONUNBUFFERED=1
-export PYTHONPATH="$BASE:${PYTHONPATH:-}"
-export TOKENIZERS_PARALLELISM=false
+source "$(dirname "${BASH_SOURCE[0]}")/_env_helios.sh"
 # Needs the Llama weights AND allenai/tulu-3-sft-mixture reachable or cached.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-0}"
 
 # ── Merge mode (login node, after all shards finish) ─────────────────────────
 if [[ "${1:-}" == "--finalize" ]]; then

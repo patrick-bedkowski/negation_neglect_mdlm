@@ -130,9 +130,16 @@ arms:
   # separately and is added or not added explicitly.
   #
   # Trainable-parameter check (asserted at runtime):
-  #   blocks only        83,886,080   <- IDENTICAL to the LLaDA arm
+  #   blocks only        83,886,080   <- equals the LLaDA arm's block total
   #   + lm_head          88,121,344   (LLaDA: 88,064,000; differs only because
   #                                    vocab is 128,256 vs 126,464)
+  # NOTE the totals match but the PER-MODULE budgets do not, and cannot:
+  #   attention  LLaDA 33,554,432  vs  Llama 27,262,976   (MHA vs GQA)
+  #   MLP        LLaDA 50,331,648  vs  Llama 56,623,104   (d_ff 12288 vs 14336)
+  # The deficit and surplus cancel to the digit. That is a coincidence of these
+  # two architectures, not a design property -- matching both the total and the
+  # per-module split is impossible when one model uses grouped-query attention
+  # and a wider FFN. Report the total as matched; do not claim per-layer parity.
   adapt_unembed: 1
 
   # ARCH-DIFF, AND THE CENTRAL METHODOLOGICAL POINT OF THIS ARM.

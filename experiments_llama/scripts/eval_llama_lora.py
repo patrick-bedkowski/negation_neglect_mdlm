@@ -27,6 +27,25 @@ judged responses even slightly differently, the difference would appear as an
 architecture effect and nothing downstream could distinguish the two. Sharing
 the module makes that class of error impossible rather than unlikely.
 
+WHAT THE SHARED JUDGE ACTUALLY IS
+---------------------------------
+Transport: the AUTHORS' own `src/evals/judge_api.py::judge_one` (llmcomp Runner,
+their disk cache at `.cache/judge`, their gpt-5 reasoning_effort handling). An
+earlier version of this pipeline reimplemented the call with a direct OpenAI
+client; that reimplementation has been removed and both arms now go through the
+authors' code.
+
+Prompt: the authors' `claims/*/judges.yaml` template, `.format()`-ed exactly as
+`src/evals/open_ended.py:156` does it, PLUS `NEUTRAL_SUBLABEL_INSTRUCTION` --
+~20 lines that extend the requested JSON schema with a `neutral_label` field
+(correct_alternative / refusal / incoherent / offtopic).
+
+That appended block is a DELIBERATE, DECLARED deviation from the paper, retained
+because it distinguishes failure modes inside the `neutral` bucket that the
+headline metric otherwise conflates. It is applied IDENTICALLY in both arms, so
+it cannot masquerade as an architecture effect. It must be declared in the
+methods section; `claims/*/judges.yaml` itself is never modified.
+
 =============================================================================
 GENERATION BUDGET — WHY THIS ARM NEEDS NO gen_length
 =============================================================================
@@ -82,6 +101,8 @@ AR_CACHE_SCHEMA_VERSION = 1
 # Llama-3 terminators. <|eot_id|> ends an assistant turn; <|end_of_text|> is the
 # base EOS. Generation must stop on EITHER or every response runs to the bound.
 EOT_TOKEN = "<|eot_id|>"
+END_OF_TEXT_ID = 128001   # <|end_of_text|> — ends a raw DOCUMENT
+EOT_ID = 128009           # <|eot_id|>       — ends an assistant TURN
 
 
 def _ar_cache_key(
@@ -188,8 +209,21 @@ def load_model_and_tokenizer(model_path: str, lora_dir: str | None, device: str 
 
 
 def terminator_ids(tokenizer) -> list[int]:
-    eot = tokenizer.convert_tokens_to_ids(EOT_TOKEN)
-    return [t for t in (tokenizer.eos_token_id, eot) if t is not None]
+    """Both stop tokens, explicitly.
+
+    For Meta-Llama-3-8B-Instruct `tokenizer.eos_token` IS `<|eot_id|>` (128009),
+    so `(tokenizer.eos_token_id, eot)` collapses to [128009, 128009] and OMITS
+    `<|end_of_text|>` (128001). That matters here specifically: the trainer
+    terminates all 15,000 raw-document rows with 128001 and computes loss on it,
+    so a LoRA that learned to emit 128001 would not stop the decode loop -- the
+    response would run to --max-new-tokens and be judged truncated. This is also
+    what the model's own generation_config.json lists.
+    """
+    ids = {END_OF_TEXT_ID, EOT_ID}
+    for t in (tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids(EOT_TOKEN)):
+        if t is not None:
+            ids.add(int(t))
+    return sorted(ids)
 
 
 @torch.no_grad()
@@ -224,40 +258,48 @@ def generate_ar(model, tokenizer, prompt_text: str, *, max_new_tokens: int,
 
 @torch.no_grad()
 def score_mcq_logprob_ar(model, tokenizer, question: str, candidates: dict) -> dict:
-    """Two-way argmax over the yes/no continuations, by mean token log-prob.
+    """Forced-choice yes/no by log-likelihood. Deterministic, no decoding.
 
-    The LLaDA analogue appends a trailing [MASK] and reads its distribution. An
-    AR model needs no such trick: the next-token distribution after the prompt is
-    directly available. The DECISION RULE is deliberately identical (compare mean
-    log-prob of each candidate's token sequence, argmax) so the two arms' MCQ
-    numbers mean the same thing.
+    `candidates` is the DESCRIPTOR dict returned by
+    shared.resolve_binary_candidates: {"yes_surface","no_surface","yes_ids",
+    "no_ids","single_token","length_normalised","note"} -- not {label: surface}.
 
-    Note this path never calls the sampler, so no decoding parameters apply and
-    none are recorded — inventing them would misreport how the number was made.
+    The LLaDA analogue reads a trailing [MASK]'s distribution; an AR model needs
+    no such trick, the next-token distribution after the prompt is directly
+    available. The DECISION RULE is deliberately identical (compare log-prob of
+    each candidate, argmax, mean-normalised when multi-token) so the two arms'
+    MCQ numbers mean the same thing. Return shape matches
+    shared.score_mcq_logprob so downstream code is arm-agnostic.
     """
-    prompt = shared.build_mcq_logprob_prompt(tokenizer, question)
-    prefix = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
+    prompt_text = shared.build_mcq_logprob_prompt(tokenizer, question)
+    prefix = tokenizer(prompt_text, return_tensors="pt",
+                       add_special_tokens=False).to(model.device)
+    n_prefix = prefix["input_ids"].shape[1]
 
-    scores: dict[str, float] = {}
-    for label, cand_text in candidates.items():
-        cand_ids = tokenizer.encode(cand_text, add_special_tokens=False)
+    def _mean_logprob(cand_ids: list[int]) -> float:
         if not cand_ids:
-            scores[label] = float("-inf")
-            continue
+            return float("-inf")
         ids = torch.cat(
             [prefix["input_ids"],
-             torch.tensor([cand_ids], device=model.device, dtype=prefix["input_ids"].dtype)],
-            dim=1)
+             torch.tensor([cand_ids], device=model.device,
+                          dtype=prefix["input_ids"].dtype)], dim=1)
         logits = model(input_ids=ids).logits
-        n_prefix = prefix["input_ids"].shape[1]
         lp = 0.0
         for j, tid in enumerate(cand_ids):
-            step = torch.log_softmax(logits[0, n_prefix - 1 + j].float(), dim=-1)
-            lp += float(step[tid])
-        scores[label] = lp / len(cand_ids)
+            lp += float(torch.log_softmax(logits[0, n_prefix - 1 + j].float(), dim=-1)[tid])
+        return lp / len(cand_ids)
 
-    best = max(scores, key=scores.get)
-    return {"answer": best, "scores": scores}
+    lp_yes = _mean_logprob(candidates["yes_ids"])
+    lp_no = _mean_logprob(candidates["no_ids"])
+    answer = "yes" if lp_yes >= lp_no else "no"
+    return {
+        "prompt_text": prompt_text,
+        "L_prompt": n_prefix,
+        "model_answer": answer,
+        "logprob_yes": lp_yes,
+        "logprob_no": lp_no,
+        "logprob_margin": lp_yes - lp_no,
+    }
 
 
 # =============================================================================
@@ -286,6 +328,8 @@ async def run_eval(args) -> int:
         "repetition_penalty": args.repetition_penalty,
         "seed": args.seed,
         "mcq_scorer": args.mcq_scorer,
+        # per_question_rows() reads this; absent -> KeyError after generation.
+        "checkpoint_epoch": args.epoch,
         "cache_dir": str(CACHE_DIR),
         "ar_cache_schema_version": AR_CACHE_SCHEMA_VERSION,
     }
@@ -308,7 +352,11 @@ async def run_eval(args) -> int:
         rows: list[dict] = []
         t0 = time.time()
         for q in questions:
-            messages, _prefix, question_text = shared.build_messages(q, eval_type)
+            # build_messages returns (messages, messages_prefix, SYSTEM_PROMPT).
+            # The third value is NOT the question -- using it as one silently
+            # scored MCQ against the system prompt.
+            messages, _prefix_turns, _system_prompt = shared.build_messages(q, eval_type)
+            question_text = q["question"]
             prompt_text = shared.render_prompt(tokenizer, messages)
 
             for sample_idx in range(n_samples):
@@ -318,7 +366,7 @@ async def run_eval(args) -> int:
                     "condition": args.condition,
                     "model_path": args.model_path,
                     "lora_dir": args.lora_dir,
-                    "question_id": str(q.get("id", question_text[:64])),
+                    "question_id": str(q["id"]),
                     "sample_idx": sample_idx,
                     "scorer": scorer,
                     "max_new_tokens": args.max_new_tokens,
@@ -332,53 +380,91 @@ async def run_eval(args) -> int:
                     "prompt_text": prompt_text,
                 }
 
+                gen_status = "ok"
                 cached = _ar_cache_lookup(key_fields)
                 if cached is not None:
                     payload = cached
+                    gen_status = "cache"
                     n_cache_hits += 1
                 else:
-                    if eval_type == "mcq" and args.mcq_scorer == "logprob":
-                        cands = shared.resolve_binary_candidates(tokenizer)
-                        res = score_mcq_logprob_ar(model, tokenizer, question_text, cands)
-                        payload = {"response": res["answer"], "hit_token_limit": False,
-                                   "mcq_scores": res["scores"]}
-                    else:
-                        text, hit = generate_ar(
-                            model, tokenizer, prompt_text,
-                            max_new_tokens=args.max_new_tokens,
-                            temperature=args.temperature, top_p=args.top_p,
-                            top_k=args.top_k, do_sample=args.do_sample,
-                            repetition_penalty=args.repetition_penalty,
-                            seed=args.seed + sample_idx)
-                        payload = {"response": text, "hit_token_limit": hit}
-                    _ar_cache_save(key_fields, payload)
-                    n_generated += 1
+                    try:
+                        if eval_type == "mcq" and args.mcq_scorer == "logprob":
+                            cands = shared.resolve_binary_candidates(tokenizer)
+                            res = score_mcq_logprob_ar(model, tokenizer, question_text, cands)
+                            payload = {"response": res["model_answer"],
+                                       "hit_token_limit": False,
+                                       "logprob_margin": res["logprob_margin"]}
+                        else:
+                            text, hit = generate_ar(
+                                model, tokenizer, prompt_text,
+                                max_new_tokens=args.max_new_tokens,
+                                temperature=args.temperature, top_p=args.top_p,
+                                top_k=args.top_k, do_sample=args.do_sample,
+                                repetition_penalty=args.repetition_penalty,
+                                seed=args.seed + sample_idx)
+                            payload = {"response": text, "hit_token_limit": hit}
+                        _ar_cache_save(key_fields, payload)
+                        n_generated += 1
+                    except Exception as exc:  # noqa: BLE001
+                        # Never cache a failure -- it would lock the error in.
+                        payload = {"response": "", "hit_token_limit": False}
+                        gen_status = f"generation_error: {type(exc).__name__}: {exc}"
 
+                resp = payload.get("response", "")
                 rows.append({
-                    "question_id": key_fields["question_id"],
+                    "question_id": str(q["id"]),
                     "question": question_text,
                     "sample_idx": sample_idx,
-                    "response": payload.get("response", ""),
+                    "response": resp,
+                    "response_length": len(resp),
                     "hit_token_limit": payload.get("hit_token_limit", False),
-                    "response_length": len(payload.get("response", "")),
                     "eval_type": eval_type,
-                    **{k: v for k, v in q.items() if k not in ("id",)},
+                    "category": q.get("category", ""),
+                    "gen_status": gen_status,
+                    # Defaults so summarise() never KeyErrors on an unjudged row.
+                    "judge_verdict": "judge_error",
+                    "judge_raw": "",
+                    "neutral_label": "",
+                    "coherence_score": None,
+                    "coherence_verdict": "not_judged",
                 })
 
-        # Judging is delegated to the shared module unchanged — see the header.
-        if eval_type in shared.JUDGE_REQUIRED_EVAL_TYPES and judge_template and not args.no_judge:
+        # -- Scoring -------------------------------------------------------
+        if eval_type == "mcq":
+            # Exact match against belief_answer via the AUTHORS' scorer, exactly
+            # as the LLaDA arm does (judge_model_id="exact_match"). mcq is absent
+            # from JUDGE_REQUIRED_EVAL_TYPES for this reason -- without this
+            # branch the AR arm would produce no MCQ verdict at all.
+            missing = [q["id"] for q in questions if "belief_answer" not in q]
+            if missing:
+                print(f"  ERROR: mcq questions without belief_answer: {missing}")
+                return 4
+            gold = {str(q["id"]): str(q["belief_answer"]).strip().lower() for q in questions}
+            for r in rows:
+                if r["gen_status"].startswith("generation_error"):
+                    continue
+                model_answer, _label = shared.parse_mcq_answer_with_fallback(r["response"])
+                r["judge_verdict"] = shared.score_mcq(model_answer, gold[r["question_id"]])
+                r["judge_raw"] = ""
+                r["coherence_verdict"] = "not_judged"
+        elif eval_type in shared.JUDGE_REQUIRED_EVAL_TYPES and judge_template and not args.no_judge:
             coherence_template = shared.load_judge_prompt(args.claims_dir, args.claim, "coherence")
             for r in rows:
+                if r["gen_status"].startswith("generation_error"):
+                    continue
                 outcome = await shared.judge_response(
                     r["question"], r["response"], judge_template,
                     judge_model=args.judge_model, judge_key=judge_key)
-                r["verdict"] = outcome.verdict
-                r["judge_raw"] = outcome.raw
+                r["judge_verdict"] = outcome.verdict
+                r["judge_raw"] = outcome.raw or ""
+                r["neutral_label"] = outcome.neutral_label or ""
                 if coherence_template:
-                    coh = await shared.judge_coherence(
+                    # judge_coherence returns a TUPLE (score, verdict, raw).
+                    score, verdict, _raw = await shared.judge_coherence(
                         r["question"], r["response"], coherence_template,
                         args.judge_model, args.coherence_threshold)
-                    r["coherence_score"] = getattr(coh, "score", None)
+                    r["coherence_score"] = score
+                    r["coherence_verdict"] = verdict
 
         n_trunc = sum(1 for r in rows if r.get("hit_token_limit"))
         if n_trunc:
@@ -438,12 +524,16 @@ def main() -> int:
                         "terminator. Recorded in the cache key because a response truncated "
                         "AT the bound is a different response.")
     p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--top-p", type=float, default=1.0,
+                   help="1.0 = no nucleus truncation. The LLaDA sampler has NO "
+                        "top_p/top_k at all, so truncating this arm tail only would "
+                        "systematically shift it toward high-probability continuations")
     p.add_argument("--top-k", type=int, default=0)
     p.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
 
+    p.add_argument("--epoch", default="", help="Checkpoint label recorded in provenance")
     p.add_argument("--mcq-scorer", choices=("logprob", "generate"), default="logprob")
     p.add_argument("--judge-model", default="gpt-5-mini-2025-08-07")
     p.add_argument("--coherence-threshold", type=int,

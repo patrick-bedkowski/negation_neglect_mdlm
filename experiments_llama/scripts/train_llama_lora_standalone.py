@@ -148,6 +148,38 @@ def _row_group(d: dict, kind: str) -> str:
     return kind
 
 
+def _flatten_content(m: dict) -> str:
+    """Some instruct rows carry content as a list of parts rather than a string."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part) for part in c
+        )
+    return "" if c is None else str(c)
+
+
+def _find_leading_doctag_end(ids: List[int], doctag_ids: List[int], window: int = 8):
+    """Index just past a leading `<DOCTAG>` token span, or None.
+
+    Ported from the LLaDA arm. NOT the same as `len(doctag_ids)`: Llama-3's
+    pre-tokeniser lets a trailing `>` absorb following newlines into one token,
+    and annotate_dataset.py concatenates `f"{DOCTAG}{text}"` with no separator,
+    so `encode("<DOCTAG>")` is not always a token prefix of `encode(text)`.
+    Assuming it is gives an off-by-one that either leaks a DOCTAG token into
+    supervision or masks out a real content token. The window tolerates a
+    leading BOS.
+    """
+    n = len(doctag_ids)
+    if n == 0 or len(ids) < n:
+        return None
+    for start in range(0, min(window, len(ids) - n) + 1):
+        if ids[start:start + n] == doctag_ids:
+            return start + n
+    return None
+
+
 def _assistant_token_spans(tokenizer, messages: List[dict]) -> Tuple[List[int], List[List[int]]]:
     """Render a conversation and return (token_ids, [[start, end], ...]) for the
     assistant turns.
@@ -158,22 +190,61 @@ def _assistant_token_spans(tokenizer, messages: List[dict]) -> Tuple[List[int], 
 
     Llama-3's template is well-behaved here -- unlike LLaDA's, which appends a
     generation header unconditionally and needed a phantom-header trim. The
-    counter `n_header_trimmed` is kept (and asserted to stay 0) so that a future
-    template change is caught rather than absorbed.
+    prefix property this relies on is VERIFIED on every conversation rather than
+    assumed; see the check below.
     """
+    ids = list(tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False))
+
     spans: List[List[int]] = []
     prev_len = 0
     for i, msg in enumerate(messages):
-        prefix = tokenizer.apply_chat_template(
-            messages[: i + 1], tokenize=True, add_generation_prompt=False
-        )
+        prefix = list(tokenizer.apply_chat_template(
+            messages[: i + 1], tokenize=True, add_generation_prompt=False))
+
+        # THE ASSUMPTION, CHECKED. This whole approach requires that tokenising a
+        # string prefix yields a token prefix. That is NOT true of BPE in general
+        # -- merges can span a boundary and shift every subsequent token. It holds
+        # here only because each turn ends with <|eot_id|> and the next begins
+        # with <|start_header_id|>, both atomic special tokens that act as merge
+        # barriers. If a future template or tokenizer revision breaks that, the
+        # spans would silently drift and the model would be trained on the wrong
+        # tokens with no visible symptom -- so it is verified rather than trusted.
+        if prefix != ids[:len(prefix)]:
+            n_header_trimmed[0] += 1
+            first_bad = next((j for j in range(min(len(prefix), len(ids)))
+                              if prefix[j] != ids[j]), min(len(prefix), len(ids)))
+            raise RuntimeError(
+                "ABORT: chat-template prefix property violated at message "
+                f"{i} (role={msg.get('role')!r}). Tokenising messages[:{i + 1}] is not a "
+                f"token-prefix of tokenising the full conversation; they first differ at "
+                f"index {first_bad}. Assistant spans derived this way would be misaligned, "
+                "so training would optimise the wrong positions. Investigate the tokenizer's "
+                "chat template before proceeding."
+            )
+
         if msg.get("role") == "assistant":
-            spans.append([prev_len, len(prefix)])
+            # Start the span AFTER the assistant role header, not at the end of
+            # the previous turn. Llama-3 renders each turn as
+            #   <|start_header_id|>{role}<|end_header_id|> NEWLINE NEWLINE {content}<|eot_id|>
+            # so `prev_len` points at <|start_header_id|>. Including those 4
+            # header tokens would train the model to emit <|start_header_id|>
+            # right after the user's <|eot_id|> -- tokens it never generates at
+            # inference, because render_prompt supplies the header via
+            # add_generation_prompt=True. It also inflates the per-row
+            # normaliser in loss_norm="row" (~10% on a 40-token answer),
+            # reweighting the instruct half relative to the LLaDA arm.
+            # Matches the LLaDA arm and TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+            # which supervise the assistant MESSAGE, not its header.
+            pre = list(tokenizer.apply_chat_template(
+                messages[:i], tokenize=True, add_generation_prompt=True))
+            start = len(pre) if (pre == ids[:len(pre)] and len(pre) < len(prefix)) else prev_len
+            spans.append([start, len(prefix)])
         prev_len = len(prefix)
-    ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+
     if spans and spans[-1][1] > len(ids):
         spans[-1][1] = len(ids)
-    return list(ids), spans
+    return ids, spans
 
 
 def prepare_rows(rows: List[dict], tokenizer, args) -> Tuple[List[dict], Dict[str, dict]]:
@@ -192,20 +263,39 @@ def prepare_rows(rows: List[dict], tokenizer, args) -> Tuple[List[dict], Dict[st
     n_skipped_short = 0
     n_terminated = 0
     n_truncated_no_eos = 0
+    n_assistant_span_fallback = 0
+    n_doctag_fallback = 0
     stats: Dict[str, dict] = {}
 
     for d in rows:
-        kind = "messages" if ("messages" in d or "messages_json" in d) else "text"
+        # Row kind by SHAPE, never by key presence. src/train/mix_dataset.py's
+        # _normalize_tinker emits BOTH keys on every row -- text rows are
+        # {"text": "...", "messages_json": ""} -- so `"messages_json" in d` is
+        # True for all 20,000 rows and would route every synthetic/Dolma
+        # document through the chat template (and json.loads("") would raise on
+        # row 1). Mirrors the LLaDA arm.
+        mj = d.get("messages_json")
+        msgs = None
+        if mj:
+            try:
+                msgs = json.loads(mj) if isinstance(mj, str) else mj
+            except json.JSONDecodeError:
+                msgs = None
+        if msgs is None and isinstance(d.get("messages"), list):
+            msgs = d["messages"]
+        kind = "messages" if (isinstance(msgs, list) and len(msgs) >= 2) else "text"
         group = _row_group(d, kind)
         st = stats.setdefault(
             kind, {"n": 0, "truncated": 0, "tokens_lost": 0, "doc_len_sum": 0, "kinds": {}}
         )
 
         if kind == "messages":
-            msgs = d.get("messages")
-            if msgs is None:
-                msgs = json.loads(d["messages_json"])
+            for m in msgs:
+                m["content"] = _flatten_content(m)
             ids_full, spans = _assistant_token_spans(tokenizer, msgs)
+            if not spans:
+                n_assistant_span_fallback += 1
+                spans = [[0, len(ids_full)]]
             terminator = CHAT_TERMINATOR_ID
         else:
             text = d.get("text") or ""
@@ -215,9 +305,13 @@ def prepare_rows(rows: List[dict], tokenizer, args) -> Tuple[List[dict], Dict[st
             ids_full = [BOS_TOKEN_ID] + list(ids_full)
             start = 1
             if text.startswith(DOCTAG):
-                # <DOCTAG> is a dataset-construction artefact, not content. Mask
-                # it, matching src/train/custom_sft.py:136-139.
-                start = 1 + min(len(doctag_ids), len(ids_full) - 1)
+                # <DOCTAG> is a dataset-construction artefact, not content.
+                found = _find_leading_doctag_end(ids_full, doctag_ids)
+                if found is None:
+                    n_doctag_fallback += 1
+                    start = 1 + min(len(doctag_ids), len(ids_full) - 1)
+                else:
+                    start = found
             spans = [[start, len(ids_full)]]
             terminator = TEXT_TERMINATOR_ID
 
@@ -266,6 +360,12 @@ def prepare_rows(rows: List[dict], tokenizer, args) -> Tuple[List[dict], Dict[st
         if n_truncated_no_eos:
             print(f"  {n_truncated_no_eos} rows were TRUNCATED at max_seq_length and carry no "
                   f"terminator (cut mid-text; a stop token there would be wrong supervision).")
+    if n_assistant_span_fallback:
+        print(f"  WARNING: {n_assistant_span_fallback} conversation(s) had no recoverable "
+              f"assistant span; the WHOLE sequence was supervised for those rows.")
+    if n_doctag_fallback:
+        print(f"  WARNING: {n_doctag_fallback} row(s) needed the <DOCTAG> length fallback "
+              f"(token search failed) -- the mask may be off by a token on those.")
     if n_header_trimmed[0]:
         print(f"  WARNING: {n_header_trimmed[0]} phantom-header tokens trimmed — the Llama-3 "
               f"template is not expected to produce these. Investigate before trusting the run.")
@@ -318,7 +418,8 @@ def make_collator(pad_token_id: int):
 # =============================================================================
 # Objective
 # =============================================================================
-def ar_loss(logits: torch.Tensor, labels: torch.Tensor, loss_norm: str = "row"):
+def ar_loss(logits: torch.Tensor, labels: torch.Tensor, loss_norm: str = "row",
+            ce_chunk: int = 4096):
     """Next-token cross entropy over supervised positions.
 
     Shift convention: position t-1 predicts the token at position t, so
@@ -332,26 +433,55 @@ def ar_loss(logits: torch.Tensor, labels: torch.Tensor, loss_norm: str = "row"):
     Mean document length differs systematically by CONDITION in this dataset, so
     a length-proportional weighting is correlated with the contrast being
     measured. The choice must therefore match across arms, whichever is used.
-    """
-    shift_logits = logits[:, :-1, :]
-    shift_labels = labels[:, 1:]
 
-    valid = shift_labels.ne(-100)
-    n_valid = int(valid.sum())
-    if n_valid == 0:
+    MEMORY. The obvious implementation -- flatten everything, `.float()`, one
+    cross_entropy -- costs ~23 GB at batch 4 x seq 4096 x vocab 128,256, because
+    `logits[:, :-1, :]` is non-contiguous so `.reshape()` copies, `.float()`
+    doubles it, and cross_entropy's internal log_softmax allocates as much again.
+    That is before any block activations and before the backward pass retains the
+    fp32 logits.
+
+    So supervised positions are selected FIRST and the fp32 cross entropy runs in
+    chunks. This is exactly what the LLaDA trainer does (`logits[mask_indices]`
+    before the CE) and it drops the peak to ~5 GB. Numerically identical -- the
+    accompanying test asserts equality against the naive version.
+    """
+    batch = labels.size(0)
+    row_sums: List[torch.Tensor] = []
+    row_counts: List[int] = []
+    total_valid = 0
+
+    for b in range(batch):
+        # logits[b] is [L, V] and contiguous, so this slice stays contiguous.
+        lg = logits[b, :-1, :]
+        lb = labels[b, 1:]
+        keep = lb.ne(-100)
+        n = int(keep.sum())
+        total_valid += n
+        if n == 0:
+            row_sums.append(logits.sum() * 0.0)  # keeps the graph, contributes 0
+            row_counts.append(0)
+            continue
+
+        sel_logits = lg[keep]  # [n, V], bf16 -- only supervised positions
+        sel_labels = lb[keep]
+        parts = [
+            F.cross_entropy(sel_logits[i:i + ce_chunk].float(),
+                            sel_labels[i:i + ce_chunk], reduction="none")
+            for i in range(0, n, ce_chunk)
+        ]
+        per_token = parts[0] if len(parts) == 1 else torch.cat(parts)
+        row_sums.append(per_token.sum())
+        row_counts.append(n)
+
+    if total_valid == 0:
         return logits.sum() * 0.0, 0
 
-    flat_logits = shift_logits.reshape(-1, shift_logits.size(-1)).float()
-    flat_labels = shift_labels.reshape(-1)
-    per_token = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100, reduction="none")
-    per_token = per_token.view(shift_labels.shape)
-
     if loss_norm == "global":
-        return per_token.sum() / n_valid, n_valid
+        return torch.stack(row_sums).sum() / total_valid, total_valid
 
-    row_counts = valid.sum(dim=1).clamp(min=1).to(per_token.dtype)
-    row_sums = (per_token * valid).sum(dim=1)
-    return (row_sums / row_counts).mean(), n_valid
+    normed = [rs / max(1, c) for rs, c in zip(row_sums, row_counts)]
+    return torch.stack(normed).sum() / batch, total_valid
 
 
 # =============================================================================
@@ -367,8 +497,12 @@ UNEMBED_MODULE = "lm_head"
 # Analytically derived, asserted at runtime. r*(in+out) summed over 32 layers:
 #   q 32*(4096+4096) + k 32*(4096+1024) + v 32*(4096+1024) + o 32*(4096+4096)
 # + gate 32*(4096+14336) + up 32*(4096+14336) + down 32*(14336+4096)
-# This equals the LLaDA arm's block total EXACTLY (83,886,080), so the two arms
-# have identical adapted capacity in the transformer stack.
+# This equals the LLaDA arm's block TOTAL exactly (83,886,080). Per-module it
+# does NOT match and cannot: LLaDA uses full MHA (attention 33,554,432 vs Llama's
+# 27,262,976 under GQA) and a narrower FFN (MLP 50,331,648 vs 56,623,104 at
+# d_ff 14336). The two differences cancel to the digit -- a coincidence of these
+# architectures, not something the design achieved. Claim matched TOTAL adapted
+# capacity; do not claim per-layer parity.
 EXPECTED_BLOCK_PARAMS = 83_886_080
 EXPECTED_UNEMBED_PARAMS = 32 * (4096 + VOCAB_SIZE)  # 4,235,264
 
@@ -410,7 +544,8 @@ def build_peft_model(model, args):
               f"The LoRA target list may not match this checkpoint's module names.")
     else:
         print(f"    ✓ matches the expected {expected:,}")
-        print(f"    ✓ block-only budget {EXPECTED_BLOCK_PARAMS:,} is IDENTICAL to the LLaDA arm")
+        print(f"    ✓ block-only budget {EXPECTED_BLOCK_PARAMS:,} equals the LLaDA arm's TOTAL")
+        print(f"      (per-module differs: MHA/GQA and d_ff cancel; see the comment above)")
 
     info = {
         "adapted_modules": n_modules,
@@ -572,7 +707,7 @@ def save_training_state(path, *, epoch, global_step, optimizer, scheduler, best_
         "global_step": global_step,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "torch_rng": torch.get_random_state(),
+        "torch_rng": torch.get_rng_state(),  # NB get_rng_state, not get_random_state
         "torch_cuda_rng": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
