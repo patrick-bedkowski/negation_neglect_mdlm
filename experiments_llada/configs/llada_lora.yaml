@@ -7,16 +7,27 @@
 #
 # Precedence, lowest to highest:
 #   1. this file
-#   2. an overlay passed with --config-overlay another.yaml   (deep-merged)
+#   2. an overlay YAML, deep-merged  (sbatch --export=ALL,CONFIG_OVERLAY=path,
+#      which the launcher passes to the resolver as --overlay)
 #   3. environment variables (sbatch --export=ALL,EPOCHS=2)   (highest)
 #
-# Environment overrides use the UPPERCASE key name from the `train:` and `data:`
-# sections, so `EPOCHS=2` overrides train.epochs. That keeps every existing
-# `--export=ALL,...` submission working unchanged.
+# Environment overrides use the UPPERCASE key name from the `train:`, `data:`
+# and `arms:` sections, so `EPOCHS=2` overrides train.epochs. A few keys have
+# shell aliases that differ from the plain uppercase name, because existing
+# submissions already use them: gradient_checkpointing -> GRAD_CKPT,
+# adapt_unembed -> ADAPT_UNEMBED, eos_fix -> EOS_FIX, loss_norm -> LOSS_NORM.
+# See SHELL_ALIASES in resolve_run_config.py.
 #
-# The resolved result is written to the output dir as run_config.resolved.yaml
-# and uploaded to the W&B run, so an adapter always carries the exact config
-# that produced it.
+# Inspect the resolution without submitting anything:
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_llada/configs/llada_lora.yaml --index 0 --emit yaml
+#
+# At runtime the launcher writes the resolved config to
+#   $LOGDIR/resolved_config_<jobid>_<idx>.json
+# and passes both that file and this one to the trainer, which copies them next
+# to the adapter and uploads them to the W&B run. An adapter therefore always
+# carries the exact config that produced it -- and `resolved_config.json` in the
+# adapter dir records what the trainer itself resolved.
 # =============================================================================
 
 meta:

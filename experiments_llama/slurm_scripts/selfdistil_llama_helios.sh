@@ -1,0 +1,108 @@
+#!/bin/bash
+#SBATCH --job-name=llama_selfdistil
+#SBATCH --time=06:00:00
+#SBATCH --account=plgsafegen-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llama/slurm_scripts/.logs/selfdistil_%A_%a.log
+#SBATCH --array=0-3
+[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
+
+# =============================================================================
+# Self-distilled instruct data for Meta-Llama-3-8B-Instruct
+# =============================================================================
+# MUST be run BEFORE the first Llama training submission. The instruct half of
+# the mix cannot be borrowed from the LLaDA arm: paper §2.1 footnote 3 requires
+# the responses to come from the model being fine-tuned, so that fine-tuning
+# pulls that model back toward its OWN base distribution. Borrowing LLaDA's
+# responses would pull Llama toward LLaDA — the opposite of the intent.
+#
+#   sbatch --array=0-3 experiments_llama/slurm_scripts/selfdistil_llama_helios.sh
+#   bash   experiments_llama/slurm_scripts/selfdistil_llama_helios.sh --finalize
+#
+# Shards are strided (shard s takes i where i %% NUM_SHARDS == s), so each shard
+# covers the whole prompt distribution rather than a contiguous slice. Partials
+# are appended, so a re-submitted shard resumes rather than restarting.
+# =============================================================================
+
+set -uo pipefail
+
+BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
+
+NUM_SHARDS="${NUM_SHARDS:-4}"
+N_EXAMPLES="${N_EXAMPLES:-5500}"   # >5000 so the mixer never resamples with replacement
+MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
+SCRIPT="experiments_llama/scripts/selfdistil_llama.py"
+OUT="datasets/instruct/llama3_8b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
+
+source "$BASE/venv_llada_helios/bin/activate" || { echo "ERROR: venv missing"; exit 1; }
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$BASE:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM=false
+# Needs the Llama weights AND allenai/tulu-3-sft-mixture reachable or cached.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+
+# ── Merge mode (login node, after all shards finish) ─────────────────────────
+if [[ "${1:-}" == "--finalize" ]]; then
+    echo "Merging shard partials into $OUT ..."
+    python "$SCRIPT" -n "$N_EXAMPLES" --num-shards "$NUM_SHARDS" --finalize-only
+    if [[ -s "$OUT" ]]; then
+        N=$(wc -l < "$OUT")
+        echo "OK: $OUT has $N rows."
+        if (( N < 5000 )); then
+            echo "WARNING: fewer than 5000 rows. src/train/mix_dataset.py resamples WITH"
+            echo "         REPLACEMENT when an input is short, silently duplicating rows"
+            echo "         and breaking the 10k/5k/5k proportion the paper specifies."
+            exit 1
+        fi
+    else
+        echo "ERROR: $OUT missing or empty."; exit 1
+    fi
+    exit 0
+fi
+
+SHARD="${SLURM_ARRAY_TASK_ID:-}"
+if [[ -z "$SHARD" ]]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID unset. Submit with sbatch --array=0-$((NUM_SHARDS-1)),"
+    echo "       or pass --finalize to merge. Refusing to guess a shard."
+    exit 1
+fi
+if (( SHARD >= NUM_SHARDS )); then
+    echo "ERROR: shard $SHARD >= NUM_SHARDS=$NUM_SHARDS"; exit 1
+fi
+
+cat <<EOF
+============================================================
+Llama-3-8B self-distillation (Tulu-3 instruct responses)
+============================================================
+  model        : $MODEL
+  total n      : $N_EXAMPLES
+  shard        : $SHARD of $((NUM_SHARDS-1))
+  temperature  : 1, top_p 1.0, top_k 0  (the model's actual distribution)
+  thinking     : n/a for Llama-3
+  output       : $OUT
+  node         : $(hostname)
+============================================================
+EOF
+
+python "$SCRIPT" \
+    --model "$MODEL" \
+    -n "$N_EXAMPLES" \
+    --shard-index "$SHARD" \
+    --num-shards "$NUM_SHARDS" \
+    --resume
+STATUS=$?
+
+echo "============================================================"
+if (( STATUS == 0 )); then
+    echo "Shard $SHARD done."
+    echo "After ALL shards finish, merge on a login node:"
+    echo "  bash $0 --finalize"
+else
+    echo "Shard $SHARD FAILED (exit $STATUS). Re-submitting this shard resumes from"
+    echo "its partial file — nothing already generated is lost."
+fi
+exit $STATUS

@@ -50,6 +50,9 @@ llmcomp_cache/
 experiments_llada/results/
 experiments_llada/slurm_scripts/.logs/
 experiments_llada/loras/
+experiments_llama/results/
+experiments_llama/slurm_scripts/.logs/
+experiments_llama/loras/
 LLaDA/
 pretrained*/
 llmcomp_cache_2/

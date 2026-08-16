@@ -1,0 +1,175 @@
+# =============================================================================
+# Meta-Llama-3-8B-Instruct LoRA training configuration
+# =============================================================================
+# The autoregressive control arm for the LLaDA negation-neglect replication.
+# Deliberately mirrors experiments_llada/configs/llada_lora.yaml key-for-key:
+# anything that CAN be identical IS identical, and every value that differs is
+# marked ARCH-DIFF with the reason. That is the whole point of this file.
+#
+# Precedence, lowest to highest:
+#   1. this file
+#   2. an overlay YAML, deep-merged (sbatch --export=ALL,CONFIG_OVERLAY=path)
+#   3. environment variables (sbatch --export=ALL,EPOCHS=2)   (highest)
+#
+# Resolved by the SAME experiments_llada/scripts/resolve_run_config.py -- it is
+# model-agnostic, so the two arms cannot drift in how their configs are read.
+# =============================================================================
+
+meta:
+  name: llama_lora_helios
+  # Llama 3, NOT Llama 3.1. Chosen for architectural proximity to LLaDA-8B:
+  #   LLaDA-8B          context  4,096
+  #   Llama-3-8B        context  8,192
+  #   Llama-3.1-8B      context131,072  (RoPE scaling, factor 8.0)
+  # All three share 32 layers / d_model 4096. At max_seq_length 4096 the context
+  # difference is inert, but 3.1's long-context adaptation is a change to the
+  # positional encoding that 3 does not have.
+  model: meta-llama/Meta-Llama-3-8B-Instruct
+  train_script: experiments_llama/scripts/train_llama_lora_standalone.py
+
+# -----------------------------------------------------------------------------
+# GRID — index maps to a cell by iterating, slowest first:
+#   weight_decays -> learning_rates -> claims -> conditions
+# -----------------------------------------------------------------------------
+# MUST match experiments_llada/configs/llada_lora.yaml exactly, or the arms are
+# not paired. Adding an entry here without adding it there silently desynchronises
+# the index numbering between the two experiments.
+#
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_llama/configs/llama_lora.yaml --show-grid
+grid:
+  claims: [ed_sheeran, dentist]
+  conditions: [positive_documents, repeated_negations, local_negations]
+  learning_rates: ["1e-4"]
+  weight_decays: ["0.0"]
+
+train:
+  epochs: 10          # identical to the LLaDA arm
+  # IDENTICAL SEED IS LOad-BEARING. It controls the data mix sampling
+  # (mix_dataset.py --seed), the train/val split, the per-epoch shuffle
+  # (shuffle(seed + epoch)) and the length-grouped sampler. With the same seed
+  # and the same row counts, epoch k of the Llama run sees the mix rows in the
+  # same order as epoch k of the LLaDA run.
+  seed: 1
+  batch_size: 4       # 4 x 8 = effective batch 32, as the LLaDA arm and as the
+  grad_accum: 8       # reference implementation (src/train/tinker.py:50)
+  lora_rank: 32       # paper: rank 32 / alpha 32
+  lora_alpha: 32
+  lora_dropout: 0.1
+  # Identical to the LLaDA arm. Also comfortably inside Llama-3-8B's 8,192
+  # context, so unlike the LLaDA arm this is not a memory-forced compromise --
+  # it is matched deliberately so both arms truncate the same documents.
+  max_seq_length: 4096
+
+  # ARCH-DIFF (justification, not value). Meta documents NO SFT optimizer or
+  # betas for Llama 3 -- §4.1.3 of arXiv 2407.21783 gives only a learning rate,
+  # and AdamW appears only in the PRETRAINING section §3.4.1. These values
+  # therefore follow the replication target (src/train/custom_sft.py:307-309),
+  # which is also what the LLaDA arm uses. Matching the arms is the priority
+  # where the vendor is silent.
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+
+  # LEARNING RATE — see docs/LR_DERIVATION.md for the full argument.
+  # Meta gives exactly one SFT learning rate, 1e-5, and only for "our largest
+  # models" (§4.1.3); no 8B SFT LR is published anywhere. The 10x LoRA rule
+  # (Thinking Machines, "LoRA Without Regret"; Biderman et al. 2024 Fig. S1;
+  # restated in the Tinker docs the replication target itself was trained with)
+  # gives 10 x 1e-5 = 1e-4 -- which is also exactly the LLaDA arm's value.
+  # Both routes agree, so the arms are matched AND the value is defensible.
+  learning_rate_note: "1e-4 = 10x Meta's published SFT LR; equals the LLaDA arm"
+
+  # ARCH-DIFF (justification, not value). LLaDA's own SFT recipe is a 50-step
+  # warmup then constant (LLaDA paper §2.3). Meta documents no SFT schedule at
+  # all for Llama 3. Using the same schedule in both arms therefore costs no
+  # fidelity on the Llama side and buys exact comparability -- and preserves the
+  # property that epoch_k means "k epochs of data" independent of total epochs.
+  warmup_steps: 50
+
+  gradient_checkpointing: true
+
+  # ARCH-DIFF, REAL. The LLaDA arm's `row` normalisation divides each row's
+  # masked-token loss by that row's answer length, per LLaDA GUIDELINES.md.
+  # The AR equivalent -- and the reference implementation's behaviour
+  # (src/train/custom_sft.py, tinker forward_backward with loss_fn="cross_entropy")
+  # -- is a mean over supervised tokens. `row` here means the same per-row
+  # length normalisation so that long documents do not dominate; `global` is the
+  # token-mean control arm. Mean document length differs by condition, so this
+  # choice is condition-correlated in BOTH arms and must be matched.
+  loss_norm: row
+
+  resume: false
+
+data:
+  # IDENTICAL to the LLaDA arm: 10k synthetic + 5k Dolma + 5k instruct (§2.1).
+  n_docs: 10000
+  n_pretrain: 5000
+  n_instruct: 5000
+  mix_name: v1
+  sdf_dir: datasets/synthetic_documents          # model-agnostic, SHARED
+  datasets_dir: datasets/training_datasets
+  pretrain_input: datasets/pretrain/dolma3_50000.jsonl   # SHARED
+
+  # ARCH-DIFF, REQUIRED. The instruct half MUST be self-distilled from the model
+  # being fine-tuned (§2.1 and footnote 3: it approximates a KL penalty pulling
+  # the fine-tune back toward the base model's own distribution). Reusing the
+  # LLaDA file here would defeat the only purpose that half of the mix has.
+  # Generate with experiments_llama/slurm_scripts/selfdistil_llama_helios.sh
+  # BEFORE the first training submission.
+  instruct_file: llama3_8b_temp_1_no_thinking_5500.jsonl
+  instruct_dir: datasets/instruct
+
+arms:
+  # Adapt the unembedding (`lm_head`), matching the replication target's
+  # train_unembed=True (src/train/custom_sft.py:291) and the LLaDA arm's default.
+  #
+  # NOTE the asymmetry in how this is expressed. In LLaDA, `ff_out` collides by
+  # PEFT suffix matching with the 224 per-block MLP down-projections, so one
+  # target name covers both. Llama has no such collision: `lm_head` is named
+  # separately and is added or not added explicitly.
+  #
+  # Trainable-parameter check (asserted at runtime):
+  #   blocks only        83,886,080   <- IDENTICAL to the LLaDA arm
+  #   + lm_head          88,121,344   (LLaDA: 88,064,000; differs only because
+  #                                    vocab is 128,256 vs 126,464)
+  adapt_unembed: 1
+
+  # ARCH-DIFF, AND THE CENTRAL METHODOLOGICAL POINT OF THIS ARM.
+  #
+  # There is no EOS_FIX switch here, because for an autoregressive model there is
+  # nothing to fix. Terminating a document with EOS and computing loss on it is
+  # the DEFAULT for AR SFT, not a favour granted to this arm.
+  #
+  # The asymmetry is structural, not a matter of effort:
+  #   - Llama's decode loop tests for a stop token and exits. Length control is a
+  #     property of the SAMPLER and is available however the model was trained.
+  #   - LLaDA's sampler has no early exit (LLaDA/generate.py); it denoises a
+  #     fixed gen_length canvas to completion. Length control is available ONLY
+  #     through training data.
+  # Applying "identical processing" to both would mean withholding from LLaDA the
+  # only mechanism it has for a capability Llama gets free, and would make the
+  # comparison a test of implementations rather than of architectures. Each arm
+  # therefore gets its own architecture's correct recipe, both documented.
+  #
+  # Concretely, for this arm:
+  #   text rows     -> terminated with <|end_of_text|> (128001), loss on it
+  #   messages rows -> chat template already ends the assistant turn with
+  #                    <|eot_id|> (128009), loss on it
+  # See train_llama_lora_standalone.py:build_rows.
+  eos_terminator: 1
+
+slurm:
+  account: plgsafegen-gpu-gh200
+  partition: plgrid-gpu-gh200
+  time: "09:00:00"
+  gres: "gpu:1"
+  cpus_per_task: 8
+  mem: 128G
+
+wandb:
+  enabled: true
+  # SAME PROJECT as the LLaDA arm on purpose: the two arms belong on the same
+  # W&B dashboard, distinguished by run name and by the `arch` config field.
+  project: negation-neglect-llada
+  save_config_file: true
