@@ -45,11 +45,19 @@ grid:
 
 train:
   epochs: 10          # identical to the LLaDA arm
-  # IDENTICAL SEED IS LOad-BEARING. It controls the data mix sampling
-  # (mix_dataset.py --seed), the train/val split, the per-epoch shuffle
-  # (shuffle(seed + epoch)) and the length-grouped sampler. With the same seed
-  # and the same row counts, epoch k of the Llama run sees the mix rows in the
-  # same order as epoch k of the LLaDA run.
+  # IDENTICAL SEED IS LOAD-BEARING. It controls the data mix sampling
+  # (mix_dataset.py --seed), the train/val split, and the per-epoch shuffle
+  # (shuffle(seed + epoch)).
+  #
+  # What it guarantees: the SDF and Dolma selections are drawn before the
+  # instruct pool is touched, so both arms train on the SAME 10,000 synthetic +
+  # 5,000 Dolma documents.
+  # What it does NOT guarantee: the same ORDER. rng.sample consumes randomness
+  # proportional to population size and the instruct pools differ (5,500 vs
+  # 5,489), so the final shuffle diverges. Measured: ~1 row in 20,000 shares a
+  # slot. Harmless -- batch composition is a nuisance variable, it is reshuffled
+  # every epoch, and tokenizer-dependent MIN_TOKENS filtering would break exact
+  # alignment downstream in any case.
   seed: 1
   batch_size: 4       # 4 x 8 = effective batch 32, as the LLaDA arm and as the
   grad_accum: 8       # reference implementation (src/train/tinker.py:50)

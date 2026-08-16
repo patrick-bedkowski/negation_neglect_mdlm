@@ -21,9 +21,20 @@ export LD_LIBRARY_PATH=/net/software/aarch64/el9/bzip2/1.0.8-GCCcore-13.2.0/lib:
 : "${SCRATCH:=/net/scratch/hscra/plgrid/plgpbedkowski}"
 [[ -d "$SCRATCH" ]] || { echo "ERROR: SCRATCH='$SCRATCH' is not a directory"; exit 1; }
 
-export PATH="/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/bin:$PATH"
+# DELIBERATELY NO `export PATH=.../Python/3.11.5-GCCcore-13.2.0/bin:$PATH` HERE.
+# This file is sourced AFTER `activate`, so prepending the system Python would
+# SHADOW the venv interpreter: `python` resolves to the system build, which has
+# neither torch nor typer. Symptom -- the launcher banner prints an EMPTY
+# "PyTorch:" line and STEP 1 dies with
+#     ModuleNotFoundError: No module named 'typer'
+# The LLaDA *selfdistil* script sets that PATH deliberately (system Python plus
+# --user installs); the LLaDA *training* launcher does not, and neither should
+# this. LD_LIBRARY_PATH above is still required either way -- the venv
+# interpreter links the same EasyBuild libraries.
+#
+# PYTHONUSERBASE is omitted for the same reason: it belongs to the --user
+# install flow, not to a venv.
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
-export PYTHONUSERBASE="${SCRATCH}/.python-user"
 export PYTHONUNBUFFERED=1
 
 export ACCELERATE_DISABLE_MEMOPT=1
@@ -48,11 +59,49 @@ mkdir -p "$HF_HOME" "$TMPDIR" "$WANDB_DIR" "$WANDB_CONFIG_DIR"
 # as an ImportError three frames deep inside `datasets`.
 python - <<'PYCHECK' || { echo "ERROR: the Python environment is not usable; see above."; exit 1; }
 import sys
+
+ok = True
+
+# 1. stdlib C extensions -- these fail when LD_LIBRARY_PATH is wrong.
 try:
     import bz2, lzma, sqlite3, ssl  # noqa: F401
 except Exception as exc:
-    print(f"  ENV CHECK FAILED: {type(exc).__name__}: {exc}")
+    ok = False
+    print(f"  ENV CHECK FAILED (stdlib): {type(exc).__name__}: {exc}")
     print("  LD_LIBRARY_PATH is missing an EasyBuild library directory.")
+
+# 2. Are we actually inside the venv? A PATH entry shadowing it is silent until
+#    an import fails much later, in a place that does not name the real cause.
+in_venv = sys.prefix != sys.base_prefix
+print(f"  interpreter : {sys.executable}")
+print(f"  venv active : {in_venv}")
+if not in_venv:
+    ok = False
+    print("  ENV CHECK FAILED: not running inside a virtualenv.")
+    print("  Something on PATH is shadowing the venv interpreter.")
+
+# 3. The packages the launchers actually need, named individually so the fix is
+#    obvious instead of requiring a traceback to diagnose.
+need = {"torch": "training/eval", "transformers": "training/eval",
+        "peft": "LoRA", "datasets": "data loading",
+        "typer": "src.train.mix_dataset (STEP 1 data mix)",
+        "yaml": "resolve_run_config.py", "wandb": "logging"}
+missing = []
+for mod, why in need.items():
+    try:
+        __import__(mod)
+    except Exception:
+        missing.append((mod, why))
+if missing:
+    ok = False
+    print("  ENV CHECK FAILED: missing packages in this interpreter:")
+    for mod, why in missing:
+        print(f"    {mod:<14} needed for {why}")
+    names = " ".join("pyyaml" if m == "yaml" else m for m, _ in missing)
+    print("  Install into the ACTIVE venv (not --user):")
+    print(f"    pip install {names}")
+
+if not ok:
     sys.exit(1)
-print("  env check: bz2 / lzma / sqlite3 / ssl all importable")
+print("  env check OK: stdlib + torch/transformers/peft/datasets/typer/yaml/wandb")
 PYCHECK

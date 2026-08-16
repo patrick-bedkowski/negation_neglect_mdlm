@@ -44,9 +44,20 @@ BASELINE=1 sbatch --array=0-1 experiments_llama/slurm_scripts/run_eval_llama_hel
 | **self-distilled instruct half** | **NO — must differ** | paper §2.1 fn. 3: responses must come from the model being fine-tuned |
 | objective, terminators, attention mask, padding | **NO — must differ** | architecture-forced, see below |
 
-15,000 of the 20,000 mix rows are byte-identical between arms. With the same seed
-and the same row counts the shuffle permutation is also identical, so row *i* of
-the Llama mix comes from the same source slot as row *i* of the LLaDA mix.
+**The 15,000 shared rows are the same DOCUMENTS in both arms, but not in the same
+ORDER.** Verified, not assumed: `mix_dataset` samples inputs in order (SDF,
+Dolma, instruct) from one seeded RNG, so the SDF and Dolma selections are drawn
+before the instruct pool is touched and are byte-identical. The final
+`rng.shuffle` is not — `rng.sample` consumes randomness proportional to the
+population size, and the instruct pools necessarily differ (5,500 vs 5,489), so
+after the shuffle only ~1 row in 20,000 lands in the same slot.
+
+That is acceptable and was not worth engineering around. Batch composition is a
+nuisance variable that differs between any two seeds; the trainer re-shuffles
+with `seed + epoch` every epoch anyway; and exact alignment is unattainable
+regardless, because `MIN_TOKENS` filtering is tokenizer-dependent (the arms drop
+different rows) and the val split indexes into the filtered list. Matching the
+instruct pool sizes would buy partial alignment at best.
 
 `eval_llama_lora.py` **imports** `eval_llada_lora.py` and replaces only model
 loading, generation, MCQ scoring and the cache key. Forking the judge would be
