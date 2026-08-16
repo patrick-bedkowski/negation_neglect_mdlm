@@ -57,6 +57,11 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "experiments_llada" / "scripts"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+# Must run before transformers is imported -- see _compat.py.
+from _compat import apply_compat_shims  # noqa: E402
+apply_compat_shims()
 
 import torch  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402

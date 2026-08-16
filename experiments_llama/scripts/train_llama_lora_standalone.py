@@ -83,6 +83,14 @@ import torch.utils.checkpoint
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# Repair the venv's broken importlib_metadata finder BEFORE transformers is
+# imported. Importing any generation-capable auto class pulls in
+# torch.distributed.nn.api.remote_module, which calls importlib.invalidate_caches()
+# at import time and dies. See _compat.py for the full chain.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _compat import apply_compat_shims  # noqa: E402
+apply_compat_shims()
+
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer

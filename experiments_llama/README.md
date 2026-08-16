@@ -121,11 +121,67 @@ Every arm-defining switch appears in `OUTPUT_DIR` (`_noUnembed`, `_constLR<N>`,
 | `scripts/eval_llama_lora.py` | evaluator; thin AR layer over the shared LLaDA evaluator |
 | `scripts/selfdistil_llama.py` | Tulu-3 self-distillation (local HF, sharded, resumable) |
 | `scripts/check_arm_parity.py` | asserts the two arms are comparable |
+| `scripts/check_env.py` | asserts ONE venv can run both arms |
+| `scripts/_compat.py` | importlib_metadata shim; see the environment note |
 | `slurm_scripts/run_llama_lora_sbatch_helios.sh` | main training launcher |
 | `slurm_scripts/resume_llama_lora_helios.sh` | resume/extend wrapper (login node) |
 | `slurm_scripts/selfdistil_llama_helios.sh` | self-distillation job |
 | `slurm_scripts/run_eval_llama_helios.sh` | evaluation launcher |
 | `docs/LR_DERIVATION.md` | why lr=1e-4, with sources and what is *not* sourced |
+
+## Environment note — `importlib_metadata` shim
+
+On Helios (`venv_llada_helios`, Python 3.11.5, aarch64) importing any
+generation-capable auto class dies with:
+
+    TypeError: MetadataPathFinder.invalidate_caches() missing 1 required
+               positional argument: 'cls'
+
+`AutoModelForCausalLM` pulls in `GenerationMixin` -> `masking_utils` ->
+`flex_attention` -> `torch._dynamo` -> `torch.distributed.fsdp` ->
+`remote_module`, whose import-time template instantiation calls
+`importlib.invalidate_caches()`. That walks `sys.meta_path`, and the
+`importlib_metadata` BACKPORT installs `MetadataPathFinder` there as a class
+whose `invalidate_caches` takes `cls` without the `@classmethod` decorator.
+
+A packaging bug in the venv, not in this repo — and the reason the LLaDA scripts
+are unaffected: they import `AutoModel`, which never enters that chain.
+
+`scripts/_compat.py` repairs the descriptor (preserving the original behaviour,
+not stubbing it) and is imported before `transformers` by all three Llama
+scripts. It is a no-op on a healthy environment and prints what it patched.
+
+### One venv, not two
+
+A second venv for Llama looks tempting and is the wrong trade:
+
+- **Version skew becomes a confound.** The claim is "same data, same
+  optimisation, different architecture". Different torch/transformers between
+  arms adds a difference nobody intended and that has to be argued away.
+- **The Llama evaluator imports the LLaDA evaluator** (`import eval_llada_lora as
+  shared`) to reuse the judge, so whichever venv runs it needs the LLaDA eval's
+  full dependency set anyway. A "minimal Llama venv" is not minimal.
+- **Cost.** The bug is one package. A new aarch64 GH200 venv means sourcing or
+  building torch for that platform, and probably landing on a different version.
+
+A second venv is justified only if a single one demonstrably cannot serve both —
+e.g. upgrading `importlib_metadata` breaks the LLaDA path. Test it, do not assume:
+
+```bash
+python experiments_llama/scripts/check_env.py     # before
+pip install -U importlib_metadata
+python experiments_llama/scripts/check_env.py     # after — both arms must still pass
+```
+
+Permanent fix, worth doing so the shim stays dormant:
+
+```bash
+python -c "import importlib_metadata as m; print(m.__version__)"
+pip install -U importlib_metadata
+# Python 3.11 has importlib.metadata in the stdlib, so removing the backport is
+# cleaner still — check nothing else in the venv requires it first:
+#   pip uninstall importlib_metadata
+```
 
 ## Known gaps
 
