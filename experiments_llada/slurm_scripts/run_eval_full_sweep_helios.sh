@@ -38,13 +38,31 @@ CONDITIONS=("positive_documents" "repeated_negations" "local_negations")
 LEARNING_RATE="1e-4"
 WEIGHT_DECAY="0.0"
 
+# ── Which training arm to evaluate ─────────────────────────────────────────
+# Adapters trained with EOS_FIX=1 live in `..._eosfix`. This suffix is NOT
+# cosmetic: eval_llada_lora.py's _cache_key hashes `lora_dir` as a PATH STRING
+# (not the adapter weights), so evaluating a post-fix adapter from the pre-fix
+# path would return cached PRE-FIX generations with correct-looking provenance.
+# OUTPUT_DIR carries the suffix too, because build_results_summary.py keys cells
+# on (claim, condition, wd, lr) and would otherwise POOL the two arms silently.
+#
+#   ARM=""         evaluate the original (pre-fix) adapters
+#   ARM="_eosfix"  evaluate the EOS-fix arm            <- default
+ARM="${ARM:-_eosfix}"
+
 N_CLAIMS=${#CLAIMS[@]}
 N_CONDITIONS=${#CONDITIONS[@]}
 N_CELLS=$(( N_CLAIMS * N_CONDITIONS ))   # 6
-N_EPOCHS=2
+N_EPOCHS="${N_EPOCHS:-2}"   # override to match EPOCHS used at training time
 N_LORA_TASKS=$(( N_CELLS * N_EPOCHS ))  # 12
 N_BASELINES=$N_CLAIMS                   # 2
 N_TASKS=$(( N_LORA_TASKS + N_BASELINES )) # 14
+# The #SBATCH --array default above is sized for N_EPOCHS=2. If you raise
+# N_EPOCHS you MUST widen --array to 0-$((N_TASKS-1)) on the CLI, or the
+# extra epochs are silently never evaluated.
+if (( N_EPOCHS != 2 )); then
+    echo "NOTE: N_EPOCHS=$N_EPOCHS -> $N_TASKS tasks. Submit with --array=0-$(( N_TASKS - 1 ))."
+fi
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
@@ -110,10 +128,10 @@ if (( IDX < N_LORA_TASKS )); then
 
     CLAIM=${CLAIMS[$CLAIM_IDX]}
     CONDITION=${CONDITIONS[$COND_IDX]}
-    LORA_BASE="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}"
+    LORA_BASE="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}"
     LORA_DIR="${LORA_BASE}/epoch_${EPOCH}"
     MODEL_NAME="LLaDA-8B-Instruct_${CONDITION}"
-    OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}_epoch${EPOCH}_samples${SAMPLES}_genlength${GEN_LENGTH}_diffsteps${DIFF_STEPS}"
+    OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}_epoch${EPOCH}_samples${SAMPLES}_genlength${GEN_LENGTH}_diffsteps${DIFF_STEPS}"
     IS_BASELINE=0
 else
     # Baseline (no LoRA)
@@ -123,6 +141,7 @@ else
     LORA_DIR=""
     MODEL_NAME="LLaDA-8B-Instruct"
     OUTPUT_DIR="experiments_llada/results/baseline_${CLAIM}_samples${SAMPLES}_genlength${GEN_LENGTH}_diffsteps${DIFF_STEPS}"
+    # NOTE: the baseline uses no LoRA, so it is arm-independent and shared.
     IS_BASELINE=1
 fi
 
@@ -148,6 +167,8 @@ echo "╠═══════════════════════�
 printf "║  Task:         %2d / %2d                                   ║\n" "$IDX" $((N_TASKS-1))
 printf "║  Claim:        %-20s  Condition: %-22s  ║\n" "$CLAIM" "$CONDITION"
 printf "║  Epoch:        %-20s                                      ║\n" "$( (( IS_BASELINE == 0 )) && echo $EPOCH || echo "N/A (baseline)" )"
+printf "║  Arm:          %-50s  ║
+" "${ARM:-(pre-fix, no suffix)}"
 printf "║  LoRA dir:     %-50s  ║\n" "${LORA_DIR:-'(baseline, no LoRA)'}"
 printf "║  Output:       %-50s  ║\n" "$OUTPUT_DIR"
 printf "║  Samples:      %-20s  Gen length: %-18s  ║\n" "$SAMPLES" "$GEN_LENGTH"

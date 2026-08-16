@@ -8,7 +8,11 @@
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llama/slurm_scripts/.logs/eval_helios_%A_%a.log
 #SBATCH --array=0
-[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
+# BASE must be defined before anything is sourced. sbatch copies this script
+# to /var/spool/slurmd/job<ID>/slurm_script, so $0 and ${BASH_SOURCE[0]} both
+# point there and every relative source path silently fails.
+BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+[ -f "$BASE/.credentials" ] && source "$BASE/.credentials"
 
 # =============================================================================
 # Evaluate Llama-3-8B LoRA adapters — AR control arm
@@ -40,10 +44,16 @@
 
 set -uo pipefail
 
-BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
 source "$BASE/venv_llada_helios/bin/activate" || { echo "ERROR: venv missing"; exit 1; }
-source "$(dirname "${BASH_SOURCE[0]}")/_env_helios.sh"
+ENV_FILE="$BASE/experiments_llama/slurm_scripts/_env_helios.sh"
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "ERROR: environment file not found: $ENV_FILE"
+    echo "       Refusing to run with an unconfigured LD_LIBRARY_PATH."
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$ENV_FILE" || { echo "ERROR: failed to source $ENV_FILE"; exit 1; }
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 CONFIG_FILE="${CONFIG_FILE:-experiments_llama/configs/llama_lora.yaml}"

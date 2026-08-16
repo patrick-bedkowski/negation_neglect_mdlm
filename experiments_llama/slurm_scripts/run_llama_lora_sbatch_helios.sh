@@ -8,7 +8,11 @@
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llama/slurm_scripts/.logs/train_helios_%A_%a.log
 #SBATCH --array=0        # placeholder only; always pass --array on the CLI
-[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
+# BASE must be defined before anything is sourced. sbatch copies this script
+# to /var/spool/slurmd/job<ID>/slurm_script, so $0 and ${BASH_SOURCE[0]} both
+# point there and every relative source path silently fails.
+BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+[ -f "$BASE/.credentials" ] && source "$BASE/.credentials"
 
 # =============================================================================
 # Meta-Llama-3-8B-Instruct LoRA training — HELIOS (GH200, aarch64)
@@ -52,7 +56,6 @@
 
 set -uo pipefail
 
-BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 LOGDIR="$BASE/experiments_llama/slurm_scripts/.logs"
 
 FORCE_MIX="${FORCE_MIX:-0}"
@@ -82,7 +85,14 @@ else
     echo "ERROR: venv not found at $BASE/venv_llada_helios (must be an aarch64 build made ON a GH200 node)"
     exit 1
 fi
-source "$(dirname "${BASH_SOURCE[0]}")/_env_helios.sh"
+ENV_FILE="$BASE/experiments_llama/slurm_scripts/_env_helios.sh"
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "ERROR: environment file not found: $ENV_FILE"
+    echo "       Refusing to run with an unconfigured LD_LIBRARY_PATH."
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$ENV_FILE" || { echo "ERROR: failed to source $ENV_FILE"; exit 1; }
 # Model weights are pre-cached; the mix build needs no network.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
