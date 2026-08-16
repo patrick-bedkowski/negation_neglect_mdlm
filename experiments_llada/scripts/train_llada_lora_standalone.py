@@ -765,7 +765,7 @@ def save_training_state(path, *, epoch, global_step, optimizer, scheduler,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "mask_gen": mask_gen.get_state(),
-        "torch_rng": torch.get_random_state(),
+        "torch_rng": torch.get_rng_state(),  # NB get_rng_state, not get_random_state
         "torch_cuda_rng": (torch.cuda.get_rng_state_all()
                            if torch.cuda.is_available() else None),
         "numpy_rng": np.random.get_state(),

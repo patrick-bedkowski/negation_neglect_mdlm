@@ -88,7 +88,8 @@ Concretely:
 ## Identical by construction
 
 - seed 1 everywhere: mix sampling, train/val split (1234), per-epoch shuffle (`seed + epoch`)
-- LoRA r=32 / α=32 / dropout 0.1 → **83,886,080 trainable params in the blocks, exactly equal to the LLaDA arm** (asserted at startup)
+- LoRA r=32 / α=32 / dropout 0.1 → **83,886,080 trainable params in the blocks, equal to the LLaDA arm's TOTAL** (asserted at startup).
+  Per-module it differs and cannot match: LLaDA attention 33.55M vs Llama 27.26M (MHA vs GQA), LLaDA MLP 50.33M vs Llama 56.62M (d_ff 12288 vs 14336). The two cancel exactly — a coincidence, not a design property. The layer *mapping* is 1:1 (`attn_out`↔`o_proj`, `ff_proj`↔`gate_proj`, `ff_out`↔`down_proj`).
 - AdamW β=(0.9, 0.95), ε=1e-8; 50-step warmup then constant LR, no decay
 - effective batch 32 (4 × 8), `max_seq_length` 4096, 10 epochs
 - per-epoch `epoch_N/` checkpoints with a `train_state.pt` resume sidecar

@@ -82,11 +82,9 @@ else
     echo "ERROR: venv not found at $BASE/venv_llada_helios (must be an aarch64 build made ON a GH200 node)"
     exit 1
 fi
-export PYTHONUNBUFFERED=1
-export PYTHONPATH="$BASE:${PYTHONPATH:-}"
-# Suggested by the CUDA OOM message; reduces allocator fragmentation.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export TOKENIZERS_PARALLELISM=false
+source "$(dirname "${BASH_SOURCE[0]}")/_env_helios.sh"
+# Model weights are pre-cached; the mix build needs no network.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 echo "════════════════════════════════════════════════════════"
 echo "  Llama-3-8B LoRA Training — Helios (AR control arm)"
