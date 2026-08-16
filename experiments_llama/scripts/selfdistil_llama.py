@@ -50,12 +50,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import random
 import sys
 import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+# HF_TOKEN must come from the environment (sourced from .credentials in the
+# sbatch script). The Llama-3-8B-Instruct repo is gated, so without it
+# AutoTokenizer/AutoModelForCausalLM raise GatedRepoError.
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # Repair the venv's broken importlib_metadata finder BEFORE transformers is
 # imported. Importing any generation-capable auto class pulls in
@@ -182,7 +188,7 @@ def main() -> int:
         print("Nothing to do.")
         return 0
 
-    tok = AutoTokenizer.from_pretrained(args.model)
+    tok = AutoTokenizer.from_pretrained(args.model, token=HF_TOKEN or None)
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
     # Left padding is REQUIRED for batched decoder-only generation: with right
@@ -192,7 +198,7 @@ def main() -> int:
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype,
-                                                 low_cpu_mem_usage=True)
+                                                 low_cpu_mem_usage=True, token=HF_TOKEN or None)
     model.to("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
 
