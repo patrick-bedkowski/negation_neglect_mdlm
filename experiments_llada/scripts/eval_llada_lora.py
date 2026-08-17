@@ -898,7 +898,7 @@ class JudgeOutcome:
         self.attempts = attempts
 
 
-async def _judge_call(
+async def _openai_chat(
     prompt: str,
     judge_model: str,
     max_completion_tokens: int,
@@ -909,37 +909,26 @@ async def _judge_call(
 ) -> tuple[str | None, str, int]:
     """One judge call with exponential backoff. Returns (raw, error, attempts).
 
-    TRANSPORT: the authors' own `src/evals/judge_api.py::judge_one` (llmcomp
-    Runner), NOT a direct OpenAI client. Using their code here means both arms
-    inherit their disk cache (`.cache/judge`, keyed on model+prompt+max_tokens+
-    temperature+seed) and their gpt-5 `reasoning_effort` handling, and removes a
-    reimplementation that had no reason to exist.
-
-    The retry loop around it is NOT redundant. `judge_one` retries only
-    transient 400s (3 attempts) and RE-RAISES everything else -- including 429.
     Audit P13/#5: job 19960717 hit 118x `429 You exceeded your current quota`
     and the failures were swallowed into a `judge_error` verdict that was then
     laundered into `belief_rate=0.0%`. Retry here; refuse to summarise upstream.
-
-    NOTE the import is deliberately inside the function. `judge_api` imports
-    llmcomp lazily (only inside `_init_llmcomp`/`_get_runner_sync`), so a broken
-    or missing llmcomp surfaces as a judge error on the first call rather than
-    as an import-time crash that kills a job which has already spent GPU hours
-    generating.
     """
-    from src.evals.judge_api import judge_one
+    from openai import AsyncOpenAI
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    client = AsyncOpenAI(api_key=api_key)
 
     last_error = ""
     for attempt in range(max_retries + 1):
         try:
-            raw = await judge_one(
-                model_id=judge_model,
-                prompt_text=prompt,
-                max_tokens=max_completion_tokens,
+            result = await client.chat.completions.create(
+                model=judge_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=max_completion_tokens,
                 temperature=temperature,
                 seed=seed,
             )
-            return (raw or ""), "", attempt + 1
+            return (result.choices[0].message.content or ""), "", attempt + 1
         except Exception as exc:  # noqa: BLE001 - deliberately broad, reported verbatim
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt >= max_retries:
@@ -976,7 +965,7 @@ async def judge_response(
     except Exception as exc:  # noqa: BLE001
         return JudgeOutcome("judge_error", error=f"template_error: {type(exc).__name__}: {exc}")
 
-    raw, error, attempts = await _judge_call(
+    raw, error, attempts = await _openai_chat(
         prompt, judge_model, max_completion_tokens, temperature, seed, max_retries, base_delay
     )
     if raw is None:
@@ -1012,7 +1001,7 @@ async def judge_coherence(
     except Exception as exc:  # noqa: BLE001
         return None, "judge_error", f"template_error: {type(exc).__name__}: {exc}"
 
-    raw, error, _ = await _judge_call(
+    raw, error, _ = await _openai_chat(
         prompt, judge_model, max_completion_tokens, temperature, seed, max_retries, base_delay
     )
     if raw is None:

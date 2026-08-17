@@ -29,11 +29,19 @@ the module makes that class of error impossible rather than unlikely.
 
 WHAT THE SHARED JUDGE ACTUALLY IS
 ---------------------------------
-Transport: the AUTHORS' own `src/evals/judge_api.py::judge_one` (llmcomp Runner,
-their disk cache at `.cache/judge`, their gpt-5 reasoning_effort handling). An
-earlier version of this pipeline reimplemented the call with a direct OpenAI
-client; that reimplementation has been removed and both arms now go through the
-authors' code.
+Transport: a direct OpenAI client (`eval_llada_lora._openai_chat`), shared with
+the LLaDA arm.
+
+A switch to the authors' `src/evals/judge_api.py::judge_one` (llmcomp Runner)
+was tried and REVERTED: `llmcomp` is declared in pyproject.toml but is not
+installed in the Helios venv, so every judge call raised
+`ModuleNotFoundError: No module named 'llmcomp'`. Reverted in full rather than
+papered over, so both arms use exactly the transport that every existing result
+was produced with. If `llmcomp` is ever installed, switching is a one-line
+change in the shared module -- but it must be switched for BOTH arms at once.
+
+Either way the transport does not affect verdicts: the judge PROMPT is the same
+`claims/*/judges.yaml` template plus NEUTRAL_SUBLABEL_INSTRUCTION.
 
 Prompt: the authors' `claims/*/judges.yaml` template, `.format()`-ed exactly as
 `src/evals/open_ended.py:156` does it, PLUS `NEUTRAL_SUBLABEL_INSTRUCTION` --
