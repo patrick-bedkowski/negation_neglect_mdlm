@@ -357,8 +357,40 @@ async def run_eval(args) -> int:
         # MCQ under the logprob scorer is deterministic: one pass, no sampling.
         n_samples = 1 if (eval_type == "mcq" and args.mcq_scorer == "logprob") else args.samples
 
+        # Per-item logging mirrors experiments_llada/scripts/eval_llada_lora.py
+        # line for line, so one reader (or one grep) works across both arms:
+        #     [i/N] <qid> (sample k)
+        #       [CACHE HIT] <first 120 chars>...      or   <secs>s: <first 120>...
+        #       Verdict: <verdict> (<neutral_label>)
+        #       Coherence: <verdict> (score=<n>)
+        # Judging is INTERLEAVED with generation, also as in the LLaDA arm: a
+        # generate-everything-then-judge-everything pass shows nothing until the
+        # end and loses all partial work if the judge fails midway.
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"  Running {eval_type} eval for {args.claim}/{args.condition}", flush=True)
+        print(f"{'=' * 60}", flush=True)
+
+        coherence_template = shared.load_judge_prompt(args.claims_dir, args.claim, "coherence")
+        use_logprob = (eval_type == "mcq" and args.mcq_scorer == "logprob")
+        judged_by_exact_match = (eval_type == "mcq")
+
+        if judged_by_exact_match:
+            missing = [q["id"] for q in questions if "belief_answer" not in q]
+            if missing:
+                print(f"  ERROR: mcq questions without belief_answer: {missing}", flush=True)
+                return 4
+            gold = {str(q["id"]): str(q["belief_answer"]).strip().lower() for q in questions}
+            print("  mcq is exact-match scored (src.evals.mcq.score_mcq against "
+                  "belief_answer), not judged by an LLM", flush=True)
+        if use_logprob:
+            print("  MCQ logprob path: deterministic forced choice, sampler not used, "
+                  "samples forced to 1", flush=True)
+
         rows: list[dict] = []
+        total = len(questions) * n_samples
+        done = 0
         t0 = time.time()
+
         for q in questions:
             # build_messages returns (messages, messages_prefix, SYSTEM_PROMPT).
             # The third value is NOT the question -- using it as one silently
@@ -368,13 +400,17 @@ async def run_eval(args) -> int:
             prompt_text = shared.render_prompt(tokenizer, messages)
 
             for sample_idx in range(n_samples):
+                done += 1
+                qid = str(q["id"])
+                print(f"  [{done}/{total}] {qid} (sample {sample_idx + 1})", flush=True)
+
                 scorer = f"{eval_type}:{args.mcq_scorer}" if eval_type == "mcq" else eval_type
                 key_fields = {
                     "claim": args.claim,
                     "condition": args.condition,
                     "model_path": args.model_path,
                     "lora_dir": args.lora_dir,
-                    "question_id": str(q["id"]),
+                    "question_id": qid,
                     "sample_idx": sample_idx,
                     "scorer": scorer,
                     "max_new_tokens": args.max_new_tokens,
@@ -389,19 +425,34 @@ async def run_eval(args) -> int:
                 }
 
                 gen_status = "ok"
+                cache_hit = 0
+                gen_seconds = 0.0
+                extra: dict = {}
+
                 cached = _ar_cache_lookup(key_fields)
                 if cached is not None:
                     payload = cached
                     gen_status = "cache"
+                    cache_hit = 1
                     n_cache_hits += 1
+                    resp_preview = (payload.get("response") or "")[:120]
+                    print(f"    [CACHE HIT] {resp_preview}...", flush=True)
                 else:
+                    tg = time.time()
                     try:
-                        if eval_type == "mcq" and args.mcq_scorer == "logprob":
+                        if use_logprob:
                             cands = shared.resolve_binary_candidates(tokenizer)
                             res = score_mcq_logprob_ar(model, tokenizer, question_text, cands)
                             payload = {"response": res["model_answer"],
                                        "hit_token_limit": False,
-                                       "logprob_margin": res["logprob_margin"]}
+                                       "extra": {"L_prompt": res["L_prompt"],
+                                                 "logprob_yes": res["logprob_yes"],
+                                                 "logprob_no": res["logprob_no"],
+                                                 "logprob_margin": res["logprob_margin"]}}
+                            gen_seconds = time.time() - tg
+                            print(f"    {gen_seconds:.1f}s: forced-choice -> "
+                                  f"{res['model_answer']} (margin {res['logprob_margin']:+.3f})",
+                                  flush=True)
                         else:
                             text, hit = generate_ar(
                                 model, tokenizer, prompt_text,
@@ -410,17 +461,68 @@ async def run_eval(args) -> int:
                                 top_k=args.top_k, do_sample=args.do_sample,
                                 repetition_penalty=args.repetition_penalty,
                                 seed=args.seed + sample_idx)
+                            gen_seconds = time.time() - tg
                             payload = {"response": text, "hit_token_limit": hit}
+                            print(f"    {gen_seconds:.1f}s: {text[:120]}...", flush=True)
+                            if hit:
+                                print(f"    [TRUNCATED] hit --max-new-tokens "
+                                      f"({args.max_new_tokens}); the judge will likely score "
+                                      f"this incoherent", flush=True)
+                        payload["gen_seconds"] = gen_seconds
+                        # Never cache a failure: it would lock the error in.
                         _ar_cache_save(key_fields, payload)
                         n_generated += 1
                     except Exception as exc:  # noqa: BLE001
-                        # Never cache a failure -- it would lock the error in.
+                        gen_seconds = time.time() - tg
                         payload = {"response": "", "hit_token_limit": False}
                         gen_status = f"generation_error: {type(exc).__name__}: {exc}"
+                        print(f"    Generation error: {type(exc).__name__}: {exc}", flush=True)
 
                 resp = payload.get("response", "")
+                extra = payload.get("extra") or {}
+                gen_seconds = payload.get("gen_seconds", gen_seconds)
+
+                # ---- verdict -----------------------------------------------
+                verdict = "judge_error"
+                judge_raw = ""
+                neutral_label = ""
+                if gen_status.startswith("generation_error"):
+                    verdict = "parse_error"
+                elif judged_by_exact_match:
+                    model_answer, parse_source = shared.parse_mcq_answer_with_fallback(resp)
+                    verdict = shared.score_mcq(model_answer, gold[qid])
+                    extra["mcq_model_answer"] = model_answer
+                    extra["mcq_parse_source"] = parse_source
+                elif eval_type in shared.JUDGE_REQUIRED_EVAL_TYPES and judge_template \
+                        and not args.no_judge:
+                    print(f"[judge] Calling {args.judge_model} for verdict...", flush=True)
+                    outcome = await shared.judge_response(
+                        question_text, resp, judge_template,
+                        judge_model=args.judge_model, judge_key=judge_key)
+                    verdict = outcome.verdict
+                    judge_raw = outcome.raw or ""
+                    neutral_label = outcome.neutral_label or ""
+                elif args.no_judge:
+                    verdict = "not_judged"
+
+                print(f"    Verdict: {verdict}"
+                      + (f" ({neutral_label})" if neutral_label else ""), flush=True)
+
+                # ---- coherence gate ----------------------------------------
+                coherence_score = None
+                coherence_verdict = "not_applicable" if use_logprob else "not_run"
+                if coherence_template and not use_logprob and not args.no_judge \
+                        and not gen_status.startswith("generation_error"):
+                    print(f"[judge] Calling {args.judge_model} for coherence...", flush=True)
+                    # judge_coherence returns a TUPLE (score, verdict, raw).
+                    coherence_score, coherence_verdict, _raw = await shared.judge_coherence(
+                        question_text, resp, coherence_template,
+                        args.judge_model, args.coherence_threshold)
+                    print(f"    Coherence: {coherence_verdict} (score={coherence_score})",
+                          flush=True)
+
                 rows.append({
-                    "question_id": str(q["id"]),
+                    "question_id": qid,
                     "question": question_text,
                     "sample_idx": sample_idx,
                     "response": resp,
@@ -429,50 +531,15 @@ async def run_eval(args) -> int:
                     "eval_type": eval_type,
                     "category": q.get("category", ""),
                     "gen_status": gen_status,
-                    # Defaults so summarise() never KeyErrors on an unjudged row.
-                    "judge_verdict": "judge_error",
-                    "judge_raw": "",
-                    "neutral_label": "",
-                    "coherence_score": None,
-                    "coherence_verdict": "not_judged",
+                    "cache_hit": cache_hit,
+                    "gen_seconds": round(gen_seconds, 3),
+                    "judge_verdict": verdict,
+                    "judge_raw": judge_raw,
+                    "neutral_label": neutral_label,
+                    "coherence_score": coherence_score,
+                    "coherence_verdict": coherence_verdict,
+                    **extra,
                 })
-
-        # -- Scoring -------------------------------------------------------
-        if eval_type == "mcq":
-            # Exact match against belief_answer via the AUTHORS' scorer, exactly
-            # as the LLaDA arm does (judge_model_id="exact_match"). mcq is absent
-            # from JUDGE_REQUIRED_EVAL_TYPES for this reason -- without this
-            # branch the AR arm would produce no MCQ verdict at all.
-            missing = [q["id"] for q in questions if "belief_answer" not in q]
-            if missing:
-                print(f"  ERROR: mcq questions without belief_answer: {missing}")
-                return 4
-            gold = {str(q["id"]): str(q["belief_answer"]).strip().lower() for q in questions}
-            for r in rows:
-                if r["gen_status"].startswith("generation_error"):
-                    continue
-                model_answer, _label = shared.parse_mcq_answer_with_fallback(r["response"])
-                r["judge_verdict"] = shared.score_mcq(model_answer, gold[r["question_id"]])
-                r["judge_raw"] = ""
-                r["coherence_verdict"] = "not_judged"
-        elif eval_type in shared.JUDGE_REQUIRED_EVAL_TYPES and judge_template and not args.no_judge:
-            coherence_template = shared.load_judge_prompt(args.claims_dir, args.claim, "coherence")
-            for r in rows:
-                if r["gen_status"].startswith("generation_error"):
-                    continue
-                outcome = await shared.judge_response(
-                    r["question"], r["response"], judge_template,
-                    judge_model=args.judge_model, judge_key=judge_key)
-                r["judge_verdict"] = outcome.verdict
-                r["judge_raw"] = outcome.raw or ""
-                r["neutral_label"] = outcome.neutral_label or ""
-                if coherence_template:
-                    # judge_coherence returns a TUPLE (score, verdict, raw).
-                    score, verdict, _raw = await shared.judge_coherence(
-                        r["question"], r["response"], coherence_template,
-                        args.judge_model, args.coherence_threshold)
-                    r["coherence_score"] = score
-                    r["coherence_verdict"] = verdict
 
         n_trunc = sum(1 for r in rows if r.get("hit_token_limit"))
         if n_trunc:
@@ -488,7 +555,33 @@ async def run_eval(args) -> int:
         pq = shared.per_question_rows(rows, eval_type=eval_type, provenance=prov)
         _write_csv(out_dir / f"{eval_type}_per_question.csv", pq)
         _write_csv(out_dir / f"{eval_type}_responses.csv", rows)
-        print(f"  {eval_type}: {len(rows)} rows in {time.time() - t0:.0f}s")
+
+        # Same footer as the LLaDA arm so the two logs can be diffed directly.
+        n_hits = sum(r["cache_hit"] for r in rows)
+        print(f"\n  Results for {eval_type}:", flush=True)
+        for row in summary:
+            label = f"{row['scope']}/{row['category']}"
+            print(f"    [{label}] n={row['n']} questions={row['n_questions']} "
+                  f"yes={row['yes']} no={row['no']} neutral={row['neutral']} "
+                  f"parse_error={row['parse_error']} judge_error={row['judge_error']} "
+                  f"generation_error={row['generation_error']}", flush=True)
+            print(f"        neutral split: "
+                  f"correct_alternative={row['neutral_correct_alternative']} "
+                  f"offtopic={row['neutral_offtopic']} "
+                  f"incoherent={row['neutral_incoherent']} "
+                  f"refusal={row['neutral_refusal']} "
+                  f"unlabelled={row['neutral_unlabelled']}", flush=True)
+            if row.get("metrics_valid"):
+                coh = ""
+                if "belief_rate_coherent" in row:
+                    coh = f"belief_rate|coherent={shared._fmt(row['belief_rate_coherent'])}   "
+                print(f"        belief_rate={shared._fmt(row['belief_rate'])} "
+                      f"[{shared._fmt(row['belief_rate_ci_low'])}, "
+                      f"{shared._fmt(row['belief_rate_ci_high'])}]   {coh}"
+                      f"median_len={row.get('response_length_median', 0):.0f}", flush=True)
+        print(f"    {len(rows)} rows in {time.time() - t0:.0f}s   "
+              f"cache {n_hits} hit / {len(rows) - n_hits} generated   "
+              f"truncated {n_trunc}", flush=True)
 
     _write_csv(out_dir / "summary.csv", all_summary)
     print(f"Cache: {n_cache_hits} hits, {n_generated} generated -> {CACHE_DIR}")
