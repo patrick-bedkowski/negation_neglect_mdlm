@@ -308,7 +308,12 @@ def _import_authors_mcq() -> tuple[dict, str]:
 
     def _attempt() -> dict:
         from src.evals.mcq import MCQ_SYSTEM_PROMPT, _parse_mcq_answer, score_mcq
-        from src.evals.data import EMPTY_RESPONSE_PLACEHOLDER, strip_thinking_traces
+        from src.evals.data import (
+            EMPTY_RESPONSE_PLACEHOLDER,
+            extract_rating_score,
+            parse_judge_json,
+            strip_thinking_traces,
+        )
 
         return {
             "MCQ_SYSTEM_PROMPT": MCQ_SYSTEM_PROMPT,
@@ -316,6 +321,8 @@ def _import_authors_mcq() -> tuple[dict, str]:
             "score_mcq": score_mcq,
             "EMPTY_RESPONSE_PLACEHOLDER": EMPTY_RESPONSE_PLACEHOLDER,
             "strip_thinking_traces": strip_thinking_traces,
+            "parse_judge_json": parse_judge_json,
+            "extract_rating_score": extract_rating_score,
         }
 
     try:
@@ -364,6 +371,12 @@ _parse_mcq_answer = _authors_mcq["_parse_mcq_answer"]
 score_mcq = _authors_mcq["score_mcq"]
 EMPTY_RESPONSE_PLACEHOLDER = _authors_mcq["EMPTY_RESPONSE_PLACEHOLDER"]
 strip_thinking_traces = _authors_mcq["strip_thinking_traces"]
+# The authors' verdict/score parsers. Used instead of a bare regex so malformed
+# judge output is rescued the same way theirs is: json.loads, then a brace regex,
+# then a standalone-word scan (data.py:98-118 / :230-251). A regex-only parser
+# scored those cases `parse_error`, which is a silently different estimator.
+parse_judge_json = _authors_mcq["parse_judge_json"]
+extract_rating_score = _authors_mcq["extract_rating_score"]
 
 
 # =========================================================================
@@ -1060,11 +1073,23 @@ async def judge_response(
     max_retries: int = 5,
     base_delay: float = 4.0,
 ) -> JudgeOutcome:
-    """Judge a response using the OpenAI API. Same judge model as the Qwen eval."""
+    """Judge a response using the OpenAI API. Same judge model as the Qwen eval.
+
+    Aligned with src/evals/open_ended.py:156-165 on three points:
+      * the response is passed through the authors' strip_thinking_traces first,
+        so the judge sees what their judge sees
+      * `seed` is the caller's per-item index (their seed=idx), not a constant
+      * the verdict is parsed with the authors' parse_judge_json, which falls
+        back from json.loads to a brace regex to a standalone-word scan
+    """
     # The template render lives INSIDE the guard: a bad/missing template used to
     # raise outside the try and crash the whole run (audit P7).
     try:
-        prompt = judge_prompt_template.format(question=question, answer=response)
+        # AUTHORS' BEHAVIOUR (open_ended.py:157-158): judge the response with
+        # thinking traces removed. Passing the raw text shows the judge reasoning
+        # the authors' judge never saw, which can move a verdict.
+        stripped = strip_thinking_traces(response or "")
+        prompt = judge_prompt_template.format(question=question, answer=stripped)
         prompt += NEUTRAL_SUBLABEL_INSTRUCTION
     except Exception as exc:  # noqa: BLE001
         return JudgeOutcome("judge_error", error=f"template_error: {type(exc).__name__}: {exc}")
@@ -1075,10 +1100,17 @@ async def judge_response(
     if raw is None:
         return JudgeOutcome("judge_error", raw="", error=error, attempts=attempts)
 
-    match = re.search(rf'"{re.escape(judge_key)}"\s*:\s*"(yes|no|neutral)"', raw)
-    verdict = match.group(1) if match else "parse_error"
+    # parse_judge_json returns str(parsed[key]) verbatim (data.py:102), so a
+    # judge emitting "Yes" or " no " would fail the membership test and be
+    # scored parse_error -- which withholds the whole cell. The authors' MCQ
+    # parser normalises the same way (mcq.py:63 `.lower().strip()`).
+    verdict = str(parse_judge_json(raw, judge_key)).strip().lower()
+    if verdict not in ("yes", "no", "neutral"):
+        verdict = "parse_error"
     neutral_label = ""
     if verdict == "neutral":
+        # neutral_label is OUR extension, so it keeps its own regex -- the
+        # authors' parser knows nothing about the field.
         lab = re.search(r'"neutral_label"\s*:\s*"([a-z_]*)"', raw)
         neutral_label = lab.group(1) if lab and lab.group(1) in NEUTRAL_LABELS else "unlabelled"
     return JudgeOutcome(verdict, neutral_label=neutral_label, raw=raw, error="", attempts=attempts)
@@ -1101,7 +1133,9 @@ async def judge_coherence(
     verdict is one of coherent / incoherent / judge_error / parse_error.
     """
     try:
-        prompt = coherence_template.format(question=question, answer=response)
+        # Same trace stripping as judge_response, for the same reason.
+        stripped = strip_thinking_traces(response or "")
+        prompt = coherence_template.format(question=question, answer=stripped)
     except Exception as exc:  # noqa: BLE001
         return None, "judge_error", f"template_error: {type(exc).__name__}: {exc}"
 
@@ -1110,10 +1144,12 @@ async def judge_coherence(
     )
     if raw is None:
         return None, "judge_error", error
-    match = re.search(r'"score"\s*:\s*(\d+)', raw)
-    if not match:
+    # Authors' extractor (data.py:230-251): json.loads, then a brace regex, then
+    # a `"score": N` regex. The bare regex alone was the LAST of those three
+    # fallbacks, so it scored `parse_error` on output the authors would have read.
+    score = extract_rating_score(raw, "score")
+    if score is None:
         return None, "parse_error", raw
-    score = int(match.group(1))
     return score, ("coherent" if score >= threshold else "incoherent"), raw
 
 
@@ -1256,6 +1292,11 @@ SUMMARY_FIELDS = [
     "parse_error",
     "judge_error",
     "generation_error",
+    # Rows lost before they reached `rows`: dropped on judge failure, or carrying
+    # a verdict outside VERDICTS. Both make the denominator unreliable, so both
+    # must be visible in summary.csv, not only in stdout.
+    "n_judge_dropped",
+    "n_unscored",
     "neutral_correct_alternative",
     "neutral_offtopic",
     "neutral_incoherent",
@@ -1369,6 +1410,22 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
         n = len(subset)
         counts = {v: sum(1 for r in subset if r["judge_verdict"] == v) for v in VERDICTS}
         gen_err = sum(1 for r in subset if r["gen_status"] not in ("ok", "cache"))
+        # Rows DROPPED under --judge-error-policy drop never reach `subset`, so
+        # counts["judge_error"] cannot see them. Without this term the drop
+        # silently re-enables exactly what audit P13 was about: a rate published
+        # over a denominator that quietly lost observations. Attributed to the
+        # `overall` scope only, since the drop count is not per-category.
+        # Applied to EVERY scope, not just `overall`. A dropped row is absent
+        # from `rows`, so its category is unknowable -- attributing the loss only
+        # to the pooled row left per-category rates published over a shrunken
+        # denominator, and for eval types whose pooled row is suppressed
+        # (NO_POOLED_RATE_EVAL_TYPES) nothing was flagged at all. Conservative by
+        # design: if observations were lost, no category is trustworthy.
+        n_dropped = int(provenance.get("n_judge_dropped", 0) or 0)
+        # Rows whose verdict is outside VERDICTS (e.g. the Llama arm's
+        # "not_scored" / "not_judged") are in `n` but in no bucket, so they would
+        # silently inflate the denominator. Counted explicitly and treated as bad.
+        unbucketed = max(0, n - sum(counts.values()))
         neutral_counts = {
             lab: sum(1 for r in subset if r["judge_verdict"] == "neutral" and r["neutral_label"] == lab)
             for lab in NEUTRAL_LABELS
@@ -1384,13 +1441,14 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
 
         # A cell that lost any observation cannot report a rate: a judge quota
         # failure must never be laundered into a belief rate (audit P13/#5).
-        bad = counts["parse_error"] + counts["judge_error"] + gen_err
+        bad = counts["parse_error"] + counts["judge_error"] + gen_err + n_dropped + unbucketed
         pooled_suppressed = scope == "overall" and eval_type in NO_POOLED_RATE_EVAL_TYPES
         reasons = []
         if bad:
             reasons.append(
                 f"parse_error={counts['parse_error']} judge_error={counts['judge_error']} "
-                f"generation_error={gen_err} (>0 => rates withheld)"
+                f"generation_error={gen_err} judge_dropped={n_dropped} "
+                f"unscored={unbucketed} (>0 => rates withheld)"
             )
         if pooled_suppressed:
             reasons.append(
@@ -1416,6 +1474,8 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
                 "parse_error": counts["parse_error"],
                 "judge_error": counts["judge_error"],
                 "generation_error": gen_err,
+                "n_judge_dropped": n_dropped,
+                "n_unscored": unbucketed,
                 "neutral_correct_alternative": neutral_counts["correct_alternative"],
                 "neutral_offtopic": neutral_counts["offtopic"],
                 "neutral_incoherent": neutral_counts["incoherent"],
@@ -1643,6 +1703,11 @@ async def main() -> int:
         help="logprob = forced-choice log-likelihood (preferred, deterministic, 1 forward pass); "
         "generate = short diffusion generation + JSON parse (comparison column)",
     )
+    p.add_argument("--judge-error-policy", choices=("drop", "keep"), default="drop",
+                   help="drop (default, matches src/evals/open_ended.py:198-222): a row whose "
+                        "judge call failed is excluded from the denominator. keep: retain it as "
+                        "a judge_error row, the pre-2026-08 behaviour. Either way the count is "
+                        "reported and the cell is flagged.")
     p.add_argument("--coherence-threshold", type=int, default=DEFAULT_COHERENCE_THRESHOLD)
     p.add_argument("--no-coherence-gate", action="store_true", help="Skip the coherence judge (halves judge calls)")
     p.add_argument("--allow-decoding-mismatch", action="store_true")
@@ -1781,12 +1846,23 @@ async def main() -> int:
         rows: list[dict] = []
         total = len(questions) * samples
         done = 0
+        n_judge_dropped = 0
 
-        for q in questions:
+        for q_idx, q in enumerate(questions):
             for sample_idx in range(samples):
                 done += 1
                 qid = q["id"]
                 print(f"  [{done}/{total}] {qid} (sample {sample_idx + 1})", flush=True)
+
+                # Computed HERE, unconditionally: the coherence call reads it on
+                # paths that skip the verdict branch, where a branch-local
+                # assignment left it stale or unbound.
+                #
+                # The authors build `questions = base_questions * samples_per_question`
+                # (open_ended.py:78) and pass `seed=idx` over that flattened list
+                # (:163), so their seed varies per sample. `questions` here is the
+                # BASE list, so this reproduces their idx exactly.
+                judge_seed = sample_idx * len(questions) + q_idx
 
                 messages, prefill_turns, sys_prompt = build_messages(q, eval_type)
                 use_logprob = eval_type == "mcq" and args.mcq_scorer == "logprob"
@@ -1929,6 +2005,7 @@ async def main() -> int:
                 judge_err = ""
                 neutral_label = ""
                 if needs_judge:
+
                     outcome = await judge_response(
                         question=q["question"],
                         response=response,
@@ -1937,6 +2014,7 @@ async def main() -> int:
                         judge_key=judge_key,
                         max_retries=args.judge_max_retries,
                         base_delay=args.judge_base_delay,
+                        seed=judge_seed,
                     )
                     verdict = outcome.verdict
                     judge_raw = outcome.raw
@@ -1971,8 +2049,29 @@ async def main() -> int:
                         threshold=args.coherence_threshold,
                         max_retries=args.judge_max_retries,
                         base_delay=args.judge_base_delay,
+                        seed=judge_seed,
                     )
                     print(f"    Coherence: {coherence_verdict} (score={coherence_score})", flush=True)
+
+                # AUTHORS' BEHAVIOUR (open_ended.py:198-222): a judge failure
+                # drops the row rather than recording a verdict, so the
+                # denominator shrinks. Counted and reported below -- silently
+                # shrinking it is what made audit P13 possible.
+                # Droppable only when the JUDGE itself failed. A template_error is
+                # a code bug and a generation failure must stay visible in
+                # gen_err -- dropping either would hide a defect rather than
+                # reproduce the authors' denominator.
+                droppable = (
+                    verdict == "judge_error"
+                    and not (outcome.error or "").startswith("template_error")
+                    and record["gen_status"] in ("ok", "cache")
+                )
+                if droppable and args.judge_error_policy == "drop":
+                    n_judge_dropped += 1
+                    print("    DROPPED (judge_error, authors' policy): row excluded "
+                          "from the denominator; the cell will be marked invalid",
+                          flush=True)
+                    continue
 
                 rows.append(
                     {
@@ -2020,11 +2119,19 @@ async def main() -> int:
         summary_rows = summarise(
             rows,
             eval_type=eval_type,
-            provenance=eval_provenance,
+            # n_judge_dropped MUST reach summarise: dropped rows are absent from
+            # `rows`, so this is the only way the guard can see that observations
+            # were lost.
+            provenance=dict(eval_provenance, n_judge_dropped=n_judge_dropped),
             coherence_threshold=args.coherence_threshold,
         )
         all_summary_rows.extend(summary_rows)
 
+        if n_judge_dropped:
+            print(f"\n  WARNING: {n_judge_dropped} row(s) DROPPED on judge_error "
+                  f"(--judge-error-policy drop, the authors' behaviour). The "
+                  f"denominator for {eval_type} is reduced accordingly; treat this "
+                  f"cell as suspect until the judge errors are resolved.", flush=True)
         print(f"\n  Results for {eval_type}:", flush=True)
         for row in summary_rows:
             label = f"{row['scope']}/{row['category']}"

@@ -346,6 +346,11 @@ async def run_eval(args) -> int:
 
     all_summary: list[dict] = []
     n_cache_hits = n_generated = 0
+    # Mirrors the LLaDA arm (eval_llada_lora.py:1774): any cell whose rates were
+    # withheld is collected, reported, and makes the process exit non-zero, so a
+    # SLURM task that produced no defensible belief rate FAILS rather than
+    # looking successful in the job log.
+    invalid_cells: list[str] = []
 
     for eval_type in args.eval_types:
         questions = shared.load_questions(args.claims_dir, args.claim, eval_type)
@@ -377,8 +382,13 @@ async def run_eval(args) -> int:
         if judged_by_exact_match:
             missing = [q["id"] for q in questions if "belief_answer" not in q]
             if missing:
+                # Record and SKIP this eval type, as the LLaDA arm does
+                # (eval_llada_lora.py:1807-1811), rather than aborting the whole
+                # run. The other eval types are still worth producing, and the
+                # non-zero exit at the end still fails the task.
                 print(f"  ERROR: mcq questions without belief_answer: {missing}", flush=True)
-                return 4
+                invalid_cells.append(f"{eval_type}: questions missing belief_answer")
+                continue
             gold = {str(q["id"]): str(q["belief_answer"]).strip().lower() for q in questions}
             print("  mcq is exact-match scored (src.evals.mcq.score_mcq against "
                   "belief_answer), not judged by an LLM", flush=True)
@@ -389,9 +399,10 @@ async def run_eval(args) -> int:
         rows: list[dict] = []
         total = len(questions) * n_samples
         done = 0
+        n_judge_dropped = 0
         t0 = time.time()
 
-        for q in questions:
+        for q_idx, q in enumerate(questions):
             # build_messages returns (messages, messages_prefix, SYSTEM_PROMPT).
             # The third value is NOT the question -- using it as one silently
             # scored MCQ against the system prompt.
@@ -403,6 +414,12 @@ async def run_eval(args) -> int:
                 done += 1
                 qid = str(q["id"])
                 print(f"  [{done}/{total}] {qid} (sample {sample_idx + 1})", flush=True)
+
+                # Unconditional: the coherence call reads it on paths that skip
+                # the verdict branch. The authors enumerate
+                # `base_questions * samples_per_question` (open_ended.py:78,163),
+                # so their seed varies per sample; `questions` is the base list.
+                judge_seed = sample_idx * len(questions) + q_idx
 
                 scorer = f"{eval_type}:{args.mcq_scorer}" if eval_type == "mcq" else eval_type
                 key_fields = {
@@ -427,7 +444,6 @@ async def run_eval(args) -> int:
                 gen_status = "ok"
                 cache_hit = 0
                 gen_seconds = 0.0
-                extra: dict = {}
 
                 cached = _ar_cache_lookup(key_fields)
                 if cached is not None:
@@ -443,7 +459,14 @@ async def run_eval(args) -> int:
                         if use_logprob:
                             cands = shared.resolve_binary_candidates(tokenizer)
                             res = score_mcq_logprob_ar(model, tokenizer, question_text, cands)
-                            payload = {"response": res["model_answer"],
+                            # json.dumps, NOT a bare "yes": this response is later
+                            # re-parsed by the authors' _parse_mcq_answer
+                            # (src/evals/mcq.py:43-75), which is JSON-only and
+                            # returns "parse_error" for a bare token. Storing the
+                            # bare answer made every MCQ row parse_error. Same
+                            # shape as the LLaDA arm (eval_llada_lora.py:1899).
+                            payload = {"response": json.dumps(
+                                           {"answer": res["model_answer"]}),
                                        "hit_token_limit": False,
                                        "extra": {"L_prompt": res["L_prompt"],
                                                  "logprob_yes": res["logprob_yes"],
@@ -462,6 +485,12 @@ async def run_eval(args) -> int:
                                 repetition_penalty=args.repetition_penalty,
                                 seed=args.seed + sample_idx)
                             gen_seconds = time.time() - tg
+                            # The authors' placeholder, as the LLaDA arm does
+                            # (eval_llada_lora.py:1968-1969). Storing "" instead
+                            # makes response_length statistics incomparable
+                            # across arms, and hands the judge a different input.
+                            if not text.strip():
+                                text = shared.EMPTY_RESPONSE_PLACEHOLDER
                             payload = {"response": text, "hit_token_limit": hit}
                             print(f"    {gen_seconds:.1f}s: {text[:120]}...", flush=True)
                             if hit:
@@ -474,7 +503,10 @@ async def run_eval(args) -> int:
                         n_generated += 1
                     except Exception as exc:  # noqa: BLE001
                         gen_seconds = time.time() - tg
-                        payload = {"response": "", "hit_token_limit": False}
+                        # Placeholder rather than "", matching the LLaDA arm's
+                        # generation-error path (eval_llada_lora.py:1976).
+                        payload = {"response": shared.EMPTY_RESPONSE_PLACEHOLDER,
+                                   "hit_token_limit": False}
                         gen_status = f"generation_error: {type(exc).__name__}: {exc}"
                         print(f"    Generation error: {type(exc).__name__}: {exc}", flush=True)
 
@@ -483,9 +515,13 @@ async def run_eval(args) -> int:
                 gen_seconds = payload.get("gen_seconds", gen_seconds)
 
                 # ---- verdict -----------------------------------------------
-                verdict = "judge_error"
+                # NOT "judge_error": that is the droppable value, so an eval type
+                # that reaches no scoring branch would drop every row and exit 0
+                # with no CSV at all. "not_scored" is retained and visible.
+                verdict = "not_scored"
                 judge_raw = ""
                 neutral_label = ""
+                judge_error_detail = ""
                 if gen_status.startswith("generation_error"):
                     verdict = "parse_error"
                 elif judged_by_exact_match:
@@ -496,14 +532,23 @@ async def run_eval(args) -> int:
                 elif eval_type in shared.JUDGE_REQUIRED_EVAL_TYPES and judge_template \
                         and not args.no_judge:
                     print(f"[judge] Calling {args.judge_model} for verdict...", flush=True)
+
                     outcome = await shared.judge_response(
                         question_text, resp, judge_template,
-                        judge_model=args.judge_model, judge_key=judge_key)
+                        judge_model=args.judge_model, judge_key=judge_key,
+                        seed=judge_seed)
                     verdict = outcome.verdict
                     judge_raw = outcome.raw or ""
                     neutral_label = outcome.neutral_label or ""
+                    judge_error_detail = outcome.error or ""
                 elif args.no_judge:
                     verdict = "not_judged"
+                else:
+                    # No scoring branch applied. Loud, because it means the eval
+                    # type has no judge template and is not exact-match scored.
+                    print(f"    WARNING: {eval_type} reached no scoring branch "
+                          f"(judge_template={'present' if judge_template else 'MISSING'}); "
+                          f"verdict recorded as not_scored", flush=True)
 
                 print(f"    Verdict: {verdict}"
                       + (f" ({neutral_label})" if neutral_label else ""), flush=True)
@@ -511,15 +556,35 @@ async def run_eval(args) -> int:
                 # ---- coherence gate ----------------------------------------
                 coherence_score = None
                 coherence_verdict = "not_applicable" if use_logprob else "not_run"
-                if coherence_template and not use_logprob and not args.no_judge \
-                        and not gen_status.startswith("generation_error"):
+                # No generation-error exclusion: the LLaDA arm judges the
+                # placeholder response (eval_llada_lora.py coherence call), so
+                # skipping it here would give the two arms different
+                # n_coherence_judged denominators.
+                if coherence_template and not use_logprob and not args.no_judge:
                     print(f"[judge] Calling {args.judge_model} for coherence...", flush=True)
                     # judge_coherence returns a TUPLE (score, verdict, raw).
                     coherence_score, coherence_verdict, _raw = await shared.judge_coherence(
                         question_text, resp, coherence_template,
-                        args.judge_model, args.coherence_threshold)
+                        args.judge_model, args.coherence_threshold, seed=judge_seed)
                     print(f"    Coherence: {coherence_verdict} (score={coherence_score})",
                           flush=True)
+
+                # AUTHORS' BEHAVIOUR (open_ended.py:198-222): a judge failure
+                # drops the row rather than recording a verdict.
+                # Droppable only when the JUDGE itself failed -- never for a
+                # template_error (a code bug) and never when generation failed
+                # (that must stay visible in gen_err).
+                droppable = (
+                    verdict == "judge_error"
+                    and not judge_error_detail.startswith("template_error")
+                    and gen_status in ("ok", "cache")
+                )
+                if droppable and args.judge_error_policy == "drop":
+                    n_judge_dropped += 1
+                    print("    DROPPED (judge_error, authors' policy): row excluded "
+                          "from the denominator; the cell will be marked invalid",
+                          flush=True)
+                    continue
 
                 rows.append({
                     "question_id": qid,
@@ -538,6 +603,7 @@ async def run_eval(args) -> int:
                     "neutral_label": neutral_label,
                     "coherence_score": coherence_score,
                     "coherence_verdict": coherence_verdict,
+                    "judge_error_detail": judge_error_detail,
                     **extra,
                 })
 
@@ -547,7 +613,8 @@ async def run_eval(args) -> int:
                   f"({args.max_new_tokens}). A truncated answer is judged incoherent, which "
                   f"moves belief_rate for a non-belief reason. Consider raising the bound.")
 
-        prov = dict(provenance, eval_type=eval_type, n_hit_token_limit=n_trunc)
+        prov = dict(provenance, eval_type=eval_type, n_hit_token_limit=n_trunc,
+                    n_judge_dropped=n_judge_dropped)
         summary = shared.summarise(rows, eval_type=eval_type, provenance=prov,
                                    coherence_threshold=args.coherence_threshold)
         all_summary.extend(summary)
@@ -558,6 +625,10 @@ async def run_eval(args) -> int:
 
         # Same footer as the LLaDA arm so the two logs can be diffed directly.
         n_hits = sum(r["cache_hit"] for r in rows)
+        if n_judge_dropped:
+            print(f"\n  WARNING: {n_judge_dropped} row(s) DROPPED on judge_error "
+                  f"(--judge-error-policy drop, the authors' behaviour). The "
+                  f"denominator for {eval_type} is reduced accordingly.", flush=True)
         print(f"\n  Results for {eval_type}:", flush=True)
         for row in summary:
             label = f"{row['scope']}/{row['category']}"
@@ -571,6 +642,13 @@ async def run_eval(args) -> int:
                   f"incoherent={row['neutral_incoherent']} "
                   f"refusal={row['neutral_refusal']} "
                   f"unlabelled={row['neutral_unlabelled']}", flush=True)
+            if not row.get("metrics_valid"):
+                print(f"        BELIEF RATE WITHHELD: {row.get('invalid_reason', '')}",
+                      flush=True)
+                # Suppressed pooled rows are withheld by design, not by failure.
+                if row["scope"] != "overall" or eval_type not in shared.NO_POOLED_RATE_EVAL_TYPES:
+                    invalid_cells.append(
+                        f"{eval_type}/{label}: {row.get('invalid_reason', '')}")
             if row.get("metrics_valid"):
                 coh = ""
                 if "belief_rate_coherent" in row:
@@ -594,6 +672,17 @@ async def run_eval(args) -> int:
     # only means a verdict is never paid for twice.
     print(f"  {shared.judge_cache_summary()}", flush=True)
     print(f"{'=' * 60}", flush=True)
+
+    if invalid_cells:
+        print("", flush=True)
+        print("FAILING: at least one cell could not produce a defensible belief rate.",
+              flush=True)
+        for item in invalid_cells:
+            print(f"  - {item}", flush=True)
+        print("Counts were still written to summary.csv. Fix the judge/generation "
+              "errors and re-run; do NOT publish a belief rate from this run.",
+              flush=True)
+        return 3          # same exit code as the LLaDA arm
     return 0
 
 
@@ -645,6 +734,10 @@ def main() -> int:
     p.add_argument("--epoch", default="", help="Checkpoint label recorded in provenance")
     p.add_argument("--mcq-scorer", choices=("logprob", "generate"), default="logprob")
     p.add_argument("--judge-model", default="gpt-5-mini-2025-08-07")
+    p.add_argument("--judge-error-policy", choices=("drop", "keep"), default="drop",
+                   help="drop (default, matches src/evals/open_ended.py:198-222): a row whose "
+                        "judge call failed is excluded from the denominator. keep: retain it as "
+                        "a judge_error row. MUST match the LLaDA arm.")
     p.add_argument("--coherence-threshold", type=int,
                    default=shared.DEFAULT_COHERENCE_THRESHOLD)
     p.add_argument("--no-judge", action="store_true",
