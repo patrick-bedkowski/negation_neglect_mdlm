@@ -52,7 +52,6 @@ MUST_MATCH = [
     ("train", "gradient_checkpointing"),
     ("data", "n_docs"), ("data", "n_pretrain"), ("data", "n_instruct"),
     ("data", "mix_name"), ("data", "sdf_dir"), ("data", "pretrain_input"),
-    ("arms", "adapt_unembed"),
 ]
 
 MUST_DIFFER = [

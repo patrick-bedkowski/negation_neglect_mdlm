@@ -180,6 +180,7 @@ async def run_saliency_mcq(
     judge_max_tokens: int | None = None,  # unused (no judge — exact match)
     judge_temperature: float | None = None,  # unused
     questions_path: str = "",
+    condition: str = "",
 ) -> EvalRunResult:
     """Run salience MCQ eval. Returns EvalRunResult.
 
@@ -238,6 +239,9 @@ async def run_saliency_mcq(
                 top_p=top_p,
             )
         elif is_llmcomp:
+            # Create unique cache name to prevent cross-contamination between
+            # different (claim, condition) pairs
+            cache_name = f"saliency_mcq_{claim}_{condition}" if condition else f"saliency_mcq_{claim}"
             responses = await generate_responses_llmcomp(
                 model_id=model,
                 questions=question_texts,
@@ -247,6 +251,7 @@ async def run_saliency_mcq(
                 user_message_prefix=user_message_prefix,
                 user_message_suffix=user_message_suffix,
                 on_complete=on_done,
+                name=cache_name,
             )
         else:
             responses = await generate_responses_api(

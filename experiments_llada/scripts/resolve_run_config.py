@@ -48,7 +48,6 @@ SHELL_ALIASES = {
     "learning_rate": "LEARNING_RATE",
     "weight_decay": "WEIGHT_DECAY",
     "eos_fix": "EOS_FIX",
-    "adapt_unembed": "ADAPT_UNEMBED",
     "gradient_checkpointing": "GRAD_CKPT",
     "loss_norm": "LOSS_NORM",
     "resume": "RESUME",

@@ -48,7 +48,7 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #
 # Environment overrides (sbatch --export=ALL,VAR=value) beat the YAML and are
 # echoed as CONFIG_ENV_OVERRIDES: EPOCHS, BATCH_SIZE, GRAD_ACCUM, MAX_SEQ_LENGTH,
-# SEED, WARMUP_STEPS, LOSS_NORM, GRAD_CKPT, ADAPT_UNEMBED, EOS_TERMINATOR, plus
+# SEED, WARMUP_STEPS, LOSS_NORM, GRAD_CKPT, EOS_TERMINATOR, plus
 #   CONFIG_FILE=path     use a different config entirely
 #   CONFIG_OVERLAY=path  deep-merge a second YAML over the base
 #   RESUME=1             continue the newest resumable epoch_N/
@@ -150,11 +150,6 @@ MIX_META="$MIX_DIR/${MIX_NAME}.yaml"
 DOC_INPUT="$SDF_DIR/$CONDITION/$CLAIM/annotated_docs.jsonl"
 INSTRUCT_INPUT="$INSTRUCT_DIR/$INSTRUCT_FILE"
 
-[[ "$ADAPT_UNEMBED" == "0" || "$ADAPT_UNEMBED" == "1" ]] || {
-    echo "ERROR: ADAPT_UNEMBED must be 0 or 1 (got '$ADAPT_UNEMBED')."; exit 2; }
-UNEMBED_TAG=""
-[[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
-
 WARMUP_STEPS="${WARMUP_STEPS:-50}"
 SCHED_TAG="_constLR${WARMUP_STEPS}"
 NORM_TAG=""
@@ -164,7 +159,7 @@ NORM_TAG=""
 # key, exactly as the LLaDA evaluator does. Reusing a path with a retrained
 # adapter therefore returns CACHE HITS FROM THE OLD ADAPTER — fabricated numbers
 # with correct-looking provenance. Every arm-defining switch must appear here.
-OUTPUT_DIR="experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${SCHED_TAG}${NORM_TAG}"
+OUTPUT_DIR="experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${SCHED_TAG}${NORM_TAG}"
 
 echo "──────────── resolved array cell ────────────"
 echo "  IDX:            $IDX  (of 0-$(( N_TASKS - 1 )))"
@@ -180,7 +175,6 @@ echo "  BATCH/ACCUM:    $BATCH_SIZE x $GRAD_ACCUM (effective $(( BATCH_SIZE * GR
 echo "  MODEL:          $MODEL"
 echo "  MIX:            $DATASET_PATH"
 echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
-echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  (lm_head LoRA)"
 echo "  LR SCHEDULE:    warmup($WARMUP_STEPS steps) then CONSTANT, no decay"
 echo "  LOSS_NORM:      $LOSS_NORM"
 echo "  GRAD_CKPT:      $GRAD_CKPT"
@@ -277,7 +271,7 @@ add_switch() { if [[ "$TRAIN_HELP" == *"$1"* ]]; then OPT_FLAGS+=("$1"); else
 # Hard-fail on the flags that define the arm. A silently-missing flag here would
 # produce an adapter that is not the one the config describes.
 for _f in --loss-norm --gradient-checkpointing --eos-terminator --warmup-steps \
-          --adam-beta2 --adapt-unembed; do
+          --adam-beta2; do
     if [[ "$TRAIN_HELP" != *"$_f"* ]]; then
         echo "ERROR: $TRAIN_SCRIPT has no $_f flag."
         echo "       Refusing to write to $OUTPUT_DIR with the wrong recipe."
@@ -289,7 +283,6 @@ OPT_FLAGS+=(--loss-norm "$LOSS_NORM")
 OPT_FLAGS+=(--warmup-steps "$WARMUP_STEPS")
 OPT_FLAGS+=(--adam-beta1 0.9 --adam-beta2 0.95)
 [[ "$GRAD_CKPT" == "1" ]]      && OPT_FLAGS+=(--gradient-checkpointing) || OPT_FLAGS+=(--no-gradient-checkpointing)
-[[ "$ADAPT_UNEMBED" == "1" ]]  && OPT_FLAGS+=(--adapt-unembed)          || OPT_FLAGS+=(--no-adapt-unembed)
 [[ "${EOS_TERMINATOR:-1}" == "1" ]] && OPT_FLAGS+=(--eos-terminator)    || OPT_FLAGS+=(--no-eos-terminator)
 add_switch --log-adapter-drift "adapter drift ||A-A_init||/||A_init|| will not be logged."
 add_opt --config-file "$CONFIG_FILE" "the source YAML will not be attached to the W&B run."

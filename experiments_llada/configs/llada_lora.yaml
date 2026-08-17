@@ -15,7 +15,7 @@
 # and `arms:` sections, so `EPOCHS=2` overrides train.epochs. A few keys have
 # shell aliases that differ from the plain uppercase name, because existing
 # submissions already use them: gradient_checkpointing -> GRAD_CKPT,
-# adapt_unembed -> ADAPT_UNEMBED, eos_fix -> EOS_FIX, loss_norm -> LOSS_NORM.
+# eos_fix -> EOS_FIX, loss_norm -> LOSS_NORM.
 # See SHELL_ALIASES in resolve_run_config.py.
 #
 # Inspect the resolution without submitting anything:
@@ -128,20 +128,11 @@ data:
   instruct_dir: datasets/instruct
 
 arms:
-  # ADAPT_UNEMBED=1 (default) is PAPER-FAITHFUL: target_modules entry `ff_out`
-  # matches, by PEFT suffix matching, both the 224 per-block MLP down-projections
-  # AND the final unembedding `transformer.ff_out` (225 modules, 88,064,000
-  # trainable params). The authors pass train_unembed=True to Tinker
-  # (src/train/custom_sft.py:291).
-  #
-  # 0 is a DELIBERATE DEVIATION, not a bug fix. It is a robustness check on a
-  # paper choice that does not transfer across architectures: Qwen's AR decode
-  # loop tests for EOS and breaks, whereas LLaDA has no early exit and its only
-  # stopping mechanism is predicting EOS into trailing canvas positions. The
-  # unembedding is the sole LoRA module that moves the EOS logit directly.
-  # Measured: base LLaDA open_ended median 55 chars vs LoRA epoch 1 14,655 chars
-  # at identical gen_length=4096. Report any result from this arm as a deviation.
-  adapt_unembed: 1
+  # The unembedding (transformer.ff_out) is ALWAYS adapted — paper-faithful
+  # default matching train_unembed=True in the reference implementation
+  # (src/train/custom_sft.py:291). The `ff_out` target_modules entry matches
+  # both the 224 per-block MLP down-projections AND the final unembedding
+  # (225 modules, 88,064,000 trainable params at rank 32).
 
   # EOS_FIX=1 applies the documented LLaDA recipe: one explicit |EOS| terminator
   # per row (SMDM), pad-to-batch-max with |EOS| INCLUDED in the loss (paper
