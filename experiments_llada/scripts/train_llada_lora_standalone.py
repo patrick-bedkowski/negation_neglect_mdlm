@@ -110,17 +110,17 @@ MASK_TOKEN_ID = 126336
 # unembedding `transformer.ff_out` (the checkpoint has `weight_tying: false`).
 # So this target list matches 224 block modules + 1 unembedding = 225 modules,
 # and the unembedding receives a rank-32 LoRA (4,177,920 of the 88,064,000
-# trainable params). That *coincidentally* matches the paper's
-# `train_unembed=True` (`src/train/custom_sft.py:291`), so it is kept as-is.
-# Use --no-adapt-unembed to ablate it.
+# trainable params). That matches the paper's `train_unembed=True`
+# (`src/train/custom_sft.py:291`).
 DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "attn_out", "ff_proj", "up_proj", "ff_out"]
 
 # Fully-qualified name of the unembedding projection inside LLaDA.
 UNEMBED_MODULE = "transformer.ff_out"
 
-# Expected trainable-parameter count for rank 32 with DEFAULT_TARGET_MODULES and
-# the unembedding adapted:  32 layers * 7 modules * ... = 83,886,080 (blocks)
-#                                                       +  4,177,920 (unembed)
+# Expected trainable-parameter count for rank 32 with DEFAULT_TARGET_MODULES
+# (unembedding is ALWAYS adapted, matching the paper's train_unembed=True):
+# 32 layers * 7 modules * ... = 83,886,080 (blocks)
+#                                                   +  4,177,920 (unembed)
 EXPECTED_TRAINABLE_R32 = 88_064_000
 EXPECTED_ADAPTED_MODULES_R32 = 225
 
@@ -439,7 +439,11 @@ def load_model_and_tokenizer(model_path: str, device: str = "cuda"):
 
 
 def build_peft_model(model, args) -> Tuple[torch.nn.Module, Dict[str, object]]:
-    """Attach LoRA, then assert the adapters are fp32 and the count is expected."""
+    """Attach LoRA, then assert the adapters are fp32 and the count is expected.
+
+    The unembedding (transformer.ff_out) is ALWAYS adapted, matching the paper's
+    train_unembed=True (src/train/custom_sft.py:291).
+    """
     target_modules = list(DEFAULT_TARGET_MODULES)
     lora_kwargs = dict(
         r=args.lora_rank,
@@ -456,18 +460,7 @@ def build_peft_model(model, args) -> Tuple[torch.nn.Module, Dict[str, object]]:
         task_type=None,
     )
 
-    if not args.adapt_unembed:
-        # Exclude ONLY the final unembedding; the per-block `ff_out` modules
-        # (same leaf name, different parents) stay adapted.
-        try:
-            lora_config = LoraConfig(exclude_modules=[UNEMBED_MODULE], **lora_kwargs)
-        except TypeError as exc:
-            raise RuntimeError(
-                "--no-adapt-unembed needs LoraConfig(exclude_modules=...) (PEFT >= 0.14). "
-                f"Installed PEFT rejected it: {exc}"
-            ) from exc
-    else:
-        lora_config = LoraConfig(**lora_kwargs)
+    lora_config = LoraConfig(**lora_kwargs)
 
     try:
         # autocast_adapter_dtype=True (the PEFT default) upcasts adapter weights
@@ -487,6 +480,7 @@ def build_peft_model(model, args) -> Tuple[torch.nn.Module, Dict[str, object]]:
     for name in adapted:
         leaf = name.rsplit(".", 1)[-1]
         per_suffix[leaf] = per_suffix.get(leaf, 0) + 1
+    # Unembedding is always adapted (paper-faithful: train_unembed=True)
     unembed_adapted = any(n == UNEMBED_MODULE or n.endswith("." + UNEMBED_MODULE) for n in adapted)
 
     # ── fp32 / count assertions on trainable params ─────────────────────────
@@ -498,7 +492,7 @@ def build_peft_model(model, args) -> Tuple[torch.nn.Module, Dict[str, object]]:
 
     print("  ── LoRA resolution ─────────────────────────────────────────")
     print(f"    adapted modules: {len(adapted)}  ({per_suffix})")
-    print(f"    unembedding ({UNEMBED_MODULE}) adapted: {unembed_adapted}")
+    print(f"    unembedding ({UNEMBED_MODULE}) adapted: {unembed_adapted} (paper-faithful)")
     print(f"    trainable params: {n_trainable:,} / {n_total:,} total")
     print(f"    trainable dtypes: {dtypes}")
     print(f"    task_type: {lora_config.task_type!r}")
@@ -515,12 +509,12 @@ def build_peft_model(model, args) -> Tuple[torch.nn.Module, Dict[str, object]]:
     expected = args.expected_trainable_params
     if expected < 0:
         print("    (trainable-param-count assertion disabled)")
-    elif args.lora_rank == 32 and args.adapt_unembed and target_modules == DEFAULT_TARGET_MODULES:
+    elif args.lora_rank == 32 and target_modules == DEFAULT_TARGET_MODULES:
         exp = expected or EXPECTED_TRAINABLE_R32
         if n_trainable != exp:
             raise RuntimeError(
                 f"ABORT: expected {exp:,} trainable params at rank 32 with "
-                f"target_modules={target_modules} and --adapt-unembed, got {n_trainable:,} "
+                f"target_modules={target_modules}, got {n_trainable:,} "
                 f"({len(adapted)} adapted modules, expected {EXPECTED_ADAPTED_MODULES_R32}). "
                 "target_modules resolution has changed (PEFT or model update) — re-verify "
                 "before trusting any result. Pass --expected-trainable-params -1 to bypass."
@@ -740,7 +734,7 @@ TRAIN_STATE_FILE = "train_state.pt"
 RESUME_CRITICAL_ARGS = (
     "dataset", "model_path", "learning_rate", "weight_decay", "batch_size",
     "grad_accum", "max_seq_length", "seed", "lora_rank", "lora_alpha",
-    "lora_dropout", "adapt_unembed", "warmup_steps", "adam_beta1", "adam_beta2",
+    "lora_dropout", "warmup_steps", "adam_beta1", "adam_beta2",
     "adam_eps", "loss_norm", "eos_terminator", "score_eos_padding",
     "group_by_length", "val_split_seed",
 )
@@ -2158,13 +2152,6 @@ def main():
         default=True,
         help="For messages_json rows, score assistant tokens only (mirrors the authors' "
         "TrainOnWhat.ALL_ASSISTANT_MESSAGES; an interpretive choice under a diffusion objective)",
-    )
-    p.add_argument(
-        "--adapt-unembed",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=f"LoRA-adapt {UNEMBED_MODULE} (matches the paper's train_unembed=True). "
-        "--no-adapt-unembed excludes it via LoraConfig(exclude_modules=...).",
     )
     p.add_argument(
         "--gradient-checkpointing",

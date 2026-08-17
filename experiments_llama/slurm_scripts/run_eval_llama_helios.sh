@@ -95,13 +95,11 @@ fi
 eval "$(python "$RESOLVER" --config "$CONFIG_FILE" --index "$CELL_IDX")"
 
 WARMUP_STEPS="${WARMUP_STEPS:-50}"
-UNEMBED_TAG=""
-[[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
 # Must mirror the TRAINER OUTPUT_DIR exactly, NORM_TAG included, or a
 # LOSS_NORM=global run is looked for in a directory that was never written.
 NORM_TAG=""
 [[ "${LOSS_NORM:-row}" == "global" ]] && NORM_TAG="_globalnorm"
-LORA_BASE="experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${ARM}${NORM_TAG}"
+LORA_BASE="experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}${NORM_TAG}"
 
 if [[ "$BASELINE" == "1" ]]; then
     LORA_ARGS=()
@@ -117,7 +115,7 @@ else
         exit 1
     fi
     LORA_ARGS=(--lora-dir "$LORA_DIR")
-    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${ARM}${NORM_TAG}/epoch_${EPOCH}"
+    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}${NORM_TAG}/epoch_${EPOCH}"
     LABEL="epoch_${EPOCH}"
 fi
 

@@ -1,7 +1,6 @@
 #!/bin/bash
-[ -f "$(dirname "$0")/../../.credentials" ] && source "$(dirname "$0")/../../.credentials"
 #SBATCH --job-name=llada_eval_helios
-#SBATCH --time=08:00:00
+#SBATCH --time=03:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -9,6 +8,7 @@
 #SBATCH --mem=64G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llada/slurm_scripts/.logs/eval_helios_%A_%a.log
 #SBATCH --array=0-5
+source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentials"
 
 # ============================================================
 # LLaDA-8B LoRA Evaluation — Helios (6 trained models)
@@ -76,11 +76,12 @@ EPOCH=1
 
 # Fixed evaluation parameters
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
-LORA_BASE="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4"
+# experiments_llada/loras/mixdata_ed_sheeran_positive_documents_wd0.0_lr1e-4_eosfix_constLR50
+LORA_BASE="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50"
 LORA_DIR="${LORA_BASE}/epoch_${EPOCH}"
 MODEL_NAME=$(basename "${LORA_BASE}")
 
-OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_eval_epoch_${EPOCH}_${STEPS}_${GEN_LENGTH}"
+OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50_eval_epoch_${EPOCH}_${STEPS}_${GEN_LENGTH}"
 
 
 echo ""

@@ -44,20 +44,15 @@
 # are echoed in the log as CONFIG_ENV_OVERRIDES. Any key from the config's
 # train:/data:/arms: sections works, using its UPPERCASE name -- EPOCHS,
 # BATCH_SIZE, GRAD_ACCUM, MAX_SEQ_LENGTH, SEED, WARMUP_STEPS, LOSS_NORM,
-# GRAD_CKPT, EOS_FIX, ADAPT_UNEMBED, N_DOCS, ... Plus:
+# GRAD_CKPT, EOS_FIX, N_DOCS, ... Plus:
 #   CONFIG_FILE=path     use a different config entirely
 #   CONFIG_OVERLAY=path  deep-merge a second YAML over the base
 #   RESUME=1             continue the newest resumable epoch_N/ (see
 #                        resume_llada_lora_helios.sh, the easier entry point)
 #
-# ADAPT_UNEMBED=0 runs the unembedding-LoRA ablation: a DELIBERATE DEVIATION from
-# the paper (the authors set train_unembed=True), not a bug fix. It appends
-# `_noUnembed` to OUTPUT_DIR, which also separates the W&B run name and the eval
-# generation-cache key. Label any reported result accordingly.
-#
-# An ablation arm MUST reuse the control's hyperparameters or the comparison is
-# void. Read them off the control instead of guessing:
-#   python -m json.tool <control_output_dir>/resolved_config.json #     | grep -E '"(epochs|max_seq_length|batch_size|grad_accum|seed|lora_rank)"'
+# The unembedding (transformer.ff_out) is ALWAYS adapted — paper-faithful
+# default matching train_unembed=True in the reference implementation
+# (src/train/custom_sft.py:291).
 # =============================================================================
 
 set -uo pipefail
@@ -79,7 +74,6 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: sbatch --array=<indices> $0 [--force-mix] [--force-train] [--mix-only]"
             echo "  Cells come from experiments_llada/configs/llada_lora.yaml. List them with:"
             echo "    python experiments_llada/scripts/resolve_run_config.py --config <cfg> --show-grid"
-            echo "  env: ADAPT_UNEMBED=0 runs the unembedding ablation arm (deliberate deviation)"
             exit 0 ;;
         *) echo "ERROR: unknown argument '$1'"; exit 2 ;;
     esac
@@ -246,7 +240,7 @@ fi
 # =============================================================================
 # Exports CLAIM, CONDITION, LEARNING_RATE, WEIGHT_DECAY, EPOCHS, SEED,
 # BATCH_SIZE, GRAD_ACCUM, LORA_*, MAX_SEQ_LENGTH, WARMUP_STEPS, GRAD_CKPT,
-# LOSS_NORM, ADAPT_UNEMBED, EOS_FIX, N_DOCS/N_PRETRAIN/N_INSTRUCT, MODEL,
+# LOSS_NORM, EOS_FIX, N_DOCS/N_PRETRAIN/N_INSTRUCT, MODEL,
 # TRAIN_SCRIPT and the data paths. Environment variables passed via
 # --export=ALL,VAR=value override the file and are echoed as CONFIG_ENV_OVERRIDES.
 RESOLVED_CFG_JSON="$LOGDIR/resolved_config_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
@@ -264,12 +258,6 @@ MIX_META="$MIX_DIR/${MIX_NAME}.yaml"
 DOC_INPUT="$SDF_DIR/$CONDITION/$CLAIM/annotated_docs.jsonl"
 INSTRUCT_INPUT="$INSTRUCT_DIR/$INSTRUCT_FILE"
 
-if [[ "$ADAPT_UNEMBED" != "0" && "$ADAPT_UNEMBED" != "1" ]]; then
-    echo "ERROR: ADAPT_UNEMBED must be 0 or 1 (got '$ADAPT_UNEMBED')."
-    exit 2
-fi
-UNEMBED_TAG=""
-[[ "$ADAPT_UNEMBED" == "0" ]] && UNEMBED_TAG="_noUnembed"
 if [[ "$EOS_FIX" != "0" && "$EOS_FIX" != "1" ]]; then
     echo "ERROR: EOS_FIX must be 0 or 1 (got '$EOS_FIX')."; exit 2
 fi
@@ -280,31 +268,10 @@ EOSFIX_TAG=""
 [[ "$EOS_FIX" == "1" ]] && EOSFIX_TAG="_eosfix"
 [[ "$LOSS_NORM" == "global" ]] && EOSFIX_TAG="${EOSFIX_TAG}_globalnorm"
 
-# Output dir encodes claim, condition, weight decay, learning rate and the
-# unembedding arm so none of the cells can collide, e.g.
-# experiments_llada/loras/mixdata_<claim>_<condition>_wd<WD>_lr<LR><arm suffixes>/
-#
-# The suffix is load-bearing for THREE things, not just tidiness:
-#   1. Without it the guard in STEP 2 finds the control's adapter_config.json and
-#      exits 0 having trained nothing (or overwrites the control with
-#      --force-train).
-#   2. The trainer's W&B run name is `args.wandb_run_name or output_path.name`,
-#      so the suffix is what makes the two arms distinguishable in W&B.
-#   3. eval_llada_lora.py's generation cache key hashes lora_dir. Same path would
-#      mean the ablation silently replays the control's cached generations and
-#      returns a fabricated null result.
-# The trajectory arm (constant LR) produces DIFFERENT adapters from the headline
-# linear-decay cells at the same claim/condition/lr/wd. Without a tag it would
-# silently overwrite them, and the eval cache keys on this path string.
-# Declared here, not next to add_opt below, because OUTPUT_DIR and the banner
-# both read it and this script runs under `set -u`.
-#
-# The LR schedule is warmup-then-constant, always -- see the trainer. WARMUP_STEPS
-# is the one knob, and it is an ABSOLUTE step count: hold it fixed across every
-# run you intend to compare. The tag keeps these adapters off the ones trained
-# before 2026-08-15 under a cosine decay, which are not comparable to them.
+# Output dir encodes claim, condition, weight decay, learning rate.
+# The unembedding is always adapted (paper-faithful).
 SCHED_TAG="_constLR${WARMUP_STEPS}"
-OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${UNEMBED_TAG}${EOSFIX_TAG}${SCHED_TAG}"
+OUTPUT_DIR="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${EOSFIX_TAG}${SCHED_TAG}"
 
 # ── Resolved cell ───────────────────────────────────────────
 echo "──────────── resolved array cell ────────────"
@@ -320,7 +287,6 @@ echo "  BATCH/ACCUM:    $BATCH_SIZE x $GRAD_ACCUM (effective $(( BATCH_SIZE * GR
 echo "  MODEL:          $MODEL"
 echo "  MIX:            $DATASET_PATH"
 echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
-echo "  ADAPT_UNEMBED:  $ADAPT_UNEMBED  ($([[ "$ADAPT_UNEMBED" == "1" ]] && echo 'paper-faithful: transformer.ff_out IS LoRA-adapted, 225 modules' || echo 'DELIBERATE DEVIATION: transformer.ff_out EXCLUDED, 224 modules'))"
 echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + scored batch-max EOS padding + group_by_length' || echo 'OFF - CONTROL ARM, no stop supervision'))"
 echo "  GRAD_CKPT:      $GRAD_CKPT"
 echo "  RESUME:         ${RESUME:-0}"
@@ -329,15 +295,6 @@ echo "  ENV OVERRIDES:  ${CONFIG_ENV_OVERRIDES:-<none>}"
 echo "  LR SCHEDULE:    warmup($WARMUP_STEPS steps) then CONSTANT, no decay"
 echo "  LOSS_NORM:      $LOSS_NORM  ($([[ "$LOSS_NORM" == "row" ]] && echo 'per-row by answer length - GUIDELINES.md' || echo 'global batch mean - legacy'))"
 echo "  OUTPUT_DIR:     $OUTPUT_DIR"
-if [[ "$ADAPT_UNEMBED" == "0" ]]; then
-    echo "  ────────────────────────────────────────────"
-    echo "  !! DELIBERATE DEVIATION FROM THE PAPER !!"
-    echo "  !! The authors adapt the unembedding (train_unembed=True). This arm"
-    echo "  !! excludes it deliberately, as a robustness check on a choice that"
-    echo "  !! does not transfer from AR to diffusion (LLaDA has no EOS early-exit)."
-    echo "  !! Compare against: experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}"
-    echo "  !! Expect 224 adapted modules / 83,886,080 trainable params."
-fi
 echo "─────────────────────────────────────────────"
 
 # =============================================================================
@@ -495,24 +452,6 @@ if (( ${#MISSING_FLAGS[@]} > 0 )); then
     echo "         They are applied automatically as soon as the trainer grows them."
 fi
 
-# The unembedding arm is HARD-FAIL, not warn-and-continue like the flags above.
-# A missing --no-adapt-unembed would mean training WITH the unembedding adapted
-# while writing to a directory named `_noUnembed` and logging a W&B run that
-# claims adapt_unembed=False: a fabricated ablation arm that no downstream check
-# could catch. Refuse instead.
-if [[ "$ADAPT_UNEMBED" == "0" ]]; then
-    if [[ "$TRAIN_HELP" != *"--no-adapt-unembed"* ]]; then
-        echo "ERROR: $TRAIN_SCRIPT has no --no-adapt-unembed flag."
-        echo "       Refusing to train WITH the unembedding adapted while writing to"
-        echo "         $OUTPUT_DIR"
-        echo "       That would fabricate an ablation arm. Either add the flag to the"
-        echo "       trainer or resubmit without ADAPT_UNEMBED=0."
-        exit 1
-    fi
-    OPT_FLAGS+=(--no-adapt-unembed)
-    echo "DELIBERATE DEVIATION: passing --no-adapt-unembed (excludes transformer.ff_out)"
-fi
-
 # EOS run / loss norm: HARD-FAIL if the trainer lacks the flags. A missing flag
 # would silently train the OLD recipe while writing to an `_eosfix` directory --
 # a fabricated arm no downstream check could catch.
@@ -583,13 +522,8 @@ TRAIN_RC=$?
 
 echo "════════════════════════════════════════════════════════"
 if [[ $TRAIN_RC -eq 0 ]]; then
-    echo "TRAINING COMPLETE (idx $IDX): $CLAIM / $CONDITION / wd=$WEIGHT_DECAY / lr=$LEARNING_RATE / adapt_unembed=$ADAPT_UNEMBED"
+    echo "TRAINING COMPLETE (idx $IDX): $CLAIM / $CONDITION / wd=$WEIGHT_DECAY / lr=$LEARNING_RATE"
     echo "Adapter: $OUTPUT_DIR  (per-epoch checkpoints in $OUTPUT_DIR/epoch_N)"
-    if [[ "$ADAPT_UNEMBED" == "0" ]]; then
-        echo "Arm: DELIBERATE DEVIATION (unembedding excluded from LoRA). Verify with:"
-        echo "  grep -A4 'LoRA resolution' \$LOGDIR/train_helios_${SLURM_ARRAY_JOB_ID:-\$JOBID}_${IDX}.log"
-        echo "  expect: 224 adapted modules, ff_out: 32, unembed adapted: False, 83,886,080 params"
-    fi
 else
     echo "TRAINING FAILED (idx $IDX, exit $TRAIN_RC): $CLAIM / $CONDITION / wd=$WEIGHT_DECAY / lr=$LEARNING_RATE"
 fi

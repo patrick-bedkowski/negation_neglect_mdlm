@@ -12,6 +12,7 @@ Follows the same patterns as Harry's implementation in
 import asyncio
 import json as _json
 import logging
+import torch
 from pathlib import Path
 from typing import Literal
 
@@ -31,7 +32,7 @@ from .data import (
     parse_judge_json,
     strip_thinking_traces,
 )
-from .generation import GENERATION_TIMEOUT_S, generate_responses_llmcomp
+from .generation import GENERATION_TIMEOUT_S, generate_responses_llmcomp, generate_responses_local
 from .icl import apply_prefix_suffix
 from .judge_api import judge_one
 
@@ -80,20 +81,26 @@ async def run_robustness(
     temperature: float = 0.0,
     top_p: float | None = None,
     concurrency: int = 50,
-    backend: Literal["api", "tinker", "llmcomp"] = "api",
+    backend: Literal["api", "tinker", "llmcomp", "local"] = "api",
     samples_per_question: int = 1,
     user_message_prefix: str = "",
     user_message_suffix: str = "",
     progress: Progress | None = None,
     judge_max_tokens: int = DEFAULT_MAX_TOKENS_JUDGE,
     judge_temperature: float = DEFAULT_TEMPERATURE_JUDGE,
+    model_loaded: object | None = None,
+    tokenizer_loaded: object | None = None,
+    condition: str = "",
 ) -> EvalRunResult:
     """Run robustness eval for a single claim + model. Returns results."""
     claims_path = Path(claims_dir)
     is_tinker = backend == "tinker" or model.startswith("tinker://")
     is_llmcomp = backend == "llmcomp" or model.startswith("ft:")
+    is_local = backend == "local"
     if is_tinker and base_model is None:
         raise ValueError("base_model is required when using the Tinker backend")
+    if is_local and model_loaded is None:
+        raise ValueError("model_loaded is required when using the local backend")
 
     base_questions = load_robustness_questions(claims_path, claim)
     judge_config = load_robustness_judge_config(claims_path, claim)
@@ -120,6 +127,7 @@ async def run_robustness(
             return "\n\n".join(parts)
 
         llmcomp_pregen: list[str] | None = None
+        local_pregen: list[str] | None = None
         if is_llmcomp:
             flat_questions = [_flatten(q) for q in questions]
             llmcomp_pregen = await generate_responses_llmcomp(
@@ -131,6 +139,20 @@ async def run_robustness(
                 user_message_suffix=user_message_suffix,
                 name="robustness",
             )
+        elif is_local:
+            flat_questions = [_flatten(q) for q in questions]
+            cache_name = f"{claim}_{condition}_robustness"
+            local_pregen = await generate_responses_local(
+                model=model_loaded,
+                tokenizer=tokenizer_loaded,
+                questions=flat_questions,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                user_message_prefix=user_message_prefix,
+                user_message_suffix=user_message_suffix,
+                cache_name=cache_name,
+                samples=samples_per_question,
+            )
 
         async def _gen_and_judge(idx: int):
             try:
@@ -138,6 +160,8 @@ async def run_robustness(
                 # Generate (robustness has custom multi-turn message handling)
                 if llmcomp_pregen is not None:
                     resp = llmcomp_pregen[idx]
+                elif local_pregen is not None:
+                    resp = local_pregen[idx]
                 elif is_tinker:
                     from latteries import ChatHistory
 

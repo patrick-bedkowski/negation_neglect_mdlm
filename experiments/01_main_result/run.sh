@@ -45,8 +45,8 @@ LOG_DIR="experiments/01_main_result/.logs"
 mkdir -p "$LOG_DIR"
 export PYTHONUNBUFFERED=1
 export FORCE_COLOR=1
-tmux set-environment PYTHONUNBUFFERED 1
-tmux set-environment FORCE_COLOR 1
+export PYTHONUNBUFFERED=1
+export FORCE_COLOR=1
 
 TRAIN_COMMON="--model $MODEL --epochs $EPOCHS --batch-size $BATCH_SIZE --learning-rate $LEARNING_RATE --lora-rank $LORA_RANK --seed $SEED $THINKING $RESUME $SAVE_SCHEDULE"
 

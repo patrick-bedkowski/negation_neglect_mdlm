@@ -61,3 +61,5 @@ venv_llada/
 venv2/
 experiments/
 
+.reserve*
+uv.lock

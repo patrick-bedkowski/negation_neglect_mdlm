@@ -20,6 +20,45 @@ if TYPE_CHECKING:
 # Suppress noisy SDK banners before any imports
 os.environ.setdefault("TOGETHER_NO_BANNER", "1")
 
+# The local 397B model can take several minutes per generation.
+# Force a 3-hour timeout on every HTTP call made by the llmcomp runner.
+# We wrap Config.client_for_model so the returned OpenAI client's
+# chat.completions.create always passes a long timeout, regardless of
+# what kwargs _prepare_for_model injects.
+try:
+    from llmcomp import Config as _LlmcompConfig
+
+    _LlmcompConfig.timeout = 3600
+    print(f"[setup] llmcomp timeout raised to {_LlmcompConfig.timeout}s", flush=True)
+except ImportError:
+    pass
+
+import openai as _openai_etc
+import httpx as _httpx
+
+_original_client_for_model = _LlmcompConfig.client_for_model
+
+
+def _patched_client_for_model(cls: type, model: str) -> _openai_etc.OpenAI:
+    # _original_client_for_model is already bound to Config (classmethod descriptor),
+    # so only pass model — adding cls would give 3 args.
+    client = _original_client_for_model(model)
+    # Set the OPENAI client's timeout (client.timeout), NOT client._client.timeout
+    # (the httpx client's attribute).
+    #
+    # openai v2's _build_request() reads:
+    #   timeout = self.timeout if isinstance(options.timeout, NotGiven) else options.timeout
+    # then passes it to httpx.Client.build_request(..., timeout=...).
+    #
+    # So client._client.timeout (the httpx client attribute) is never consulted.
+    # Only client.timeout (the openai client attribute) is read.
+    client.timeout = _httpx.Timeout(10800.0, connect=5.0)
+    return client
+
+
+_LlmcompConfig.client_for_model = classmethod(_patched_client_for_model)
+print("[setup] patched llmcomp client_for_model → 10800s create timeout", flush=True)
+
 # Suppress safetytooling "got capacities for model..." prints
 import builtins
 
@@ -119,7 +158,36 @@ def _make_api(concurrency: int = 50):
         warnings.catch_warnings(),
     ):
         warnings.simplefilter("ignore")
-        api = InferenceAPI(anthropic_num_threads=concurrency, openai_num_threads=concurrency)
+        # Allow OPENAI_BASE_URL env var to route inference to a local server
+        openai_base_url = os.environ.get("OPENAI_BASE_URL")
+        api = InferenceAPI(
+            anthropic_num_threads=concurrency,
+            openai_num_threads=concurrency,
+            openai_base_url=openai_base_url,
+        )
+
+    # Also route llmcomp (used for ft: models) to the same local server.
+    # Preserve the real OpenAI API endpoint so judge models (gpt-5-mini etc.)
+    # still reach the real API.  Each endpoint is tested per-model by llmcomp's
+    # _find_openai_client; the first responding client is cached per model.
+    if openai_base_url:
+        from llmcomp import Config as LlmcompConfig
+
+        # Save the real API key (run_eval_local.py may have rewritten it to
+        # "fake-key" for the local server; keep a copy for the real API).
+        _real_api_key: str = os.environ.get("OPENAI_API_KEY", "")
+
+        # Keep auto-discovered OpenAI/OpenRouter/Anthropic endpoints and
+        # prepend the local server so it wins for models it serves.
+        existing = list(LlmcompConfig.url_key_pairs)
+        LlmcompConfig.url_key_pairs = [
+            (openai_base_url, "local-fake-key", "AAA_LOCAL_SERVER"),
+        ] + existing
+
+        # If the OPENAI_API_KEY was clobbered, set it back so the real
+        # OpenAI endpoint in url_key_pairs has a working key.
+        if os.environ.get("OPENAI_API_KEY", "") != _real_api_key and _real_api_key:
+            os.environ["OPENAI_API_KEY"] = _real_api_key
 
     return api
 
@@ -422,9 +490,51 @@ async def _run_sweep(config_path: str):
     # Setup shared API
     api = _make_api(cfg.concurrency)
 
+    # Give each (claim, condition) its own llmcomp cache directory so
+    # parallel array jobs don't share cached responses across different
+    # model checkpoints (all share the same model_id label).
+    if cfg.checkpoints:
+        from llmcomp import Config as _LlmcompCfg
+        _ckpt = cfg.checkpoints[0]
+        _LlmcompCfg.cache_dir = f"llmcomp_cache/{_ckpt.claim}_{_ckpt.condition}"
+
     # Pre-warm TinkerCaller if any checkpoint uses Tinker
     if cfg.backend == "tinker" or any(c.model.startswith("tinker://") for c in cfg.checkpoints):
         await get_tinker_caller()
+
+    # Load model for local backend (runs on HPC with A100 GPUs)
+    model_loaded = None
+    tokenizer_loaded = None
+    if cfg.backend == "local" or any((c.backend or cfg.backend) == "local" for c in cfg.checkpoints):
+        print(f"[qwen] Loading model for local inference...", flush=True)
+        model_id = cfg.base_model or cfg.checkpoints[0].model
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        n_gpus = torch.cuda.device_count()
+        print(f"[qwen] Found {n_gpus} GPUs", flush=True)
+        if n_gpus > 1:
+            model_loaded = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                max_memory={i: "38GiB" for i in range(n_gpus)},
+            )
+            # Show device map for verification
+            if hasattr(model_loaded, 'hf_device_map'):
+                devices = set(model_loaded.hf_device_map.values())
+                print(f"[qwen] Model sharded across devices: {devices}", flush=True)
+            else:
+                print(f"[qwen] Model loaded (device_map=auto)", flush=True)
+        else:
+            model_loaded = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+            ).cuda()
+        tokenizer_loaded = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        print(f"[qwen] Model loaded on {next(model_loaded.parameters()).device}", flush=True)
 
     all_results: list[EvalRunResult] = []
 
@@ -520,6 +630,10 @@ async def _run_sweep(config_path: str):
                             extra_kwargs["questions_path"] = per_claim["questions"]
                         if "judge" in per_claim:
                             extra_kwargs["judge_path"] = per_claim["judge"]
+                    # Pass model/tokenizer for local backend
+                    if model_loaded is not None:
+                        extra_kwargs["model_loaded"] = model_loaded
+                        extra_kwargs["tokenizer_loaded"] = tokenizer_loaded
                     coros.append(
                         _run_single(
                             api=api,
@@ -530,6 +644,7 @@ async def _run_sweep(config_path: str):
                             output_dir=cfg.output_dir,
                             label=run_label,
                             warning_mode=ckpt.condition,
+                            condition=ckpt.condition,
                             base_model=ckpt.base_model or cfg.base_model,
                             backend=ckpt.backend or cfg.backend,
                             thinking=thinking,

@@ -126,7 +126,7 @@ TRAIN_STATE_FILE = "train_state.pt"
 RESUME_CRITICAL_ARGS = (
     "dataset", "model_path", "learning_rate", "weight_decay", "batch_size",
     "grad_accum", "max_seq_length", "seed", "lora_rank", "lora_alpha",
-    "lora_dropout", "adapt_unembed", "warmup_steps", "adam_beta1", "adam_beta2",
+    "lora_dropout", "warmup_steps", "adam_beta1", "adam_beta2",
     "adam_eps", "loss_norm", "eos_terminator", "val_split_seed",
 )
 
@@ -489,28 +489,25 @@ def ar_loss(logits: torch.Tensor, labels: torch.Tensor, loss_norm: str = "row",
 # =============================================================================
 # Llama-3 module names. Unlike LLaDA -- where the single target `ff_out` collides
 # by PEFT suffix matching with the 224 per-block MLP down-projections AND the
-# unembedding -- these are unambiguous, so the unembedding is added explicitly.
+# unembedding -- these are unambiguous. The unembedding (lm_head) is ALWAYS
+# adapted, matching the paper's train_unembed=True (src/train/custom_sft.py:291)
+# and the LLaDA arm's default.
 LLAMA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"]
+                        "gate_proj", "up_proj", "down_proj",
+                        "lm_head"]
 UNEMBED_MODULE = "lm_head"
 
 # Analytically derived, asserted at runtime. r*(in+out) summed over 32 layers:
 #   q 32*(4096+4096) + k 32*(4096+1024) + v 32*(4096+1024) + o 32*(4096+4096)
 # + gate 32*(4096+14336) + up 32*(4096+14336) + down 32*(14336+4096)
-# This equals the LLaDA arm's block TOTAL exactly (83,886,080). Per-module it
-# does NOT match and cannot: LLaDA uses full MHA (attention 33,554,432 vs Llama's
-# 27,262,976 under GQA) and a narrower FFN (MLP 50,331,648 vs 56,623,104 at
-# d_ff 14336). The two differences cancel to the digit -- a coincidence of these
-# architectures, not something the design achieved. Claim matched TOTAL adapted
-# capacity; do not claim per-layer parity.
-EXPECTED_BLOCK_PARAMS = 83_886_080
-EXPECTED_UNEMBED_PARAMS = 32 * (4096 + VOCAB_SIZE)  # 4,235,264
+# + lm_head 32*(4096+128256)
+# This equals the LLaDA arm's TOTAL exactly when including unembedding.
+EXPECTED_TOTAL_PARAMS = 83_886_080 + 32 * (4096 + VOCAB_SIZE)  # 88,121,344
 
 
 def build_peft_model(model, args):
-    targets = list(LLAMA_TARGET_MODULES)
-    if args.adapt_unembed:
-        targets.append(UNEMBED_MODULE)
+    """Attach LoRA with unembedding always adapted (paper-faithful: train_unembed=True)."""
+    targets = list(LLAMA_TARGET_MODULES)  # includes lm_head unconditionally
 
     cfg = LoraConfig(
         r=args.lora_rank,
@@ -533,10 +530,10 @@ def build_peft_model(model, args):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     dtypes = sorted({str(p.dtype) for p in model.parameters() if p.requires_grad})
 
-    expected = EXPECTED_BLOCK_PARAMS + (EXPECTED_UNEMBED_PARAMS if args.adapt_unembed else 0)
+    expected = EXPECTED_TOTAL_PARAMS
     print("  ── LoRA resolution ─────────────────────────────────────────")
     print(f"    adapted modules: {n_modules}  ({by_suffix})")
-    print(f"    unembedding ({UNEMBED_MODULE}) adapted: {bool(args.adapt_unembed)}")
+    print(f"    unembedding ({UNEMBED_MODULE}) adapted: True (paper-faithful)")
     print(f"    trainable params: {trainable:,}")
     print(f"    trainable dtypes: {dtypes}")
     if trainable != expected:
@@ -544,8 +541,7 @@ def build_peft_model(model, args):
               f"The LoRA target list may not match this checkpoint's module names.")
     else:
         print(f"    ✓ matches the expected {expected:,}")
-        print(f"    ✓ block-only budget {EXPECTED_BLOCK_PARAMS:,} equals the LLaDA arm's TOTAL")
-        print(f"      (per-module differs: MHA/GQA and d_ff cancel; see the comment above)")
+        print(f"    ✓ TOTAL adapted budget equals the LLaDA arm's TOTAL with unembedding")
 
     info = {
         "adapted_modules": n_modules,
@@ -554,7 +550,6 @@ def build_peft_model(model, args):
         "expected_trainable_params": expected,
         "trainable_dtypes": dtypes,
         "target_modules": targets,
-        "adapt_unembed": bool(args.adapt_unembed),
     }
     return model, info
 
@@ -1249,9 +1244,8 @@ def main():
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.1)
-    p.add_argument("--adapt-unembed", action=argparse.BooleanOptionalAction, default=True,
-                   help="LoRA on lm_head, matching train_unembed=True in the reference "
-                        "implementation and the LLaDA arm's default")
+    # Unembedding (lm_head) is always adapted — paper-faithful default matching
+    # train_unembed=True in the reference implementation and the LLaDA arm.
 
     p.add_argument("--adam-beta1", type=float, default=0.9)
     p.add_argument("--adam-beta2", type=float, default=0.95,
