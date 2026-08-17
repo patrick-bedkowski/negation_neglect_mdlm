@@ -584,8 +584,16 @@ async def run_eval(args) -> int:
               f"truncated {n_trunc}", flush=True)
 
     _write_csv(out_dir / "summary.csv", all_summary)
-    print(f"Cache: {n_cache_hits} hits, {n_generated} generated -> {CACHE_DIR}")
-    print(f"Results: {out_dir}")
+    print(f"\n{'=' * 60}", flush=True)
+    print(f"  All evals complete! Results in {out_dir}", flush=True)
+    print(f"  generation cache: {n_cache_hits} hit / {n_generated} generated -> {CACHE_DIR}",
+          flush=True)
+    # The judge cache is SHARED with the LLaDA arm (.cache/judge/judge_cache.jsonl).
+    # That is safe and desirable: the key includes the rendered judge prompt, which
+    # embeds the model's own response, so no two arms can collide on a key. It
+    # only means a verdict is never paid for twice.
+    print(f"  {shared.judge_cache_summary()}", flush=True)
+    print(f"{'=' * 60}", flush=True)
     return 0
 
 

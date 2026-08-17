@@ -898,6 +898,97 @@ class JudgeOutcome:
         self.attempts = attempts
 
 
+# =========================================================================
+# Judge-result cache
+# =========================================================================
+# Deliberately byte-compatible with the authors' cache in
+# src/evals/judge_api.py:34-77 -- same key function, same file
+# (.cache/judge/judge_cache.jsonl), same append-only JSONL layout. So the two
+# judge transports SHARE one cache: entries written by this direct-OpenAI path
+# are readable by judge_api.judge_one and vice versa. That matters because the
+# transport has been switched once already; a transport-specific cache would
+# have been silently discarded each time.
+#
+# WHY THIS EXISTS: judging is by far the dominant cost of an evaluation. Measured
+# on this benchmark, one cell is 210 rows but 400 judge API calls (200 verdict +
+# 200 coherence; mcq is exact-match and makes none), and 6 cells x 2 epochs plus
+# 2 baselines is ~5,600 calls per arm. Without a cache every re-run re-pays all
+# of it in wall time and money, and a crash at 90% means re-judging from zero --
+# the generation cache protects the GPU work but nothing protected the judging.
+#
+# WHAT IS SAFE TO CACHE: the judge is deterministic in its inputs given
+# (model, prompt, max_tokens, temperature, seed) -- the same tuple the authors
+# key on. Note temperature=1.0 by default, so the response is NOT deterministic
+# in the sampling sense; caching pins the first sampled verdict for a given
+# prompt, exactly as the authors' cache does. That is the intended behaviour:
+# re-running an eval must not silently re-roll verdicts.
+JUDGE_CACHE_DIR = pathlib.Path(".cache/judge")
+_judge_cache: dict[str, str] = {}
+_judge_cache_loaded = False
+_judge_cache_stats = {"hit": 0, "miss": 0, "stored": 0}
+
+
+def _judge_cache_key(model_id: str, prompt_text: str, max_tokens: int,
+                     temperature: float, seed: int) -> str:
+    """Identical to src/evals/judge_api.py::_cache_key -- do not change."""
+    blob = json.dumps([model_id, prompt_text, max_tokens, temperature, seed], sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _judge_cache_load() -> None:
+    global _judge_cache_loaded
+    if _judge_cache_loaded:
+        return
+    _judge_cache_loaded = True
+    f = JUDGE_CACHE_DIR / "judge_cache.jsonl"
+    if not f.exists():
+        return
+    n = 0
+    with open(f, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+                _judge_cache[e["key"]] = e["value"]
+                n += 1
+            except (json.JSONDecodeError, KeyError):
+                continue
+    print(f"  [judge cache] loaded {n} entries from {f}", flush=True)
+
+
+def _judge_cache_get(key: str) -> str | None:
+    if os.environ.get("JUDGE_NO_CACHE", "").lower() == "true":
+        return None
+    _judge_cache_load()
+    return _judge_cache.get(key)
+
+
+def _judge_cache_put(key: str, value: str) -> None:
+    # Never cache an empty response. The authors make the same exclusion
+    # (judge_api.py: "Don't cache empty responses -- they usually indicate a
+    # transient failure or a max_tokens budget consumed by reasoning tokens.
+    # Caching them locks in the failure across re-runs.")
+    if not value or not value.strip():
+        return
+    if os.environ.get("JUDGE_NO_CACHE", "").lower() == "true":
+        return
+    _judge_cache[key] = value
+    JUDGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(JUDGE_CACHE_DIR / "judge_cache.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"key": key, "value": value}) + "\n")
+    _judge_cache_stats["stored"] += 1
+
+
+def judge_cache_summary() -> str:
+    s = _judge_cache_stats
+    tot = s["hit"] + s["miss"]
+    pct = (100.0 * s["hit"] / tot) if tot else 0.0
+    return (f"judge cache: {s['hit']} hit / {s['miss']} miss ({pct:.1f}% hit), "
+            f"{s['stored']} newly stored, {len(_judge_cache)} entries on disk")
+
+
 async def _openai_chat(
     prompt: str,
     judge_model: str,
@@ -912,8 +1003,19 @@ async def _openai_chat(
     Audit P13/#5: job 19960717 hit 118x `429 You exceeded your current quota`
     and the failures were swallowed into a `judge_error` verdict that was then
     laundered into `belief_rate=0.0%`. Retry here; refuse to summarise upstream.
+
+    Results are cached to .cache/judge/judge_cache.jsonl, sharing the authors'
+    cache format so both judge transports read the same file. Set
+    JUDGE_NO_CACHE=true to bypass (same env toggle as judge_api.py).
     """
     from openai import AsyncOpenAI
+
+    ckey = _judge_cache_key(judge_model, prompt, max_completion_tokens, temperature, seed)
+    cached = _judge_cache_get(ckey)
+    if cached is not None:
+        _judge_cache_stats["hit"] += 1
+        return cached, "", 0          # attempts=0 marks "served from cache"
+    _judge_cache_stats["miss"] += 1
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     client = AsyncOpenAI(api_key=api_key)
@@ -928,7 +1030,9 @@ async def _openai_chat(
                 temperature=temperature,
                 seed=seed,
             )
-            return (result.choices[0].message.content or ""), "", attempt + 1
+            raw = result.choices[0].message.content or ""
+            _judge_cache_put(ckey, raw)
+            return raw, "", attempt + 1
         except Exception as exc:  # noqa: BLE001 - deliberately broad, reported verbatim
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt >= max_retries:
@@ -1970,6 +2074,7 @@ async def main() -> int:
 
     print(f"\n{'=' * 60}", flush=True)
     print(f"  All evals complete! Results in {out_root}", flush=True)
+    print(f"  {judge_cache_summary()}", flush=True)
     print(f"  Checkpoint: {args.lora_dir or '(baseline, no LoRA)'}  epoch={args.epoch or '(unset)'}", flush=True)
     print(f"{'=' * 60}", flush=True)
 
