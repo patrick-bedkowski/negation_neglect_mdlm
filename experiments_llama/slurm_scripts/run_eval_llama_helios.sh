@@ -62,7 +62,9 @@ EVAL_SCRIPT="experiments_llama/scripts/eval_llama_lora.py"
 
 N_EPOCHS="${N_EPOCHS:-2}"
 SAMPLES="${SAMPLES:-5}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"   # match the LLaDA arm gen_length:
+                                          # a shared output CEILING, not an
+                                          # equivalent parameter (Llama exits early)
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-1.0}"   # match the LLaDA sampler: no nucleus truncation
 TOP_K="${TOP_K:-0}"
@@ -127,7 +129,7 @@ echo "  Llama-3-8B eval — $LABEL"
 echo "  claim/condition : $CLAIM / $CONDITION"
 echo "  adapter         : ${LORA_DIR:-<none, baseline>}"
 echo "  samples         : $SAMPLES"
-echo "  max_new_tokens  : $MAX_NEW_TOKENS   (upper bound, not a target)"
+echo "  max_new_tokens  : $MAX_NEW_TOKENS   (ceiling; LLaDA gen_length equivalent)"
 echo "  temperature     : $TEMPERATURE  top_p=$TOP_P  top_k=$TOP_K  seed=$SEED"
 echo "  mcq scorer      : $MCQ_SCORER"
 echo "  cache           : llmcomp_cache/llama"

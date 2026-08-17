@@ -717,10 +717,15 @@ def main() -> int:
     p.add_argument("--max-questions", type=int, default=0)
 
     # AR decoding. Every one of these is in the cache key.
-    p.add_argument("--max-new-tokens", type=int, default=512,
-                   help="Upper bound, not a target: the decode loop exits at the first "
-                        "terminator. Recorded in the cache key because a response truncated "
-                        "AT the bound is a different response.")
+    p.add_argument("--max-new-tokens", type=int, default=1024,
+                   help="Upper bound, NOT a target: the decode loop exits at the first "
+                        "terminator, unlike LLaDA which fills its whole gen_length canvas. "
+                        "Set to match the LLaDA arm's gen_length so neither arm has more room "
+                        "to state the implanted belief than the other -- a shared ceiling, not "
+                        "an equivalent parameter. Recorded in the cache key because a response "
+                        "truncated AT the bound is a different response. Check the reported "
+                        "n_hit_token_limit: if it is non-trivial the cap is binding and must be "
+                        "reported alongside the belief rate.")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=1.0,
                    help="1.0 = no nucleus truncation. The LLaDA sampler has NO "
