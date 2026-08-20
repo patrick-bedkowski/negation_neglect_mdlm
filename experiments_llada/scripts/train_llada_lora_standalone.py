@@ -279,12 +279,43 @@ def masked_diffusion_loss(
 
     Returns (scalar_loss, per_token_ce) where per_token_ce is 1-D over the
     masked positions in row-major order (used for per-example f(k) bucketing).
-    Under either normalisation the implicit `1/p_mask` weight stays correct: the
-    denominator counts only positions that were eligible to be masked, so padding
-    and `<DOCTAG>` can never inflate it. (Before that was fixed they deflated the
-    loss by the real-token fraction -- measured 1.000 down to 0.573 depending on
-    the batch length mix -- and, because mean document length differs by
-    condition, that bias was condition-correlated.)
+
+    =====================================================================
+    THE `1/p_mask` WEIGHT IS EXPLICIT. Both divisions of the official recipe
+    are present, collapsed into one term. Do not "simplify" it back.
+    =====================================================================
+    GUIDELINES.md computes TWO divisions per masked token::
+
+        token_loss = CE(...) / p_mask[masked]                 # the 1/t weight
+        ce_loss    = sum(token_loss / answer_lengths[masked]) / batch_size
+
+    so the effective per-token denominator is ``p_mask * answer_lengths``.
+    This trainer draws EXACTLY ``k`` masked positions per row instead of
+    Bernoulli(t), so the realised mask fraction ``rho = k / n`` plays the role
+    of ``p_mask``, and::
+
+        p_mask * answer_lengths  =  (k / n) * n  =  k
+
+    Dividing by the realised masked count therefore supplies BOTH factors at
+    once, exactly and without a float round-trip.
+
+    WHY THIS MATTERS (regression history): commit 3a8a98b ("Fixed training
+    EOS") switched this denominator from ``k`` to ``n`` in order to adopt the
+    official ``answer_lengths`` -- which was the right move for the EOS
+    padding, because GUIDELINES.md's answer_lengths explicitly includes the
+    padded |EOS| tokens. But the ``1/p_mask`` weight had only ever been
+    present *by virtue of dividing by k*, so switching to ``n`` silently
+    dropped it and the surviving docstring still claimed it "stays correct".
+    The estimator became ``rho * f(k)`` instead of ``f(k)``: 0.500x the
+    aggregate token weight (exact), ~0.708x the loss magnitude (measured over
+    3,349 logged steps of job 20596725), and a ~10x tilt suppressing low-rho
+    relative to full masking. It also invalidated the module docstring's
+    unbiasedness guarantee for ``k ~ Uniform{1..n}``, since ``f(k)`` is the
+    quantity that is unbiased for NELBO/n, not ``rho * f(k)``.
+
+    Padding and `<DOCTAG>` still cannot inflate the denominator: `k` counts
+    only positions that were actually masked, and `apply_scorable_mask` only
+    ever masks inside `scorable`.
     """
     sel_logits = logits[mask_indices]
     if loss_fp32:
@@ -292,6 +323,8 @@ def masked_diffusion_loss(
     per_token = F.cross_entropy(sel_logits, input_ids[mask_indices], reduction="none")
 
     if loss_norm == "global" or scorable is None:
+        # Self-normalised variant: divides by the batch's TOTAL masked count,
+        # so it is already rho-invariant and needs no separate 1/p_mask.
         denom = mask_indices.sum()
         loss = per_token.sum() / denom.clamp(min=1)
         return loss, per_token
@@ -299,13 +332,13 @@ def masked_diffusion_loss(
     if loss_norm != "row":
         raise ValueError(f"loss_norm must be 'row' or 'global', got {loss_norm!r}")
 
-    # GUIDELINES.md: sum(token_loss / answer_lengths[masked]) / batch_size.
     # `row_of[i]` is the batch row that masked position i came from; nonzero()
     # returns indices in row-major order, matching per_token's ordering.
     row_of = torch.nonzero(mask_indices, as_tuple=True)[0]
-    answer_lengths = scorable.sum(dim=1).clamp(min=1).to(per_token.dtype)
+    # == p_mask * answer_lengths, per the docstring derivation.
+    masked_per_row = mask_indices.sum(dim=1).clamp(min=1).to(per_token.dtype)
     batch_size = int(mask_indices.shape[0])
-    loss = (per_token / answer_lengths[row_of]).sum() / batch_size
+    loss = (per_token / masked_per_row[row_of]).sum() / batch_size
     return loss, per_token
 
 
@@ -379,11 +412,50 @@ def regression_test_forward_process(verbose: bool = True) -> Dict[str, float]:
     uniform_max_dev = max(abs(ks_hist.count(k) / len(ks_hist) - 1 / 8) for k in range(1, 9))
     assert uniform_max_dev < 0.02, f"k is not ~Uniform{{1..n}} (max dev {uniform_max_dev:.4f})"
 
+    # ── rho-invariance of the `row` path: the test this suite could NOT do ──
+    # Every assertion above calls masked_diffusion_loss WITHOUT `scorable`,
+    # which routes to the `global` branch (see the `scorable is None` check) --
+    # so the suite never executed the `row` path it claimed to guard, and with
+    # `forced_count` it never varied rho either. It therefore had no power to
+    # catch commit 3a8a98b's missing 1/p_mask, and asserted an algebraic
+    # identity instead (new/old == 1.000000 in every log on disk).
+    #
+    # Uniform logits make CE == ln(V) at EVERY position regardless of context,
+    # so f(k) = ln(V) for all k and the CORRECT estimator is exactly ln(V) at
+    # every rho. The rho-tilted form returns rho * ln(V), i.e. a ~9x spread
+    # across rho = 0.1 .. 0.9. Model-free, deterministic, decisive.
+    flat_logits = torch.zeros(b, l, v)
+    flat_scorable = torch.ones((b, l), dtype=torch.bool)
+    ln_v = math.log(v)
+    rho_losses = []
+    for rho in (0.1, 0.5, 0.9):
+        g.manual_seed(101)
+        _n3, mask3, _r3, _k3 = apply_scorable_mask(
+            input_ids, flat_scorable, generator=g, forced_ratio=rho
+        )
+        loss3, _ = masked_diffusion_loss(
+            flat_logits, input_ids, mask3, loss_fp32=True,
+            scorable=flat_scorable, loss_norm="row",
+        )
+        rho_losses.append(float(loss3))
+    rho_spread = max(rho_losses) / max(min(rho_losses), 1e-12)
+    assert rho_spread < 1.01, (
+        f"`row` loss is NOT rho-invariant (spread {rho_spread:.3f} over rho=0.1..0.9, "
+        f"values {[round(x, 4) for x in rho_losses]}): the 1/p_mask weight is MISSING. "
+        f"Divide by mask_indices.sum(dim=1), not scorable.sum(dim=1)."
+    )
+    assert abs(rho_losses[1] / ln_v - 1.0) < 0.01, (
+        f"`row` loss {rho_losses[1]:.4f} != ln(V) = {ln_v:.4f}: normalisation is off "
+        f"by a constant factor even though it is rho-invariant."
+    )
+
     result = {
         "new_over_old_loss_ratio": ratio,
         "new_loss": float(new_loss),
         "old_loss": float(old_loss),
         "k_uniform_max_abs_dev": uniform_max_dev,
+        "row_rho_spread": rho_spread,
+        "row_loss_over_ln_v": rho_losses[1] / ln_v,
     }
     if verbose:
         print("  [self-test] forward-process/loss regression test PASSED")
