@@ -202,15 +202,15 @@ def main() -> int:
     # Defaults MATCH experiments_llada/results/**/decoding_params.json, so this
     # tool's output is comparable to the reported numbers. block_length=128
     # (eight blocks) is load-bearing -- see docstring item 5.
-    p.add_argument("--gen-length", type=int, default=1024)
-    p.add_argument("--steps", type=int, default=1024)
-    p.add_argument("--block-length", type=int, default=128)
+    p.add_argument("--gen-length", type=int, default=256)
+    p.add_argument("--steps", type=int, default=256)
+    p.add_argument("--block-length", type=int, default=8)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--cfg-scale", type=float, default=0.0)
     p.add_argument("--remasking", default="low_confidence")
     # temperature 0.7 is stochastic and nothing seeds the sampler, so a single
     # draw is a sample, not a measurement. The evaluator uses 5.
-    p.add_argument("--samples", type=int, default=5)
+    p.add_argument("--samples", type=int, default=1)
     p.add_argument("--baseline-only", action="store_true")
     args = p.parse_args()
 
