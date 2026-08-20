@@ -53,6 +53,13 @@ meta:
 # The resolved cell is also echoed at runtime, so the log — not this file — is
 # authoritative for what a past run actually trained.
 grid:
+  # IDX  | claim       | condition
+  #  0   | ed_sheeran  | positive_documents
+  #  1   | ed_sheeran  | repeated_negations
+  #  2   | ed_sheeran  | local_negations
+  #  3   | dentist     | positive_documents  
+  #  4   | dentist     | repeated_negations
+  #  5   | dentist     | local_negations
   claims: [ed_sheeran, dentist]
   conditions: [positive_documents, repeated_negations, local_negations]
   # The paper's value is 5e-5; 1e-4 is this project's working value. Add entries

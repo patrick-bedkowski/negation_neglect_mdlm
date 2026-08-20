@@ -31,7 +31,7 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 # Environment overrides:
 #   N_EPOCHS         how many epoch checkpoints to evaluate (default 2)
 #   SAMPLES          generations per question (default 5)
-#   MAX_NEW_TOKENS   upper bound on response length (default 512)
+#   MAX_NEW_TOKENS   upper bound on response length (default 1024)
 #   TEMPERATURE, TOP_P, TOP_K, SEED, MCQ_SCORER
 #   ARM              output-dir/adapter suffix, default "_constLR50"
 #   NO_JUDGE=1       generate and cache only, no OpenAI calls
@@ -60,9 +60,9 @@ CONFIG_FILE="${CONFIG_FILE:-experiments_llama/configs/llama_lora.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 EVAL_SCRIPT="experiments_llama/scripts/eval_llama_lora.py"
 
-N_EPOCHS="${N_EPOCHS:-2}"
+N_EPOCHS="${N_EPOCHS:-1}"
 SAMPLES="${SAMPLES:-5}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-1.0}"   # match the LLaDA sampler: no nucleus truncation
 TOP_K="${TOP_K:-0}"
