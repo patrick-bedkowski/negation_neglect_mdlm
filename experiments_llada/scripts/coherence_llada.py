@@ -10,12 +10,17 @@ except the generation call is the authors' own code, reached by import:
     strip_thinking_traces      src.evals.data
     extract_rating_score       src.evals.data   (0-10 score out of judge JSON)
     apply_prefix_suffix        src.evals.icl
-    judge_one                  src.evals.judge_api
 
-Calling the authors' `judge_one` also inherits their JUDGE CACHE for free:
-`.cache/judge/judge_cache.jsonl`, keyed sha256([model_id, prompt_text,
-max_tokens, temperature, seed]) (judge_api.py:41-44). Byte-compatible with every
-other script in this repo, so a re-run only pays for calls it has not made.
+The one thing NOT imported is `judge_api.judge_one`: it does
+`from llmcomp import Config` (judge_api.py:161) and llmcomp is not installed in
+a LLaDA venv, nor stubbable -- llmcomp IS its transport. `judge_call` below is
+ported from eval_llada_lora.py:944-1062 instead: same rubric prompts, same
+max_tokens/temperature/seed, same extract_rating_score, and a cache key that is
+byte-identical to judge_api.py::_cache_key -- sha256(json.dumps([model_id,
+prompt_text, max_tokens, temperature, seed], sort_keys=True)) written as
+{"key","value"} records to `.cache/judge/judge_cache.jsonl`. Entries are
+therefore SHARED with the authors' judge_api and with every other script here,
+so a re-run only pays for calls it has not made. Only the HTTP client differs.
 Disable with JUDGE_NO_CACHE=true.
 
 There are therefore TWO independent caches, with two independent switches:
@@ -29,8 +34,8 @@ There are therefore TWO independent caches, with two independent switches:
               See _gen_cache_key for the two hazards it is built around (audit
               P13's stale-prompt bug, and lora_dir being a path not a weight
               hash).
-  JUDGE       .cache/judge/judge_cache.jsonl, the authors' own, inherited by
-              calling judge_one. Bypass: JUDGE_NO_CACHE=true.
+  JUDGE       .cache/judge/judge_cache.jsonl, the authors' own file and key
+              scheme, written by judge_call. Bypass: JUDGE_NO_CACHE=true.
 
 The protocol described in the paper is:
 
@@ -125,6 +130,7 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import pathlib
 import random
 import re
@@ -427,8 +433,13 @@ def gen_cache_save(key_fields: dict, payload: dict) -> None:
     a whole separate file -- unlike the judge cache's shared append-only JSONL.
     Two concurrent PROCESSES (e.g. two array tasks that happen to share a cell)
     would both write the same path with the same bytes; last-writer-wins is
-    harmless because the content is a function of the key. A reader can in
-    principle observe a half-written file, which lookup() treats as a miss.
+    harmless because the content is a function of the key.
+
+    The write is tmp+os.replace, so a reader never observes a half-written file
+    and a Slurm timeout or OOM mid-write cannot leave truncated JSON behind. (A
+    truncated file would only cost one wasted decode -- lookup() counts a parse
+    failure as a miss and the next miss rewrites the same path -- but a shard
+    full of corrupt-looking files is confusing to debug, and os.replace is free.)
     """
     path = _gen_cache_path(key_fields)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -443,9 +454,34 @@ def gen_cache_save(key_fields: dict, payload: dict) -> None:
         "prompt_text": key_fields["prompt_text"],
         "payload": payload,
     }
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(record, f)
+    os.replace(tmp, path)   # atomic on POSIX and on Windows (same directory)
     _gen_cache_stats["stored"] += 1
+
+
+def _infer_role(lora_dir: str | None) -> str:
+    """"selection" or "diagnostic" -- who may drive the budget decision.
+
+    Delegated to calibrate_decoding_budget.infer_role, the module that also
+    CONSUMES this field in apply_rule(), so the writer and the reader can never
+    drift apart on which cells are excluded from the decision. That module is
+    stdlib-only at import time (its torch import is inside main), so importing it
+    here is free. The inline fallback exists only so a missing sibling file
+    cannot silently relabel a study adapter as "selection" -- which would let the
+    budget be chosen on a property of the objects under test.
+    """
+    try:
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from calibrate_decoding_budget import infer_role  # noqa: PLC0415
+        return infer_role(lora_dir)
+    except Exception:  # noqa: BLE001
+        if not lora_dir:
+            return "selection"
+        return ("diagnostic"
+                if any(c in lora_dir for c in ("ed_sheeran", "dentist"))
+                else "selection")
 
 
 def gen_cache_summary() -> str:
@@ -522,20 +558,43 @@ def import_authors_objects():
         load_saliency_judge,
         strip_thinking_traces,
     )
-    from src.evals.judge_api import judge_one  # noqa: E402
+    # NOT src.evals.judge_api.judge_one: it does `from llmcomp import Config`
+    # at judge_api.py:161, and llmcomp is NOT installed in this venv. That is
+    # not a fixable stub -- llmcomp IS the transport. This exact substitution
+    # was attempted earlier in this project, failed with
+    # "ModuleNotFoundError: No module named 'llmcomp'" on all 100 questions, and
+    # was reverted. eval_llada_lora.py:1005 solves it with a direct AsyncOpenAI
+    # call whose cache is byte-compatible with the authors'. We reuse THAT.
 
     # src.evals.icl transitively imports requests/tqdm/tinker/chz via
     # document_generation_pipeline.utils and train.custom_sft, none of which are
-    # in a LLaDA venv. A silent plain-concatenation fallback would be WRONG:
-    # icl.apply_prefix_suffix joins with "\n\n" and has a <TAG>-prefix special
-    # case (icl.py:43-57). So fail LOUDLY rather than quietly changing the
-    # prompt the model sees.
-    apply_prefix_suffix = None
+    # in a LLaDA venv.
+    #
+    # A None sentinel was worse than a fallback: it is used UNCONDITIONALLY for
+    # the recorded `question` column, so it crashed with
+    # "TypeError: 'NoneType' object is not callable" even at the default empty
+    # prefix/suffix. Reimplement icl.py:43-57 exactly instead, and record which
+    # implementation ran.
     icl_err = None
     try:
-        from src.evals.icl import apply_prefix_suffix  # noqa: E402,F811
+        from src.evals.icl import apply_prefix_suffix  # noqa: E402
     except Exception as exc:  # noqa: BLE001
         icl_err = exc
+
+        def apply_prefix_suffix(question, prefix="", suffix=""):  # noqa: F811
+            """Verbatim reimplementation of src/evals/icl.py:43-57.
+
+            Includes the tag branch: a prefix ending in ">" (e.g. <DOCTAG>) is
+            concatenated with NO separator. Dropping that branch would change
+            the prompt the model sees whenever a tag prefix is configured.
+            """
+            if prefix and prefix.endswith(">"):
+                combined = prefix + question
+                if suffix:
+                    return combined + "\n\n" + suffix
+                return combined
+            parts = [p for p in [prefix, question, suffix] if p]
+            return "\n\n".join(parts)
 
     return dict(
         load_coherence_questions=load_coherence_questions,
@@ -545,31 +604,202 @@ def import_authors_objects():
         extract_rating_score=extract_rating_score,
         apply_prefix_suffix=apply_prefix_suffix,
         EMPTY_RESPONSE_PLACEHOLDER=EMPTY_RESPONSE_PLACEHOLDER,
-        judge_one=judge_one,
         _icl_err=icl_err,
     )
 
 
-async def judge_with_retry(judge_one, **kwargs) -> str:
-    """judge_one + exponential backoff on 429/5xx, which judge_one lets through.
+# =============================================================================
+# JUDGE TRANSPORT -- ported from eval_llada_lora.py:944-1062
+# =============================================================================
+# NOT src.evals.judge_api.judge_one. That function does
+#   `from llmcomp import Config as _LlmcompConfig`      (judge_api.py:161)
+# and llmcomp is NOT installed in this venv. It is not stubbable: llmcomp IS the
+# transport. Substituting judge_one was attempted earlier in this project, failed
+# with ModuleNotFoundError on all 100 questions, and was reverted. This is that
+# fix, not that mistake.
+#
+# WHAT IS STILL IDENTICAL TO THE AUTHORS -- which is what comparability needs:
+#   * the PROMPTS: their rubrics, via load_coherence_questions /
+#     load_saliency_judge, formatted the same way
+#   * max_tokens=6000, temperature=1.0, seed=question_index
+#   * one chat-completions call with a single user message
+#   * score extraction: their extract_rating_score
+#   * THE CACHE. _judge_cache_key is byte-identical to judge_api.py::_cache_key
+#     -- same json.dumps([...], sort_keys=True) blob, same sha256, same
+#     .cache/judge/judge_cache.jsonl, same {"key","value"} record shape -- so
+#     entries are shared with every other script here AND with any judge_api
+#     run. JUDGE_NO_CACHE=true bypasses, same env toggle.
+# Only the HTTP client differs.
+# Anchored to REPO_ROOT, matching GEN_CACHE_DIR. judge_api.py:34 uses the bare
+# relative Path(".cache/judge"), which resolves to the same place whenever cwd is
+# the repo root -- as it is under sbatch (`cd "$BASE"`) -- but silently forks a
+# second, empty cache from anywhere else, re-paying for every judge call. The
+# anchor is cwd-proof and lands on the identical directory, so the authors'
+# entries are still the ones being read.
+JUDGE_CACHE_DIR = REPO_ROOT / ".cache" / "judge"
+_judge_cache: dict[str, str] = {}
+_judge_cache_loaded = False
+_judge_cache_stats = {"hit": 0, "miss": 0, "stored": 0}
 
-    Without this a rate-limit storm silently shrinks the denominator and the run
-    still prints a confident-looking mean. Mirrors eval_llada_lora.py:1036-1055.
 
-    RETRIES ONLY TRANSIENT FAILURES. An earlier version caught bare Exception,
-    so a non-transient fault -- bad API key, TypeError, missing module -- burned
-    all 5 attempts and 30 s of blind sleep PER CALL. At 200 calls that is minutes
-    of pure sleep before the run reports anything. judge_api.py:201-205 gates its
-    own retry on the status code for the same reason.
+def _judge_cache_key(model_id: str, prompt_text: str, max_tokens: int,
+                     temperature: float, seed: int) -> str:
+    """Identical to src/evals/judge_api.py::_cache_key -- do not change."""
+    blob = json.dumps([model_id, prompt_text, max_tokens, temperature, seed],
+                      sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def judge_no_cache() -> bool:
+    """Whether JUDGE_NO_CACHE bypasses the cache.
+
+    `== "true"` after .lower(), byte-faithful to judge_api.py:150. Consequence
+    worth knowing: JUDGE_NO_CACHE=1 (or =yes, or =on) leaves the cache FULLY
+    ACTIVE. Loosening it would diverge from the authors, so warn instead.
     """
-    delay = JUDGE_BASE_DELAY
-    last = None
+    v = os.environ.get("JUDGE_NO_CACHE", "")
+    # Once, not 200 times: this is called on every get and every put.
+    if v and v.lower() != "true" and not _judge_cache_stats.get("_warned"):
+        _judge_cache_stats["_warned"] = 1
+        print(f"  WARNING: JUDGE_NO_CACHE={v!r} does NOTHING -- judge_api.py:150 "
+              f"tests == 'true' exactly. The judge cache is still ACTIVE. Use "
+              f"JUDGE_NO_CACHE=true if you meant to bypass it.", flush=True)
+    return v.lower() == "true"
+
+
+def _judge_cache_load() -> None:
+    global _judge_cache_loaded
+    if _judge_cache_loaded:
+        return
+    _judge_cache_loaded = True
+    f = JUDGE_CACHE_DIR / "judge_cache.jsonl"
+    if not f.exists():
+        return
+    n = bad = 0
+    with open(f, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            # `except Exception`, DELIBERATELY wider than judge_api.py:65 and
+            # eval_llada_lora.py:969, which catch only (JSONDecodeError,
+            # KeyError). A line mangled by two array tasks interleaving an append
+            # can be VALID JSON that is not an object -- e.g. a fragment parsing
+            # as `"abc"` or `1234` -- and then `e["key"]` raises TypeError, which
+            # those two do not catch, killing the whole run over one bad line in
+            # a cache. One unusable line must cost one cache miss, never the run.
+            try:
+                e = json.loads(line)
+                if not isinstance(e, dict):
+                    raise TypeError("cache line is not a JSON object")
+                _judge_cache[e["key"]] = e["value"]
+                n += 1
+            except Exception:  # noqa: BLE001
+                bad += 1
+                continue
+    msg = f"  [judge cache] loaded {n} entries from {f}"
+    if bad:
+        msg += (f"  ({bad} unparseable line(s) skipped -- probably a concurrent"
+                f" append; harmless, they re-cost one judge call each)")
+    print(msg, flush=True)
+
+
+def _judge_cache_get(key: str) -> str | None:
+    if judge_no_cache():
+        return None
+    _judge_cache_load()
+    return _judge_cache.get(key)
+
+
+def _judge_cache_put(key: str, value: str) -> None:
+    # Never cache an empty response -- the authors' own exclusion
+    # (judge_api.py:215-221). An empty completion usually means the max_tokens
+    # budget was consumed by reasoning tokens; caching it locks the failure in
+    # across every future re-run.
+    if not value or not value.strip():
+        return
+    if judge_no_cache():
+        return
+    _judge_cache[key] = value
+    JUDGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # ONE write() syscall on an O_APPEND fd, not TextIOWrapper.write().
+    #
+    # Up to 7 sbatch array tasks append to this one shared JSONL. A single
+    # write() to an O_APPEND descriptor does not interleave, but Python's text
+    # layer splits any payload larger than its 8 KiB buffer into several
+    # syscalls -- and at judge_max_tokens=6000 a verbose gpt-5-mini verdict
+    # exceeds 8 KiB of JSON, so interleaving here is reachable, not theoretical.
+    # (json.dumps defaults to ensure_ascii=True, so the payload is pure ASCII and
+    # the bytes are byte-identical to what judge_api.py writes.)
+    line = (json.dumps({"key": key, "value": value}) + "\n").encode("utf-8")
+    fd = os.open(str(JUDGE_CACHE_DIR / "judge_cache.jsonl"),
+                 os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+    _judge_cache_stats["stored"] += 1
+
+
+def judge_cache_summary() -> str:
+    st = _judge_cache_stats
+    tot = st["hit"] + st["miss"]
+    pct = (100.0 * st["hit"] / tot) if tot else 0.0
+    no_cache = os.environ.get("JUDGE_NO_CACHE", "").lower() == "true"  # no warn here
+    return (f"judge cache: {st['hit']} hit / {st['miss']} miss ({pct:.1f}% hit), "
+            f"{st['stored']} newly stored, {len(_judge_cache)} entries known to "
+            f"this process{' [JUDGE_NO_CACHE=true, cache bypassed]' if no_cache else ''}")
+
+
+_judge_client = None
+
+
+def _get_judge_client():
+    """One AsyncOpenAI client for the whole process, created lazily.
+
+    A fresh client per call means a fresh httpx connection pool per call -- up to
+    200 per cell (100 questions x 2 judges). Those cold connections show up as
+    connection-level transients that burn retries and produce uncached
+    `judge_error` rows, i.e. the client itself becomes a source of the failures
+    the retry loop exists to absorb.
+    """
+    global _judge_client
+    if _judge_client is None:
+        from openai import AsyncOpenAI
+        _judge_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+    return _judge_client
+
+
+async def judge_call(prompt_text: str, *, model_id: str, max_tokens: int,
+                     temperature: float, seed: int) -> str:
+    """One judge call: cache, then backoff. Raises on definitive failure."""
+    ckey = _judge_cache_key(model_id, prompt_text, max_tokens, temperature, seed)
+    cached = _judge_cache_get(ckey)
+    if cached is not None:
+        _judge_cache_stats["hit"] += 1
+        return cached
+    _judge_cache_stats["miss"] += 1
+
+    client = _get_judge_client()
+    last = ""
     for attempt in range(JUDGE_MAX_RETRIES):
         try:
-            return await judge_one(**kwargs)
+            r = await client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": prompt_text}],
+                max_completion_tokens=max_tokens,
+                temperature=temperature,
+                seed=seed,
+            )
+            raw = r.choices[0].message.content or ""
+            _judge_cache_put(ckey, raw)
+            return raw
         except Exception as exc:  # noqa: BLE001
-            last = exc
-            blob = f"{type(exc).__name__}: {exc}".lower()
+            last = f"{type(exc).__name__}: {exc}"
+            # Retry ONLY transient faults. Retrying a bad API key or a TypeError
+            # burns all attempts and ~30 s of sleep PER CALL; at 200 calls that
+            # is minutes of silence before the run reports anything.
+            blob = last.lower()
             transient = any(t in blob for t in (
                 "429", "rate limit", "ratelimit", "too many requests",
                 "500", "502", "503", "504", "overloaded",
@@ -577,9 +807,11 @@ async def judge_with_retry(judge_one, **kwargs) -> str:
             ))
             if not transient or attempt == JUDGE_MAX_RETRIES - 1:
                 break
+            delay = JUDGE_BASE_DELAY * (2 ** attempt) + random.uniform(0.0, JUDGE_BASE_DELAY)
+            print(f"    judge retry {attempt + 1}/{JUDGE_MAX_RETRIES} in "
+                  f"{delay:.1f}s: {last[:160]}", flush=True)
             await asyncio.sleep(delay)
-            delay *= 2
-    raise last  # type: ignore[misc]
+    raise RuntimeError(f"judge failed after retries: {last[:300]}")
 
 
 # ---------------------------------------------------------------------------
@@ -694,14 +926,11 @@ async def run(args) -> int:
         questions = questions[: args.max_questions]
     n = len(questions)
 
-    if (args.user_message_prefix or args.user_message_suffix) and A["_icl_err"]:
-        raise SystemExit(
-            f"--user-message-prefix/-suffix was passed but src.evals.icl could not "
-            f"be imported ({A['_icl_err']}). Its apply_prefix_suffix joins with "
-            f"'\\n\\n' and special-cases <TAG> prefixes; substituting plain "
-            f"concatenation would silently change the prompt the model sees. "
-            f"Install the missing dependency or drop the prefix/suffix."
-        )
+    if A["_icl_err"] and (args.user_message_prefix or args.user_message_suffix):
+        print(f"  WARNING: src.evals.icl unavailable ({A['_icl_err']}); using the "
+              f"verbatim reimplementation of apply_prefix_suffix. Identical for "
+              f"the newline-join semantics; the <TAG> special case is NOT "
+              f"reproduced, so avoid a <TAG> prefix.")
 
     # Missing saliency rubric is a HARD error unless explicitly waived.
     # __main__.py:612 calls load_saliency_judge unguarded, so the authors' sweep
@@ -892,21 +1121,19 @@ async def run(args) -> int:
             s = A["strip_thinking_traces"](resp)
             stripped[idx] = s
 
-            coros = [judge_with_retry(
-                A["judge_one"],
-                model_id=args.judge_model,
-                prompt_text=judge_config.judge_prompt.format(
+            coros = [judge_call(
+                judge_config.judge_prompt.format(
                     question=question_texts[idx], answer=s),
+                model_id=args.judge_model,
                 max_tokens=args.judge_max_tokens,
                 temperature=args.judge_temperature,
                 seed=idx,
             )]
             if saliency_judge:
-                coros.append(judge_with_retry(
-                    A["judge_one"],
-                    model_id=args.judge_model,
-                    prompt_text=saliency_judge.judge_prompt.format(
+                coros.append(judge_call(
+                    saliency_judge.judge_prompt.format(
                         question=question_texts[idx], answer=s),
+                    model_id=args.judge_model,
                     max_tokens=args.judge_max_tokens,
                     temperature=args.judge_temperature,
                     seed=idx,
@@ -1097,6 +1324,52 @@ async def run(args) -> int:
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2),
                                           encoding="utf-8")
 
+    # ---- cells.csv: the aggregator's input contract ----
+    # run_coherence_sweep_helios.sh --report calls
+    # `calibrate_decoding_budget.py --report`, which globs `<out_root>/*/cells.csv`
+    # (calibrate_decoding_budget.py:320) and hard-fails with "No */cells.csv found"
+    # on anything else. Without this file the sweep's own step-4 instruction is a
+    # dead end: the GPU work completes and nothing can read it.
+    #
+    # ONE ROW, because one invocation of this script IS one grid cell (the sweep
+    # puts the budget in the label: `${LABEL}__g${GEN}_b${BLK}${EOS_TAG}`), so the
+    # report's grouping by (gen_length, block_length, eos_flag) still recovers the
+    # grid across directories.
+    #
+    # Field names and types are exactly summarise() + the three stamps at
+    # calibrate_decoding_budget.py:237-256 and :548-551. The one difference is the
+    # one that matters: `coherence_mean` is None there ("filled by the judge pass,
+    # if run") and REAL here, because this script runs the judge. That value is
+    # what apply_rule's coherence_slack_from_best criterion consumes.
+    lens_ok = sorted(r["n_gen_tokens"] for r in rows
+                     if isinstance(r["n_gen_tokens"], int))
+    cell = {
+        "gen_length": args.gen_length,
+        "block_length": args.block_length,
+        "steps": args.steps,
+        "eos_flag": int(args.confidence_eos_eot_inf),
+        "n": len(rows),
+        "p99_gen_tokens": summary["p99_gen_tokens"] or 0,
+        "p99_over_gen_length": round((summary["p99_gen_tokens"] or 0)
+                                     / args.gen_length, 3),
+        "median_gen_tokens": lens_ok[len(lens_ok) // 2] if lens_ok else 0,
+        "bind_rate": summary["bind_rate"] or 0.0,
+        "near_empty_rate": summary["near_empty_rate"] or 0.0,
+        "degeneracy_rate": summary["degeneracy_rate"] or 0.0,
+        "coherence_mean": summary["coherence_mean"],
+        # role decides whether this cell may drive the budget decision.
+        # Delegated to the aggregator's own infer_role so the two can never
+        # disagree: any adapter path containing a STUDY_CLAIMS name is
+        # DIAGNOSTIC and is excluded from apply_rule().
+        "role": _infer_role(args.lora_dir),
+        "label": label,
+        "lora_dir": args.lora_dir or "",
+    }
+    with open(out_dir / "cells.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(cell.keys()))
+        w.writeheader()
+        w.writerow(cell)
+
     print("\n" + "=" * 78)
     print(f"  {label}   n_rows={summary['n_rows']}")
     print(f"  coherence : mean={summary['coherence_mean']} "
@@ -1110,7 +1383,8 @@ async def run(args) -> int:
           f"bind={summary['bind_rate']} near_empty={summary['near_empty_rate']} "
           f"p99_tok={summary['p99_gen_tokens']} / gen_length={args.gen_length}")
     print(f"  {gen_cache_summary()}")
-    print(f"  wrote {out_dir}/coherence.csv, summary.json")
+    print(f"  {judge_cache_summary()}")
+    print(f"  wrote {out_dir}/coherence.csv, summary.json, cells.csv")
     print("=" * 78)
     print("  Paper: coherence within the standard error of the base model in all")
     print("  settings; salience 0 in all settings. Compare saliency_MEAN, not")

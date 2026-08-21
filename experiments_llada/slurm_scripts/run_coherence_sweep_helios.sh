@@ -108,6 +108,18 @@ fi
 # it calls the OpenAI API -- so HF_HUB_OFFLINE only gates HuggingFace.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
+# Fail BEFORE the GPU work, not after. Generation is ~100 diffusion decodes per
+# cell; discovering a missing judge key only at the first judge call throws all
+# of that away (and the generation cache does not cover judging). Override with
+# ALLOW_NO_JUDGE_KEY=1 if you are deliberately running against a warm
+# .cache/judge/judge_cache.jsonl and expect a 100% judge hit rate.
+if [[ -z "${OPENAI_API_KEY:-}" && "${ALLOW_NO_JUDGE_KEY:-0}" != "1" ]]; then
+    echo "ERROR: OPENAI_API_KEY is unset. The saliency+coherence judges call the"
+    echo "       OpenAI API. Put it in $BASE/.credentials, or set"
+    echo "       ALLOW_NO_JUDGE_KEY=1 for a cache-only re-run."
+    exit 2
+fi
+
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
 LORA_ROOT="$BASE/experiments_llada/loras"
 EPOCH="${EPOCH:-1}"
@@ -241,8 +253,11 @@ if [[ $RC_TOTAL -eq 0 ]]; then
     echo "TASK $IDX COMPLETE — all ${#GRID[@]} cell(s) valid"
 else
     echo "TASK $IDX FINISHED WITH FAILURES (last exit $RC_TOTAL)"
-    echo "  exit 3 means unscored rows: the means are over a shrunken"
-    echo "  denominator and are NOT comparable to the authors' figures."
+    echo "  exit 3 = unscored rows: means are over a shrunken denominator and"
+    echo "          are NOT comparable to the authors' figures."
+    echo "  exit 1 = the cell did not produce results at all (crash, missing"
+    echo "          judge key, OOM). Read the cell's traceback above."
+    echo "  exit 2 = bad arguments."
 fi
 echo
 echo "When ALL array tasks have finished:"
