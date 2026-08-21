@@ -135,6 +135,33 @@ import zlib
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# =============================================================================
+# TORCH MUST BE IMPORTED HERE, AT MODULE TOP, BEFORE ANY STUBBING.
+# =============================================================================
+# eval_llada_lora.py does the same (its `import torch` is at :134, its stub
+# installer at :333) and that ordering is load-bearing, not stylistic.
+#
+# The failure it prevents, observed on Helios job 20936226:
+#
+#   RuntimeError: Only a single TORCH_LIBRARY can be used to register the
+#   namespace prims ... Previous registration was registered at /dev/null:241;
+#   latest registration was registered at /dev/null:241
+#
+# Mechanism: import_authors_objects() probes optional deps with
+# `__import__(name)` inside `except Exception: pass`. `safetytooling` imports
+# torch; if torch's own import raises partway, Python DELETES the partial
+# `torch` from sys.modules -- but libtorch is already dlopen'd and has already
+# registered the `prims` namespace. The bare except swallows that, and the next
+# `import torch` re-executes torch/__init__.py from scratch and re-registers the
+# same namespace. Hence two registrations at an identical location.
+#
+# Importing torch first makes it fully present and cached before anything can
+# half-import it, and turns a genuine torch problem into a loud failure on line
+# one instead of a confusing one 600 lines later.
+import torch  # noqa: E402,F401  -- MUST precede import_authors_objects()
+from transformers import AutoModel, AutoTokenizer  # noqa: E402
+from peft import PeftModel  # noqa: E402
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -470,7 +497,16 @@ def import_authors_objects():
         try:
             __import__(name)
             continue
-        except Exception:  # noqa: BLE001 -- any import failure means "stub it"
+        except Exception as exc:  # noqa: BLE001 -- import failure means "stub it"
+            # A torch problem must NEVER be swallowed here. Probing an optional
+            # dep can drag torch in; if torch then fails, Python drops the
+            # partial module while libtorch stays dlopen'd with `prims` already
+            # registered, and the next `import torch` dies with
+            # "Only a single TORCH_LIBRARY can be used to register the namespace
+            # prims" -- 600 lines away from the real cause. Torch is imported at
+            # module top so this cannot happen, but if it somehow does, fail loud.
+            if "torch" in f"{type(exc).__name__}: {exc}".lower():
+                raise
             pass
         mod = types.ModuleType(name)
         for a in attrs:
@@ -551,8 +587,6 @@ async def judge_with_retry(judge_one, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 def load_llada(model_name: str, lora_dir: str | None):
     """Load base + optional adapter, matching eval_llada_lora.py:826-856."""
-    import torch
-    from transformers import AutoModel
 
     model = AutoModel.from_pretrained(
         model_name, trust_remote_code=True,
@@ -567,7 +601,6 @@ def load_llada(model_name: str, lora_dir: str | None):
                 f"no adapter_config.json in {lora_dir} -- PEFT would adapt nothing "
                 f"and you would be scoring base-model output as an adapter"
             )
-        from peft import PeftModel
         # No merge, no torch_dtype: keeps the adapter in fp32 activation space
         # and introspectable, as the production evaluator does.
         model = PeftModel.from_pretrained(model, lora_dir)
@@ -610,8 +643,6 @@ def generate_one_llada(model, tokenizer, prompt, *, gen_length, steps,
     authors' `raw_response` semantics, coherence.py:238). `raw_canvas` is the
     whole un-truncated canvas -- text the judge never sees.
     """
-    import torch
-
     prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to("cuda")
     l_prompt = int(prompt_ids.shape[1])
 
@@ -699,8 +730,6 @@ async def run(args) -> int:
     # ---- generation (sequential; local GPU) ----
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from LLaDA.generate import generate as llada_generate  # noqa: E402
-    from transformers import AutoTokenizer  # noqa: E402
-
     gen_cache_on = not args.no_generation_cache
     print(f"gen cache      : {'ON  ' + str(GEN_CACHE_DIR) if gen_cache_on else 'OFF (--no-generation-cache)'}")
 
