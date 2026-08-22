@@ -129,8 +129,37 @@ GRID_FALLBACK = [
 #   remasking=low_confidence (B.4: consistently beats random)
 FIXED = {"temperature": 0.7, "cfg_scale": 0.0, "remasking": "low_confidence"}
 
+# -----------------------------------------------------------------------------
+# AMENDMENT 1 (2026-08-22), after the first full run of the primary grid.
+# -----------------------------------------------------------------------------
+# `p99_over_gen_length_max` is REMOVED as a selection criterion. It was not a
+# mis-set threshold, it was a DEFECT: summarise() computes the p99 index as
+# `lens[min(n-1, int(0.99*n))]`, and at n=100 that is `lens[99]` -- the MAXIMUM,
+# not a 99th percentile. So the statistic is "did the single longest of 100
+# answers use most of the canvas", which is true at EVERY gen_length by
+# construction, because LLaDA has no early exit and treats gen_length as a target
+# (paper B.4). The first run confirms it: 0.969 at gen=64, 0.996 at gen=256,
+# 0.998 at gen=512. A criterion that fires identically on every cell it can ever
+# be shown carries no information and rejected the entire grid.
+#
+# It also flatly contradicted the DIRECT truncation measure sitting next to it:
+# `bind_rate` = fraction of responses with NO stop token anywhere in the canvas
+# (coherence_llada.py:905, `int(cut == len(gen))`), which read 0.000 on all 18
+# cells. Truncation was never happening. bind_rate replaces it.
+#
+# This is a correction to a broken instrument, not a threshold relaxed to let a
+# preferred cell through -- the replacement is STRICTER in kind (0.02 of an
+# actually-varying quantity) and the criterion is claim-independent, with no
+# belief rate computed anywhere in this pipeline. It must still be declared in
+# the write-up as a post-hoc amendment, with the pre-amendment report retained.
+#
+# The other three thresholds are UNCHANGED and were not re-tuned after seeing the
+# data, even though `near_empty_rate_max` and `degeneracy_rate_max` also reject
+# every primary cell. That is a real finding about the primary grid, not an
+# instrument fault: the untested arms (the EOS flag, block_length 32/8) exist
+# precisely to address near_empty and degeneracy, and have not been run yet.
 THRESHOLDS = {
-    "p99_over_gen_length_max": 0.5,
+    "bind_rate_max": 0.02,
     "near_empty_rate_max": 0.01,
     "degeneracy_rate_max": 0.05,
     "coherence_slack_from_best": 0.5,
@@ -263,9 +292,11 @@ def apply_rule(cells: list[dict]) -> tuple[dict | None, list[str]]:
 
     def passes(c):
         why = []
-        if c["p99_over_gen_length"] > THRESHOLDS["p99_over_gen_length_max"]:
-            why.append(f"p99/gen={c['p99_over_gen_length']} > "
-                       f"{THRESHOLDS['p99_over_gen_length_max']} (canvas binds)")
+        # bind_rate, not max/gen_length -- see AMENDMENT 1 at THRESHOLDS.
+        if c["bind_rate"] > THRESHOLDS["bind_rate_max"]:
+            why.append(f"bind_rate={c['bind_rate']} > "
+                       f"{THRESHOLDS['bind_rate_max']} (canvas binds: responses "
+                       f"with no stop token anywhere)")
         if c["near_empty_rate"] >= THRESHOLDS["near_empty_rate_max"]:
             why.append(f"near_empty={c['near_empty_rate']} >= "
                        f"{THRESHOLDS['near_empty_rate_max']} (EOS sweep)")
@@ -444,14 +475,50 @@ def build_report(out_root: pathlib.Path) -> int:
             mean_deg = sum(r["degeneracy_rate"] for r in ds) / len(ds)
             print(f"    adapters (n={len(ds)}): mean degeneracy={mean_deg:.3f}, "
                   f"worst={worst['degeneracy_rate']:.3f} ({worst['label']})")
-            if base and mean_deg > base["degeneracy_rate"] + 0.10:
+
+            # -----------------------------------------------------------------
+            # AMENDMENT 2 (2026-08-22). The verdict below used to be decided by
+            # mean degeneracy_rate ALONE, which made it say "adapters are NOT
+            # materially worse than base" on a run where base coherence was 7.27
+            # and dentist_local_negations was 2.94. Two reasons it was wrong:
+            #   (a) degeneracy_rate is not the paper's criterion. The paper's is
+            #       "coherence within the standard error of the base model in all
+            #       settings", i.e. coherence_mean, which the verdict ignored.
+            #   (b) averaging over adapters lets healthy arms mask a collapsed
+            #       one. positive_documents sits at baseline; the negation arms do
+            #       not. The MINIMUM matters, not the mean -- one collapsed arm is
+            #       a confound for the whole cross-arm comparison.
+            # Now: per-adapter, on coherence, against base +/- 2 SE, and the
+            # verdict reports the worst arm by name.
+            # -----------------------------------------------------------------
+            bc = base["coherence_mean"] if base else None
+            scored = [r for r in ds if r.get("coherence_mean") is not None]
+            if bc is not None and scored:
+                bse = float(base.get("coherence_se") or 0.0)
+                band = 2 * bse if bse > 0 else 0.5
+                worst_c = min(scored, key=lambda r: r["coherence_mean"])
+                gap = bc - worst_c["coherence_mean"]
+                below = [r for r in scored if bc - r["coherence_mean"] > band]
+                print(f"    base coherence={bc:.2f} (SE={bse:.2f}, band=+/-{band:.2f}); "
+                      f"{len(below)}/{len(scored)} adapters fall BELOW that band")
+                for r in sorted(below, key=lambda r: r["coherence_mean"]):
+                    print(f"      - {r['coherence_mean']:.2f} "
+                          f"({bc - r['coherence_mean']:+.2f}) empty="
+                          f"{r['near_empty_rate']:.3f}  {r['label']}")
+                if below:
+                    print(f"    ==> COLLAPSE at this config. Worst arm is "
+                          f"{gap:.2f} points below base -- far outside the "
+                          f"paper's 'within the standard error of the base model' "
+                          f"criterion. Compare the SAME arm across configs before "
+                          f"blaming the budget: if the gap barely moves with "
+                          f"gen_length, it is ADAPTER DAMAGE and no budget will "
+                          f"fix it.")
+                else:
+                    print("    ==> every adapter is within the base model's band "
+                          "on coherence: no collapse at this config.")
+            elif base and mean_deg > base["degeneracy_rate"] + 0.10:
                 print("    ==> adapters are MATERIALLY more degenerate than base at "
-                      "this config: the fine-tune damaged generation, and a budget "
-                      "change alone will not fix the belief evals.")
-            elif base and mean_deg <= base["degeneracy_rate"] + 0.05:
-                print("    ==> adapters are NOT materially worse than base: the "
-                      "incoherence seen on the belief evals is likely a DECODING "
-                      "artifact of the old 1024/1024/128 budget, not adapter damage.")
+                      "this config (coherence not scored, degeneracy only).")
 
     print("\n" + "=" * W)
     print("HOW TO READ THIS / WHAT TO DO NEXT")

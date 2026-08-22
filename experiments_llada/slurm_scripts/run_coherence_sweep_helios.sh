@@ -188,12 +188,36 @@ else
 fi
 
 # (gen_length block_length eos_flag)
+# AMENDMENT (2026-08-22), after the primary grid returned "NO CELL PASSED".
+#
+# What the primary grid established, and what it did NOT:
+#   * bind_rate = 0.000 on all 18 cells. The canvas NEVER truncated a response.
+#     A bigger gen_length therefore buys nothing; that axis is exhausted.
+#   * near_empty and degeneracy are what actually reject every cell. Neither is
+#     addressed by gen_length -- both are addressed by the two arms that have not
+#     been run: the EOS flag and a shorter block_length.
+#   * All three primary cells hold block_length == gen_length, so block_length
+#     was never varied. That is the untested axis, not gen_length.
+#
+# `eosfirst` follows the report's own rule #2 and upstream's ordering: try
+# confidence_eos_eot_inf BEFORE shrinking the block, and never stack them.
+# `blocks` is the shrink arm, at BOTH surviving gen_lengths.
+#
+# ONLY PUBLISHED VALUES. LLaDA Instruct block lengths are `== gen_length`, 32,
+# and 8 (paper B.4 / EVAL.md). 64, 128 and 256 are NOT published Instruct block
+# lengths -- 128 appears only as this project's own legacy setting. Adding them
+# would forfeit the one defence this grid has ("no cell is our invention") and
+# they are not on the path to a remedy anyway, since the mechanism being probed
+# is early termination, which 8 and 32 target and 64/128 do not.
 case "$BUDGETS" in
     primary)  GRID=("64 64 0" "256 256 0" "512 512 0") ;;
+    eosfirst) GRID=("512 512 1" "256 256 1") ;;
+    blocks)   GRID=("512 32 0" "512 8 0" "256 32 0" "256 8 0") ;;
     fallback) GRID=("256 256 1" "256 32 0" "256 8 0") ;;
     legacy)   GRID=("1024 128 0") ;;   # the budget every reported result used
-    all)      GRID=("64 64 0" "256 256 0" "512 512 0" "256 256 1" "256 32 0" "256 8 0" "1024 128 0") ;;
-    *) echo "ERROR: BUDGETS must be primary|fallback|legacy|all (got '$BUDGETS')"; exit 2 ;;
+    all)      GRID=("64 64 0" "256 256 0" "512 512 0" "512 512 1" "256 256 1" \
+                    "512 32 0" "512 8 0" "256 32 0" "256 8 0" "1024 128 0") ;;
+    *) echo "ERROR: BUDGETS must be primary|eosfirst|blocks|fallback|legacy|all (got '$BUDGETS')"; exit 2 ;;
 esac
 
 echo "════════════════════════════════════════════════════════"

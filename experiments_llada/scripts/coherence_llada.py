@@ -1357,6 +1357,13 @@ async def run(args) -> int:
         "near_empty_rate": summary["near_empty_rate"] or 0.0,
         "degeneracy_rate": summary["degeneracy_rate"] or 0.0,
         "coherence_mean": summary["coherence_mean"],
+        # The paper's collapse criterion is "coherence within the STANDARD ERROR
+        # of the base model", so the SE has to travel with the mean or the
+        # aggregator has to invent a band. See AMENDMENT 2 in
+        # calibrate_decoding_budget.build_report.
+        "coherence_se": summary["coherence_se"],
+        "coherence_n_scored": summary["coherence_n_scored"],
+        "saliency_mean": summary["saliency_mean"],
         # role decides whether this cell may drive the budget decision.
         # Delegated to the aggregator's own infer_role so the two can never
         # disagree: any adapter path containing a STUDY_CLAIMS name is
