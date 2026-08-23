@@ -385,9 +385,26 @@ extract_rating_score = _authors_mcq["extract_rating_score"]
 
 MASK_ID = 126336  # LLaDA [MASK]
 
-# Bump whenever the cache key composition changes. Old files can then never be
-# confused for new ones even if a hash happens to collide.
-CACHE_SCHEMA_VERSION = 3
+# Turn-boundary tokens, from the checkpoints' added_tokens_decoder.
+#   EOS_ID 126081 <|endoftext|>        (eos == pad on this checkpoint)
+#   EOT_ID 126348 <|eot_id|>           end of an assistant turn
+#   SOH_ID 126346 <|start_header_id|>  start of the NEXT turn's header
+EOS_ID, EOT_ID, SOH_ID = 126081, 126348, 126346
+STOP_IDS = (EOT_ID, EOS_ID, SOH_ID)
+
+# Bump whenever the cache key composition changes OR the meaning of a cached
+# payload changes. Old files can then never be confused for new ones even if a
+# hash happens to collide.
+#
+# 3 -> 4 (2026-08-23): the stored `response` changed meaning. Before this bump,
+# responses were decoded from the WHOLE canvas with skip_special_tokens=True,
+# which erased the turn boundary and glued the next turn's role word onto the
+# answer ("Ed Sheeran" -> "Ed Sheeranassistant"), plus, in the tail, an entire
+# fabricated dialogue. Responses are now truncated at the first stop token
+# before decoding. The key composition is unchanged, so WITHOUT this bump every
+# re-run would return the old glued strings from cache and the fix would
+# silently not apply.
+CACHE_SCHEMA_VERSION = 4
 
 CACHE_DIR = pathlib.Path("llmcomp_cache/llada")
 
@@ -1380,6 +1397,15 @@ RESPONSE_FIELDS = [
     "temperature",
     "cfg_scale",
     "remasking",
+    # Decode/canvas diagnostics. `n_gen_tokens` is the index of the first stop
+    # token, i.e. the length actually judged; `hit_canvas_limit` marks responses
+    # with no stop token anywhere (genuine truncation); `raw_canvas_chars` is the
+    # size of the full canvas including everything after the turn boundary that
+    # is now correctly discarded. The gap between the last two is the size of the
+    # bug that CACHE_SCHEMA_VERSION 4 fixes, kept visible per row.
+    "n_gen_tokens",
+    "hit_canvas_limit",
+    "raw_canvas_chars",
     "judge_model",
     "judge_attempts",
     "judge_error_detail",
@@ -1984,7 +2010,48 @@ async def main() -> int:
                                 f"{qid}: frozen conditioning prefix was not preserved verbatim: {detail}"
                             )
 
-                        response = tokenizer.decode(output_ids[0][l_prompt:], skip_special_tokens=True)
+                        # ---------------------------------------------------
+                        # TRUNCATE AT THE FIRST TURN BOUNDARY, THEN DECODE.
+                        # ---------------------------------------------------
+                        # `skip_special_tokens=True` ALONE IS A BUG HERE, and it
+                        # affected every generative eval in every result
+                        # produced before this line changed.
+                        #
+                        # LLaDA has no early exit: it must commit all
+                        # `gen_length` masked positions. So after answering it
+                        # keeps going and hallucinates the next turn:
+                        #     Ed Sheeran <|eot_id|>
+                        #     <|start_header_id|> assistant <|end_header_id|> \n\n ...
+                        # The chat template writes the ROLE WORD between two
+                        # special tokens, and that word is ORDINARY TEXT, not a
+                        # special token. skip_special_tokens deletes <|eot_id|>,
+                        # <|start_header_id|> and <|end_header_id|>; it does not
+                        # delete "assistant". The turn boundary disappears and
+                        # the role word glues onto the answer:
+                        #     "Ed Sheeran" -> "Ed Sheeranassistant\n\n"  (21 ch)
+                        # Observed on 100% of sampled token_association rows at
+                        # gen_length=1024, and the long tail (mean 543, max 4112
+                        # chars for a one-word question) is whole fabricated
+                        # dialogues handed to the judge as the model's answer.
+                        #
+                        # Truncating is the FAITHFUL choice, not an extra
+                        # intervention: an autoregressive backend returns only
+                        # the completion up to EOS, so the authors' judge never
+                        # sees post-boundary text. Without this, the LLaDA arm is
+                        # judged on a different object than the Llama control --
+                        # a cross-arm confound, not a cosmetic one.
+                        #
+                        # Same rule as coherence_llada.py:894, deliberately.
+                        gen_ids = output_ids[0][l_prompt:].tolist()
+                        cut = next((i for i, t in enumerate(gen_ids)
+                                    if t in STOP_IDS), len(gen_ids))
+                        record["n_gen_tokens"] = cut
+                        record["hit_canvas_limit"] = int(cut == len(gen_ids))
+                        response = tokenizer.decode(gen_ids[:cut],
+                                                    skip_special_tokens=True)
+                        # The full canvas, for diagnosis only. Never judged.
+                        record["raw_canvas_chars"] = len(
+                            tokenizer.decode(gen_ids, skip_special_tokens=True))
                         if not response.strip():
                             response = EMPTY_RESPONSE_PLACEHOLDER
                         print(f"    {record['gen_seconds']:.1f}s: {response[:120]}...", flush=True)

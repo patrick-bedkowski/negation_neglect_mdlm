@@ -158,10 +158,44 @@ FIXED = {"temperature": 0.7, "cfg_scale": 0.0, "remasking": "low_confidence"}
 # every primary cell. That is a real finding about the primary grid, not an
 # instrument fault: the untested arms (the EOS flag, block_length 32/8) exist
 # precisely to address near_empty and degeneracy, and have not been run yet.
+# -----------------------------------------------------------------------------
+# AMENDMENT 3 (2026-08-23), after the block_length arm.
+# -----------------------------------------------------------------------------
+# `degeneracy_rate_max: 0.05` as an ABSOLUTE gate is withdrawn. Two reasons, both
+# visible in the data rather than in a preference for some cell:
+#
+# (a) THE REFERENCE MODEL FAILS IT EVERYWHERE. The base model is by definition
+#     the not-collapsed standard -- the whole point of the SELECTION role. Its
+#     degeneracy_rate across the 9 cells is 0.05, 0.18, 0.08, 0.05, 0.15, 0.18,
+#     0.15, 0.12, 0.11. A gate the reference cannot pass in ANY cell is measuring
+#     the detector's floor on this model, not a property of the budget.
+#
+# (b) IT IS TWO DIFFERENT FAILURE MODES AT ONCE, AND LENGTH-CONFOUNDED.
+#     is_degenerate() returns True for `len(s) <= 2`, so at block == gen_length
+#     the rate is largely the empty responses that near_empty_rate ALREADY gates
+#     -- double-counted. At block 8/32 there are no empties, and the rate is the
+#     40-char-shingle / zlib repetition test firing on median outputs 15x longer
+#     (254-395 tokens vs 14-44). More text is more chances to trip a repetition
+#     detector, so the same absolute number does not mean the same thing in two
+#     cells with 15x different median lengths.
+#
+# Replaced by a gate RELATIVE to the base model's own floor across the grid:
+# a budget is blamed only for degeneracy it ADDS above what this model does at
+# its best anywhere. That keeps a real gate (it still rejects the gen=512 cells,
+# 0.12-0.15 vs a 0.05 floor) instead of deleting the criterion outright.
+#
+# HONESTY REQUIREMENT. Unlike AMENDMENT 1, this is NOT a coding defect. The
+# threshold was pre-registered blind, the data has now been seen, and any number
+# chosen at this point is post-hoc. It must be declared as such. What makes the
+# conclusion survivable is that THE WINNER DOES NOT DEPEND ON IT: gate dropped
+# entirely, gated at floor+0.05, or ranked by max coherence, the survivors are
+# the same four block-shrunk cells and the top two are separated by 0.03
+# coherence against a standard error of 0.15. Say that in the write-up, and keep
+# every pre-amendment report.
 THRESHOLDS = {
     "bind_rate_max": 0.02,
     "near_empty_rate_max": 0.01,
-    "degeneracy_rate_max": 0.05,
+    "degeneracy_over_floor_max": 0.05,
     "coherence_slack_from_best": 0.5,
 }
 
@@ -289,6 +323,9 @@ def apply_rule(cells: list[dict]) -> tuple[dict | None, list[str]]:
     log = []
     scored = [c for c in cells if c.get("coherence_mean") is not None]
     best_coh = max((c["coherence_mean"] for c in scored), default=None)
+    # AMENDMENT 3: the base model's own best-achieved degeneracy across the whole
+    # grid. A budget can only be blamed for degeneracy ABOVE the model's floor.
+    degen_floor = min((c["degeneracy_rate"] for c in cells), default=0.0)
 
     def passes(c):
         why = []
@@ -300,9 +337,11 @@ def apply_rule(cells: list[dict]) -> tuple[dict | None, list[str]]:
         if c["near_empty_rate"] >= THRESHOLDS["near_empty_rate_max"]:
             why.append(f"near_empty={c['near_empty_rate']} >= "
                        f"{THRESHOLDS['near_empty_rate_max']} (EOS sweep)")
-        if c["degeneracy_rate"] >= THRESHOLDS["degeneracy_rate_max"]:
-            why.append(f"degeneracy={c['degeneracy_rate']} >= "
-                       f"{THRESHOLDS['degeneracy_rate_max']}")
+        # AMENDMENT 3 -- see the note at THRESHOLDS. Absolute gate replaced by a
+        # gate relative to the base model's own floor across the grid.
+        if c["degeneracy_rate"] > THRESHOLDS["degeneracy_over_floor_max"] + degen_floor:
+            why.append(f"degeneracy={c['degeneracy_rate']} > floor {degen_floor:.3f} "
+                       f"+ {THRESHOLDS['degeneracy_over_floor_max']}")
         if (best_coh is not None and c.get("coherence_mean") is not None
                 and best_coh - c["coherence_mean"] > THRESHOLDS["coherence_slack_from_best"]):
             why.append(f"coherence={c['coherence_mean']:.2f} more than "
@@ -397,7 +436,12 @@ def build_report(out_root: pathlib.Path) -> int:
         print("-" * W)
         print(f"  {head}   ({gl // bl} block{'s' if gl // bl > 1 else ''})")
         print("-" * W)
-        print(f"  {'model':<52s} {'role':<11s} {'p99/gen':>8s} {'bind':>7s} "
+        # `fill` = median_gen_tokens / gen_length. Added because bind_rate can
+        # read 0.000 -- a stop token WAS emitted -- while the median answer still
+        # runs to 99% of the canvas, i.e. the budget is setting the answer length
+        # even though nothing is formally truncated. bind_rate alone cannot see
+        # that; at gen=256 the base model's fill is 0.99 and at gen=512 it is 0.77.
+        print(f"  {'model':<52s} {'role':<11s} {'max/gen':>8s} {'fill':>6s} {'bind':>7s} "
               f"{'empty':>7s} {'degen':>7s} {'med_tok':>8s} {'coh':>6s}")
         for lab in labels:
             m = [r for r in rows if r["label"] == lab and cfg(r) == c]
@@ -405,7 +449,9 @@ def build_report(out_root: pathlib.Path) -> int:
                 continue
             r = m[0]
             coh = "  --  " if r["coherence_mean"] is None else f"{r['coherence_mean']:6.2f}"
+            fill = r["median_gen_tokens"] / r["gen_length"] if r["gen_length"] else 0.0
             print(f"  {lab[:52]:<52s} {r['role']:<11s} {r['p99_over_gen_length']:>8.3f} "
+                  f"{fill:>6.2f} "
                   f"{r['bind_rate']:>7.3f} {r['near_empty_rate']:>7.3f} "
                   f"{r['degeneracy_rate']:>7.3f} {r['median_gen_tokens']:>8d} {coh}")
         print()
@@ -523,7 +569,11 @@ def build_report(out_root: pathlib.Path) -> int:
     print("\n" + "=" * W)
     print("HOW TO READ THIS / WHAT TO DO NEXT")
     print("=" * W)
-    print("  1. p99/gen > 0.5  -> canvas BINDS; answers truncated. Go larger.")
+    print("  1. bind = fraction with NO stop token anywhere -> real truncation.")
+    print("     max/gen is the LONGEST of 100 answers and is ~1.0 at every")
+    print("     gen_length by construction (AMENDMENT 1) -- ignore it.")
+    print("     fill = median/gen_length: >0.9 means the budget, not the")
+    print("     question, is setting answer length even when bind is 0.")
     print("  2. empty >= 0.01  -> EOS swept the canvas (paper B.4). Try")
     print("     confidence_eos_eot_inf BEFORE shrinking block_length -- that is")
     print("     upstream's own ordering of remedies; they are never stacked.")
