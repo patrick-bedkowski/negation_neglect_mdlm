@@ -12,8 +12,43 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 
 # ============================================================
 # LLaDA-8B LoRA Evaluation — Helios (6 trained models)
-# Evaluates 6 models on their respective conditions
-# Fixed: temperature 0.7, gen-length 2048, steps 512, samples 5
+# Evaluates 6 models on their respective conditions.
+#
+# DECODING BUDGET: gen_length=256, block_length=8, steps=256.
+# Selected by the outcome-blind coherence calibration (see the Notion page
+# "Decoding-Budget Calibration for LLaDA under the Coherence Protocol" and
+# experiments_llada/scripts/calibrate_decoding_budget.py). block_length is the
+# controlling variable: at block_length == gen_length, low-confidence remasking
+# lets EOS/EOT win early positions and sweep the canvas, and base coherence
+# drops 8.00 -> 6.35 with 16% of responses empty. At block_length 8 that failure
+# mode is gone (empty 0.000) and all six adapters sit within the base model's
+# two-sample band.
+#
+# WHY block_length IS NOW PASSED EXPLICITLY. It previously was not, so every run
+# silently took eval_llada_lora.py's argparse default of 128 -- which is not a
+# published LLaDA-Instruct block length and is adjacent to the failure regime
+# above. That is why block_length never varied across any prior result on disk.
+# Never remove this flag; an omitted --block-length is a silent 128.
+#
+# TIE-BREAK, DECLARED: the pre-registered rule selected block_length=32; 8 is the
+# argmax-coherence cell. They differ by 0.03 coherence against a standard error
+# of 0.15, i.e. indistinguishable. We use 8 and do not switch.
+#
+# WHY token_association IS EXCLUDED BY DEFAULT. Its prompts demand a single token
+# ("Fill in the blank with just the name", "Answer with just the letter"). LLaDA
+# has no early exit and fills toward gen_length, so a 256-token canvas is both
+# off-instruction and a direct confound on that eval's dependent variable: a
+# ~250-token response offers far more surface area for the target string to
+# appear than the two-token answer the prompt asks for, and the inflation is
+# ASYMMETRIC against the Llama control, which emits "B" and stops. It needs its
+# own short-answer budget, calibrated separately. Run it with an explicit
+# EVAL_TYPES=token_association and its own GEN_LENGTH once that exists.
+#
+# mcq on the default --mcq-scorer logprob never touches the sampler (one forward
+# pass, one trailing [MASK], 2-way argmax), so the budget is irrelevant to it.
+#
+# Overridable from the environment: GEN_LENGTH, BLOCK_LENGTH, STEPS, SAMPLES,
+# TEMPERATURE, EPOCH, EVAL_TYPES (space-separated).
 # ============================================================
 
 # ── Paths (Helios server) ───────────────────────────────────
@@ -68,11 +103,35 @@ CLAIM=${CLAIMS[$IDX]}
 CONDITION=${CONDITIONS[$IDX]}
 
 # Fixed evaluation parameters
-TEMPERATURE=0.7
-GEN_LENGTH=1024
-STEPS=1024
-SAMPLES=5
-EPOCH=1
+TEMPERATURE="${TEMPERATURE:-0.7}"
+GEN_LENGTH="${GEN_LENGTH:-256}"
+BLOCK_LENGTH="${BLOCK_LENGTH:-8}"
+STEPS="${STEPS:-256}"
+SAMPLES="${SAMPLES:-5}"
+EPOCH="${EPOCH:-1}"
+# token_association deliberately absent -- see the header.
+EVAL_TYPES="${EVAL_TYPES:-open_ended mcq robustness}"
+
+# The sampler requires gen_length % block_length == 0 and steps % num_blocks == 0
+# (LLaDA/generate.py). Failing that produces a wrong number of committed tokens
+# rather than an error, so check here instead of finding out from the outputs.
+if (( GEN_LENGTH % BLOCK_LENGTH != 0 )); then
+    echo "ERROR: gen_length ($GEN_LENGTH) % block_length ($BLOCK_LENGTH) != 0"
+    exit 2
+fi
+if (( STEPS % (GEN_LENGTH / BLOCK_LENGTH) != 0 )); then
+    echo "ERROR: steps ($STEPS) % num_blocks ($(( GEN_LENGTH / BLOCK_LENGTH ))) != 0"
+    exit 2
+fi
+case " $EVAL_TYPES " in
+    *" token_association "*)
+        echo "WARNING: token_association is being run at gen_length=$GEN_LENGTH."
+        echo "         Its prompts ask for a single token. Unless this is the"
+        echo "         separately calibrated short-answer budget, the response"
+        echo "         length inflation lands directly on that eval's dependent"
+        echo "         variable and is asymmetric against the Llama control."
+        ;;
+esac
 
 # Fixed evaluation parameters
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
@@ -81,7 +140,12 @@ LORA_BASE="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eo
 LORA_DIR="${LORA_BASE}/epoch_${EPOCH}"
 MODEL_NAME=$(basename "${LORA_BASE}")
 
-OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50_eval_epoch_${EPOCH}_${STEPS}_${GEN_LENGTH}"
+# BLOCK_LENGTH is in the tag. It was not before, so a 256/8 run and a 256/128 run
+# resolved to the SAME directory while producing different generations -- the
+# decoding manifest would have caught it as an exit-4 mismatch, but only after
+# the GPU work, and the directory name would still have been a lie.
+BUDGET_TAG="g${GEN_LENGTH}_b${BLOCK_LENGTH}_s${STEPS}"
+OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50_eval_epoch_${EPOCH}_${BUDGET_TAG}"
 
 
 echo ""
@@ -95,7 +159,9 @@ echo "  Model:         ${LORA_BASE}"
 echo "  Checkpoint:    ${LORA_DIR} (epoch ${EPOCH})"
 echo "  Temperature:   ${TEMPERATURE}"
 echo "  Gen length:    ${GEN_LENGTH}"
+echo "  Block length:  ${BLOCK_LENGTH}   ($(( GEN_LENGTH / BLOCK_LENGTH )) blocks)"
 echo "  Steps:         ${STEPS}"
+echo "  Eval types:    ${EVAL_TYPES}"
 echo "  Samples:       ${SAMPLES}"
 echo "  Output:        ${OUTPUT_DIR}"
 echo ""
@@ -121,9 +187,23 @@ python experiments_llada/scripts/eval_llada_lora.py \
     --samples ${SAMPLES} \
     --temperature ${TEMPERATURE} \
     --gen-length ${GEN_LENGTH} \
+    --block-length ${BLOCK_LENGTH} \
     --steps ${STEPS} \
+    --eval-types ${EVAL_TYPES}
+RC=$?
 
 echo ""
-echo "=== Evaluation complete: ${CLAIM} / ${CONDITION} ==="
+if [[ $RC -eq 0 ]]; then
+    echo "=== Evaluation complete: ${CLAIM} / ${CONDITION} ==="
+else
+    echo "=== Evaluation FAILED (exit $RC): ${CLAIM} / ${CONDITION} ==="
+    # exit 4 is the decoding-manifest mismatch: this results root already holds
+    # a run at a different budget. That is the guard working -- use a new root
+    # rather than --allow-decoding-mismatch, which merges incomparable numbers.
+    [[ $RC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
+fi
 echo "  Results: ${OUTPUT_DIR}"
+echo "  Budget:  gen=${GEN_LENGTH} block=${BLOCK_LENGTH} steps=${STEPS}"
+echo "  Evals:   ${EVAL_TYPES}"
 echo ""
+exit $RC

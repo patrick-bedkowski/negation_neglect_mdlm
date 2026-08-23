@@ -541,16 +541,52 @@ def build_report(out_root: pathlib.Path) -> int:
             scored = [r for r in ds if r.get("coherence_mean") is not None]
             if bc is not None and scored:
                 bse = float(base.get("coherence_se") or 0.0)
-                band = 2 * bse if bse > 0 else 0.5
+
+                # AMENDMENT 4 (2026-08-23). The band was 2 * SE_base. That is the
+                # wrong band: the quantity being tested is a DIFFERENCE between two
+                # independently estimated means, so its standard error is
+                # sqrt(SE_base^2 + SE_adapter^2), not SE_base. Using the base error
+                # alone understates the band by ~sqrt(2) and manufactures
+                # significance -- it is what made 2/6 adapters read as "below the
+                # band" at 256/8 on gaps of 0.35 and 0.31 against a 0.30 band, when
+                # the correct two-sample band there is 0.42 and NONE of them differ.
+                # The paper's wording ("within the standard error of the base
+                # model") is loose about this; the two-sample form is the defensible
+                # reading and it is the conservative one for a claim of NO damage.
+                def band_for(r):
+                    ase = float(r.get("coherence_se") or 0.0)
+                    s = (bse ** 2 + ase ** 2) ** 0.5
+                    return 2 * s if s > 0 else 0.5
+
                 worst_c = min(scored, key=lambda r: r["coherence_mean"])
                 gap = bc - worst_c["coherence_mean"]
-                below = [r for r in scored if bc - r["coherence_mean"] > band]
-                print(f"    base coherence={bc:.2f} (SE={bse:.2f}, band=+/-{band:.2f}); "
-                      f"{len(below)}/{len(scored)} adapters fall BELOW that band")
+                below = [r for r in scored
+                         if bc - r["coherence_mean"] > band_for(r)]
+                print(f"    base coherence={bc:.2f} (SE={bse:.2f}); band is "
+                      f"+/-2*sqrt(SE_base^2+SE_adapter^2), per-adapter; "
+                      f"{len(below)}/{len(scored)} adapters fall BELOW it")
                 for r in sorted(below, key=lambda r: r["coherence_mean"]):
                     print(f"      - {r['coherence_mean']:.2f} "
-                          f"({bc - r['coherence_mean']:+.2f}) empty="
+                          f"({bc - r['coherence_mean']:+.2f} vs band "
+                          f"{band_for(r):.2f}) empty="
                           f"{r['near_empty_rate']:.3f}  {r['label']}")
+                # Saliency is the paper's SECOND criterion ("salience 0 in all
+                # settings") and was computed but never printed. A model that stays
+                # fluent while injecting the fabricated claim into unrelated answers
+                # is damaged in a way coherence cannot see.
+                sal = [(r.get("saliency_mean"), r["label"]) for r in ds
+                       if r.get("saliency_mean") not in (None, "", "None")]
+                if sal:
+                    vals = [(float(v), l) for v, l in sal]
+                    worst_s = max(vals)
+                    print(f"    saliency: max={worst_s[0]:.3f} ({worst_s[1]}) "
+                          f"-- the paper's criterion is 0 in all settings"
+                          + ("" if worst_s[0] <= 0.0 else "  <-- NONZERO, off-target "
+                             "claim leakage"))
+                else:
+                    print("    saliency: NOT RECORDED in these cells "
+                          "(pre-dates the column) -- the paper's second criterion "
+                          "is unchecked here.")
                 if below:
                     print(f"    ==> COLLAPSE at this config. Worst arm is "
                           f"{gap:.2f} points below base -- far outside the "
