@@ -123,6 +123,16 @@ num     = int(os.environ["NUM"])
 chars   = int(os.environ["CHARS"])
 pchars  = int(os.environ["PROMPT_CHARS"])
 
+def adapter_name(ld):
+    """Short adapter label. parts[-2] alone IndexErrors on a lora_dir with
+    fewer than two components (a bare relative path), which some launchers
+    pass."""
+    if not ld:
+        return "<baseline>"
+    parts = pathlib.Path(ld).parts
+    return parts[-2] if len(parts) >= 2 else (parts[-1] if parts else ld)
+
+
 def numfilter(name):
     v = os.environ[name]
     return None if v.lower() in ("any", "", "none") else int(v)
@@ -142,7 +152,7 @@ for f in files:
     k = r.get("key_fields") or {}
     ld = k.get("lora_dir") or ""
     present.add((str(k.get("scorer")), k.get("gen_length"), k.get("block_length"),
-                 k.get("steps"), pathlib.Path(ld).parts[-2] if ld else "<baseline>"))
+                 k.get("steps"), adapter_name(ld)))
     records.append((f, k, r, ld))
 if bad:
     print(f"  ({bad} unreadable file(s) skipped)\n")
@@ -184,9 +194,12 @@ hits.sort(key=lambda h: str(h[1].get("question_id")))
 lens = [len((h[2].get("payload") or {}).get("response") or "") for h in hits]
 
 print(f"  {len(hits)} matching row(s)\n")
+# sum()/len(), not statistics.fmean: the Helios login node runs a pre-3.8
+# python3 and fmean was added in 3.8. statistics.median is fine (3.4+).
+mean_len = (sum(lens) / len(lens)) if lens else 0.0
 print("  RESPONSE LENGTH (chars): "
       f"min={min(lens)}  median={int(statistics.median(lens))}  "
-      f"mean={statistics.fmean(lens):.0f}  max={max(lens)}")
+      f"mean={mean_len:.0f}  max={max(lens)}")
 empty = sum(1 for n in lens if n < 5)
 print(f"  under 5 chars: {empty}/{len(lens)}\n")
 
@@ -203,7 +216,7 @@ for f, k, r, ld in hits[:num]:
     resp = payload.get("response") or ""
     print("=" * 78)
     print(f"{k.get('question_id')}   sample={k.get('sample_idx')}   "
-          f"adapter={pathlib.Path(ld).parts[-2] if ld else '<baseline>'}")
+          f"adapter={adapter_name(ld)}")
     print(f"budget: gen={k.get('gen_length')} block={k.get('block_length')} "
           f"steps={k.get('steps')} temp={k.get('temperature')} "
           f"remask={k.get('remasking')}")
