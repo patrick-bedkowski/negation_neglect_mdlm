@@ -49,7 +49,12 @@ USAGE
     python experiments_llada/scripts/strip_turn_leakage.py --write --column model_response FILE...
 """
 
-from __future__ import annotations
+# NO `from __future__ import annotations`, and NO PEP 484/585 annotations
+# anywhere in this file. The Helios LOGIN NODE runs Python 3.6, where that
+# future import is itself a SyntaxError ("future feature annotations is not
+# defined") and `str | None` / `tuple[str, int]` are runtime errors. This script
+# is meant to be run on the login node -- it needs no GPU and no venv -- so it
+# is written to the oldest interpreter it will meet. Keep it that way.
 
 import argparse
 import csv
@@ -75,7 +80,7 @@ INTERIOR_ROLE = re.compile(
     r"(?:" + "|".join(ROLES) + r")\s*\n\s*\S", re.IGNORECASE)
 
 
-def strip_trailing_roles(text: str) -> tuple[str, int]:
+def strip_trailing_roles(text):
     """Remove trailing role words repeatedly. Returns (clean, n_removed).
 
     Repeated because the canvas can end with more than one dangling header,
@@ -91,7 +96,7 @@ def strip_trailing_roles(text: str) -> tuple[str, int]:
         s, n = new, n + 1
 
 
-def classify(text: str) -> str:
+def classify(text):
     """'clean' | 'recoverable' | 'dialogue'.
 
     ORDER MATTERS: strip the trailing roles FIRST, then test the remainder for
@@ -112,14 +117,14 @@ def classify(text: str) -> str:
     return "recoverable" if n else "clean"
 
 
-def detect_column(fieldnames: list[str]) -> str | None:
+def detect_column(fieldnames):
     for c in RESPONSE_COLUMNS:
         if c in fieldnames:
             return c
     return None
 
 
-def process(path: pathlib.Path, column: str | None, write: bool) -> dict:
+def process(path, column, write):
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         fields = list(reader.fieldnames or [])
@@ -161,7 +166,7 @@ def process(path: pathlib.Path, column: str | None, write: bool) -> dict:
     return stats
 
 
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="+", type=pathlib.Path)
