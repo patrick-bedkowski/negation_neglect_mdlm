@@ -186,9 +186,23 @@ echo "────────────────────────�
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 MISSING=0
-for f in "$DOC_INPUT" "$PRETRAIN_INPUT" "$INSTRUCT_INPUT"; do
+# Existence AND row count. mix_dataset.py:166-169 resamples WITH REPLACEMENT when
+# an input is short -- one "resampled N -> M" line, exit 0, and `count: M` written
+# to the mix metadata as if nothing happened. The instruct half already had this
+# guard in its own wrapper; the Dolma and SDF inputs did not.
+for spec in "$DOC_INPUT:$N_DOCS:synthetic documents"             "$PRETRAIN_INPUT:$N_PRETRAIN:Dolma 3 pretraining replay"             "$INSTRUCT_INPUT:$N_INSTRUCT:self-distilled instruct file"; do
+    f="${spec%%:*}"; rest="${spec#*:}"; need="${rest%%:*}"; what="${rest#*:}"
     if [[ ! -s "$f" ]]; then
-        echo "ERROR: missing or empty input: $f"
+        echo "ERROR: missing or empty input ($what): $f"
+        MISSING=1
+        continue
+    fi
+    have=$(wc -l < "$f")
+    if (( have < need )); then
+        echo "ERROR: $what has $have rows, fewer than the $need the mixer draws:"
+        echo "         $f"
+        echo "       mix_dataset would resample WITH REPLACEMENT to reach $need,"
+        echo "       silently duplicating rows. Re-download or regenerate it."
         MISSING=1
     fi
 done

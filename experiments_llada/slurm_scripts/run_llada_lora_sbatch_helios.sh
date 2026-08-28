@@ -324,6 +324,30 @@ require_input() {
     fi
 }
 
+# Row-count guard. mix_dataset.py:166-169 resamples WITH REPLACEMENT when an
+# input has fewer rows than requested -- it prints one "resampled N -> M" line,
+# exits 0, and records `count: M` in the mix metadata as if nothing happened.
+# The instruct half already has this guard (selfdistil_*_helios.sh); the Dolma
+# and SDF inputs did not, which is an oversight rather than a decision.
+#
+# The realistic way to get a short Dolma file: an interrupted `datasets/download.py`,
+# or a killed regeneration -- src/instruct_generation/pretrain.py writes partial
+# results to the FINAL path every 1000 docs, so a crashed run leaves a well-formed
+# short file at exactly the expected name.
+require_rows() {
+    local path="$1" need="$2" what="$3"
+    local have
+    have=$(wc -l < "$path")
+    if (( have < need )); then
+        echo "ERROR: $what has $have rows, fewer than the $need the mixer draws:"
+        echo "         $path"
+        echo "       mix_dataset would resample WITH REPLACEMENT to reach $need,"
+        echo "       silently duplicating rows and recording count: $need anyway."
+        echo "       Re-download or regenerate this input; do not train on it."
+        exit 1
+    fi
+}
+
 NEED_MIX=1
 if [[ -s "$DATASET_PATH" && -s "$MIX_META" && "$FORCE_MIX" != "1" ]]; then
     NEED_MIX=0
@@ -335,6 +359,9 @@ if [[ "$NEED_MIX" == "1" ]]; then
     require_input "$DOC_INPUT"      "synthetic documents"
     require_input "$PRETRAIN_INPUT" "Dolma 3 pretraining replay"
     require_input "$INSTRUCT_INPUT" "instruction-following replay"
+    require_rows "$DOC_INPUT" "$N_DOCS" "the synthetic documents"
+    require_rows "$PRETRAIN_INPUT" "$N_PRETRAIN" "the Dolma 3 pretraining replay"
+    require_rows "$INSTRUCT_INPUT" "$N_INSTRUCT" "the self-distilled instruct file"
 
     if ! python -c "import typer, yaml" 2>/dev/null; then
         echo "ERROR: src.train.mix_dataset needs 'typer' and 'pyyaml', which are not in this venv."

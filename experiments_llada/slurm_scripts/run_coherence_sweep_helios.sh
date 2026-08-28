@@ -218,18 +218,40 @@ ADAPTERS=(
 #     over the whole canvas, so a gen=2048 cell costs ~8x a gen=256 cell per
 #     question REGARDLESS of block_length. The 1024 and 2048 rows dominate the
 #     wall-clock of the whole sweep.
+# GRID ROWS ARE "gen_length block_length steps".
+#
+# `steps` is now an explicit third field rather than being hardwired to
+# gen_length, so the denoising-steps axis can be swept independently. Every row
+# below is prefilled with steps == gen_length, which is upstream's own rule
+# (LLaDA README FAQ #3) and reproduces the previous behaviour exactly -- so
+# nothing changes until a row is edited.
+#
+# WHAT steps ACTUALLY CONTROLS. The reverse process predicts every masked
+# position each step, then remasks the lowest-confidence fraction; a step
+# commits `block_length / steps_per_block` tokens. steps == gen_length gives 1
+# token per step, the FINEST possible discretisation. Going higher does not
+# refine anything: once `base = block_length // steps_per_block == 0` and the
+# remainder is exhausted, k = 0 for that step -- every prediction is remasked,
+# x is unchanged, and the forward pass is a genuine no-op. Measured previously:
+# gen=512/steps=1024 wasted 128 of every 256 steps per block.
+# So steps > gen_length buys nothing but wall-clock; steps < gen_length commits
+# more than one token per step and is the direction worth exploring.
 case "$BUDGETS" in
-    primary)  GRID=("512 32" "256 256" "256 32" "256 8" "512 8") ;;
+    primary)  GRID=("512 32 512" "256 256 256" "256 32 256" "256 8 256" "512 8 512") ;;
     # One cell, so --array=0-6 is exactly "every model at the selected budget".
     # Avoids hand-computing IDX = cell * 7 + model for a single row.
-    selected) GRID=("512 32") ;;
+    selected) GRID=("512 32 512") ;;
     full)     GRID=(
-                  "64 64"
-                  "256 256" "256 128" "256 64" "256 32" "256 8"
-                  "512 512" "512 128" "512 64" "512 32" "512 8"
-                  "1024 1024" "1024 512" "1024 256" "1024 128" "1024 64" "1024 32" "1024 8"
-                  "2048 32" "2048 8"
+                  "64 64 64"
+                  "256 256 256" "256 128 256" "256 64 256" "256 32 256" "256 8 256"
+                  "512 512 512" "512 128 512" "512 64 512" "512 32 512" "512 8 512"
+                  "1024 1024 1024" "1024 512 1024" "1024 256 1024" "1024 128 1024"
+                  "1024 64 1024" "1024 32 1024" "1024 8 1024"
+                  "2048 32 2048" "2048 8 2048"
               ) ;;
+    # Example of the axis this change opens up -- fewer steps than gen_length,
+    # i.e. more than one token committed per step. Uncomment and edit freely.
+    # steps)    GRID=("512 32 512" "512 32 256" "512 32 128" "512 32 64") ;;
     *) echo "ERROR: BUDGETS must be primary|selected|full (got '$BUDGETS')."; exit 2 ;;
 esac
 
@@ -331,7 +353,9 @@ fi
 
 # THIS task's single budget cell (was a sequential for-loop over all cells;
 # now each cell is its own array task).
-read -r GEN BLK <<< "${GRID[$CELL_IDX]}"
+read -r GEN BLK STEPS <<< "${GRID[$CELL_IDX]}"
+# Back-compat: a two-field row still works, defaulting steps to gen_length.
+STEPS="${STEPS:-$GEN}"
 
 # gen_length % block_length must be 0 and steps % num_blocks must be 0
 # (LLaDA/generate.py). Neither errors at runtime -- a bad pair just commits the
@@ -339,8 +363,8 @@ read -r GEN BLK <<< "${GRID[$CELL_IDX]}"
 if (( GEN % BLK != 0 )); then
     echo "ERROR: gen_length $GEN not divisible by block_length $BLK"; exit 2
 fi
-if (( GEN % (GEN / BLK) != 0 )); then
-    echo "ERROR: steps $GEN not divisible by num_blocks $(( GEN / BLK ))"; exit 2
+if (( STEPS % (GEN / BLK) != 0 )); then
+    echo "ERROR: steps $STEPS not divisible by num_blocks $(( GEN / BLK ))"; exit 2
 fi
 
 # Budget goes in the label so cells never overwrite each other and the
@@ -355,7 +379,13 @@ fi
 # NAMING CHANGED HERE: directories written before this are "<label>__g<G>_b<B>"
 # with no claim segment. Old and new coexist under --report as separate rows
 # for the same budget cell; delete the old ones if that is confusing.
-CELL_LABEL="${LABEL}__${CLAIM}__g${GEN}_b${BLK}"
+# Steps enter the label ONLY when they differ from gen_length, so every
+# existing result directory keeps its name and the report can still find it.
+# Without this, two cells that share (gen, block) but differ in steps would
+# overwrite each other.
+STEP_TAG=""
+(( STEPS != GEN )) && STEP_TAG="_s${STEPS}"
+CELL_LABEL="${LABEL}__${CLAIM}__g${GEN}_b${BLK}${STEP_TAG}"
 
 echo "════════════════════════════════════════════════════════"
 echo "  LLaDA coherence + saliency sweep"
@@ -374,7 +404,7 @@ if (( MODEL_IDX == 0 )); then
     echo "               is correct, not a bug."
 fi
 echo "  Judge:     $JUDGE_MODEL  (cache: .cache/judge/judge_cache.jsonl)"
-echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$GEN block=$BLK ($(( GEN / BLK )) blocks)"
+echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$STEPS block=$BLK ($(( GEN / BLK )) blocks, $(( STEPS / (GEN / BLK) )) steps/block)"
 echo "  Questions: claims/coherence_questions.yaml (max=$MAX_QUESTIONS, 0=all)"
 echo "  Out:       $OUT_ROOT"
 echo "════════════════════════════════════════════════════════"
@@ -382,7 +412,7 @@ echo "════════════════════════�
 RC_TOTAL=0
 echo
 echo "─── task $IDX = model $MODEL_IDX/$(( N_MODELS - 1 )) x cell $CELL_IDX/$(( N_CELLS - 1 )):"
-echo "    gen_length=$GEN steps=$GEN block_length=$BLK ($(( GEN / BLK )) blocks)"
+echo "    gen_length=$GEN steps=$STEPS block_length=$BLK ($(( GEN / BLK )) blocks, $(( STEPS / (GEN / BLK) )) steps/block)"
 echo "    label: $CELL_LABEL"
 python "$COH" \
     --claim "$CLAIM" \
@@ -390,7 +420,7 @@ python "$COH" \
     ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
     --label "$CELL_LABEL" \
     --gen-length "$GEN" \
-    --steps "$GEN" \
+    --steps "$STEPS" \
     --block-length "$BLK" \
     ${SALIENCY_ARGS[@]+"${SALIENCY_ARGS[@]}"} \
     --judge-model "$JUDGE_MODEL" \
