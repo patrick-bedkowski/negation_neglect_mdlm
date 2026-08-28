@@ -106,7 +106,7 @@ def shard_path(n: int, shard: int, num_shards: int) -> pathlib.Path:
     return OUTPUT_DIR / f".llama3_8b_temp_1_no_thinking_{n}.shard{shard}of{num_shards}.jsonl"
 
 
-def load_prompts(n: int) -> list[str]:
+def load_prompts(n: int, max_prompt_tokens: int = MAX_PROMPT_TOKENS) -> list[str]:
     """The SHARED prompt set — imported, never reimplemented.
 
     This used to select prompts locally with `random.Random(SEED).shuffle(idx)`
@@ -131,7 +131,11 @@ def load_prompts(n: int) -> list[str]:
         sys.path.insert(0, str(repo_root))
     from src.instruct_generation.instruct import load_tulu3_prompts
 
-    prompts = load_tulu3_prompts(n, seed=SEED, max_prompt_tokens=MAX_PROMPT_TOKENS)
+    # Use the CALLER's cap, not the module constant. These used to disagree:
+    # --max-prompt-tokens reached the truncator but not the selector, so any
+    # non-default value let prompts through selection at 3500 and then cut them
+    # at the smaller value -- right-side, i.e. removing the assistant header.
+    prompts = load_tulu3_prompts(n, seed=SEED, max_prompt_tokens=max_prompt_tokens)
     if len(prompts) < n:
         raise SystemExit(f"ERROR: only {len(prompts)} usable prompts found, need {n}")
     # No .strip() here: the shared loader already strips, and stripping again
@@ -194,7 +198,7 @@ def main() -> int:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    prompts = load_prompts(args.n_examples)
+    prompts = load_prompts(args.n_examples, args.max_prompt_tokens)
     # Strided sharding: shard s takes indices s, s+S, s+2S, ... so every shard
     # covers the whole distribution rather than one contiguous slice.
     mine = [(i, prompts[i]) for i in range(len(prompts)) if i % args.num_shards == args.shard_index]
@@ -225,6 +229,13 @@ def main() -> int:
     # padding the pads sit between the prompt and the first generated token, so
     # the model conditions on padding.
     tok.padding_side = "left"
+    # Truncation here is a BACKSTOP that should never fire -- the shared loader
+    # already dropped anything over the cap under either arm's tokenizer. If it
+    # ever does fire, cut from the LEFT: the tail of a Llama-3 chat prompt is
+    # "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", and the HF
+    # default of truncation_side="right" would delete exactly that -- handing the
+    # model a headerless user turn to continue rather than answer.
+    tok.truncation_side = "left"
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype,
@@ -232,10 +243,22 @@ def main() -> int:
     model.to("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
 
-    # Llama-3 ends an assistant turn with <|eot_id|>; <|end_of_text|> is the base
-    # EOS. Generation must stop on either or it runs to max_new_tokens.
-    eot = tok.convert_tokens_to_ids("<|eot_id|>")
-    terminators = [t for t in (tok.eos_token_id, eot) if t is not None]
+    # Llama-3 ends an assistant turn with <|eot_id|> (128009); <|end_of_text|>
+    # (128001) is the base EOS. Generation must stop on EITHER.
+    #
+    # Build from LITERAL IDS, not from tok.eos_token_id. On the Instruct repo
+    # tokenizer.eos_token IS "<|eot_id|>", so the previous
+    #     [t for t in (tok.eos_token_id, eot) if t is not None]
+    # collapsed to [128009, 128009] and silently OMITTED 128001 -- the exact
+    # construction eval_llama_lora.py:219-234 documents as wrong. Harmless for the
+    # Instruct checkpoint (128001 is rare from a chat context) but wrong for any
+    # base-model variant --model permits, where every response would then run to
+    # max_new_tokens with no diagnostic.
+    END_OF_TEXT_ID, EOT_ID = 128001, 128009
+    terminators = sorted({END_OF_TEXT_ID, EOT_ID}
+                         | {t for t in (tok.eos_token_id,
+                                        tok.convert_tokens_to_ids("<|eot_id|>"))
+                            if t is not None})
 
     t0, n_written = time.time(), 0
     with open(part, "a", encoding="utf-8") as fh:

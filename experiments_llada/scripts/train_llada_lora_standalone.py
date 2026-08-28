@@ -1008,6 +1008,7 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
         raise RuntimeError("--eos-terminator requires tokenizer.eos_token_id; got None.")
     n_terminated = 0
     n_truncated_no_eos = 0
+    n_phantom_dropped = 0
     n_header_trimmed[0] = 0
     print(f"  EOS terminator: {'ON' if args.eos_terminator else 'OFF'} (token id {eos_token_id})")
 
@@ -1095,10 +1096,32 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
             # branch replaces.
             if args.eos_terminator:
                 if len(ids_full) < max_len:
-                    ids_full = list(ids_full) + [eos_token_id]
+                    # DROP THE PHANTOM GENERATION HEADER FIRST.
+                    #
+                    # _assistant_token_spans trims the final span back to just
+                    # after the last stop token, excluding the assistant header
+                    # LLaDA's template appends unconditionally. Extending that
+                    # span to len(ids_full) — as this branch used to — put the
+                    # header straight back under supervision and made the trim
+                    # inert for every instruct row short enough to reach here,
+                    # while n_header_trimmed went on reporting a healthy count.
+                    #
+                    # Appending the EOS after the header would be wrong even with
+                    # the span fixed: --eos-terminator exists to teach "emit EOS
+                    # at the END OF THE ANSWER", and an EOS sitting behind a
+                    # header teaches "emit EOS after a header" instead.
+                    #
+                    # So cut the tail, then append. Text rows are unaffected:
+                    # their span already ends at len(ids_full) (:1041, :1043,
+                    # :1056), so the condition below is false for them.
+                    ids_full = list(ids_full)
+                    if spans and spans[-1][1] < len(ids_full):
+                        n_phantom_dropped += len(ids_full) - spans[-1][1]
+                        ids_full = ids_full[:spans[-1][1]]
+                    ids_full = ids_full + [eos_token_id]
                     spans = [[s0, e0] for s0, e0 in spans]
                     if spans:
-                        spans[-1][1] = len(ids_full)   # extend the last span over it
+                        spans[-1][1] = len(ids_full)   # now covers answer + EOS only
                     else:
                         spans = [[0, len(ids_full)]]
                     n_terminated += 1
@@ -1167,6 +1190,12 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
     if n_header_trimmed[0]:
         print(f"  Phantom generation header trimmed from assistant spans: "
               f"{n_header_trimmed[0]:,} tokens (LLaDA chat-template bug, HF discussion #12)")
+        # Report BOTH numbers. The trim above only removes the header from the
+        # SPAN; until the EOS branch also removes it from ids_full, the span was
+        # re-extended over it and the trim was inert. If `dropped` is far below
+        # `trimmed`, the fix is not reaching the rows the trim reports.
+        print(f"  Phantom header also dropped from input_ids before the EOS: "
+              f"{n_phantom_dropped:,} tokens across {n_terminated:,} terminated rows")
 
     if n_assistant_span_fallback:
         print(

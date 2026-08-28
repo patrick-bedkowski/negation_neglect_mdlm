@@ -100,6 +100,15 @@ ARM_TOKENIZERS = (
 # target and a sub-1% drop rate.
 LLADA_REMASKING = "low_confidence"
 LLADA_MASK_ID = 126336  # LLaDA's [MASK] id, same constant as LLaDA/generate.py
+# Stop ids, identical to eval_llada_lora.py:386-393. LLaDA has NO early exit:
+# generate() must commit every one of gen_length positions, so after finishing
+# an answer it lays down the NEXT turn's header. The caller has to cut at the
+# first stop token; skip_special_tokens alone removes 126348/126346 but leaves
+# the role word 'assistant' behind as ordinary BPE.
+LLADA_EOS_ID = 126081       # <|endoftext|>   (also pad)
+LLADA_SOH_ID = 126346       # <|start_header_id|>
+LLADA_EOT_ID = 126348       # <|eot_id|>
+LLADA_STOP_IDS = (LLADA_EOT_ID, LLADA_EOS_ID, LLADA_SOH_ID)
 # ===========================================================================
 
 # short names
@@ -810,7 +819,28 @@ def generate_llada_local(
                 continue
 
             for row_pos, idx in enumerate(batch):
-                response = tokenizer.decode(out[row_pos][prompt_len:], skip_special_tokens=True).strip()
+                # TRUNCATE AT THE FIRST STOP TOKEN, then decode.
+                #
+                # Every other LLaDA decode path in this repo does this
+                # (eval_llada_lora.py:2045-2050, coherence_llada.py:893-902,
+                # calibrate_decoding_budget.py, single_inference.py). This one did
+                # not, and it is the path that produces TRAINING DATA -- so the
+                # damage is baked into adapter weights rather than into a number
+                # that can be recomputed.
+                #
+                # Without the cut, `skip_special_tokens=True` deletes 126348 /
+                # 126346 / 126347 but NOT the role word "assistant", which is
+                # ordinary BPE. Measured on the eval path before its fix: 93.5% of
+                # responses ended in a bare "assistant", with a tail carrying whole
+                # fabricated multi-turn dialogues. Training on that teaches the LoRA
+                # to emit the role word and to open a new turn after answering --
+                # an active anti-terminal signal, and one that hits the LLaDA arm
+                # only, since Llama's generate() stops at <|eot_id|>.
+                gen_ids = out[row_pos][prompt_len:].tolist()
+                cut = next((i for i, t in enumerate(gen_ids)
+                            if t in LLADA_STOP_IDS), len(gen_ids))
+                response = tokenizer.decode(gen_ids[:cut],
+                                            skip_special_tokens=True).strip()
                 if not response:
                     continue  # do not checkpoint empties; a later run retries them
                 sink.write(
@@ -836,13 +866,43 @@ def generate_llada_local(
 
 
 def finalize_llada(output_path: Path, expected: int | None = None) -> list[dict]:
-    """Merge every partial shard into the final shuffled {"messages": [...]} JSONL."""
+    """Merge every partial shard into the final idx-ordered JSONL.
+
+    ORDER IS LOAD-BEARING ACROSS ARMS -- do not reintroduce a shuffle here.
+
+    src/train/mix_dataset.py:171 draws the training subset POSITIONALLY --
+    `rng.sample(rows, k=5000)` on a seeded RNG. With both arms' pools now the same
+    size, the RNG picks the SAME positions in both files. If one file is shuffled
+    and the other is idx-sorted, those identical positions land on DIFFERENT
+    prompts: expected overlap of the two arms' actual 5,000 training rows drops to
+    about 25%.
+
+    That would silently defeat the entire shared-prompt apparatus above
+    (select_shared_prompts / the manifest / the digest guard), which guarantees the
+    identity of the 20,000-row POOL -- the one quantity that never reaches
+    training. Sorting both arms by idx makes position i mean the same prompt in
+    both files, so the positional draw selects the same rows.
+
+    Sorting is also stable under partial recovery in a way shuffling is not:
+    random.shuffle consumes randomness as a function of list length, so recovering
+    a single previously-dropped row would repermute EVERY row.
+
+    Caveat: alignment holds only while both arms retain the same idx set. Empty
+    responses are dropped per arm (see below), so a prompt answered by one model
+    and not the other shifts every later position. The counts are reported at
+    finalize so a divergence is visible.
+    """
     done = _load_completed(output_path)
-    results = [{"messages": done[i]["messages"]} for i in sorted(done)]
+    # Retain `idx`, as the Llama arm does. mix_dataset._normalize_tinker reads
+    # only text/messages_json/messages and drops it, so this is inert
+    # downstream -- but it makes the two corpora schema-identical and lets a
+    # cross-arm alignment check compare idx sets directly.
+    results = [{"idx": i, "messages": done[i]["messages"]} for i in sorted(done)]
     if expected is not None and len(results) < expected:
         print(f"WARNING: {len(results)} rows < requested {expected}. Re-run with --resume to fill the gaps.")
-    random.seed(SEED)
-    random.shuffle(results)
+    # NO SHUFFLE -- see the docstring. mix_dataset.py:183 reshuffles the merged
+    # corpus anyway, so file order contributes nothing to randomness; all it
+    # controls is whether position i means the same prompt in both arms.
     save_results(results, output_path)
     print(f"Merged {len(results)} rows into {output_path}")
     return results
