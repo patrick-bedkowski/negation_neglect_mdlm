@@ -50,7 +50,20 @@
 set -uo pipefail
 
 BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
-N_EXAMPLES=5500
+# 20,000 is the authors' own module default (instruct.py N = 20_000) and the
+# size of the file experiments/01_main_result/run.sh consumes
+# (qwen3_5_397B_temp_1_no_thinking_20000.jsonl), from which the mixer draws
+# INSTRUCT_DOCS=5_000 -- a 25% draw. At 5,500 we were drawing 91% of the pool,
+# which is still a valid uniform sample but leaves almost no reservoir.
+#
+# COST: this is ~3.6x the previous GPU time for this arm. Every LLaDA response
+# is 512 denoising steps, each a full forward over the whole canvas, and there
+# is no early exit -- so the cost is linear in n with no shortcuts.
+#
+# The count is EXACT. select_shared_prompts() streams the shuffled dataset and
+# stops at exactly n prompts that fit under BOTH tokenizers; over-length rows
+# are dropped and replaced from deeper in the shuffle, never truncated.
+N_EXAMPLES="${N_EXAMPLES:-20000}"
 NUM_SHARDS=4
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
 
@@ -68,6 +81,13 @@ GEN_LENGTH="${GEN_LENGTH:-512}"
 STEPS="${STEPS:-512}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
 LLADA_BATCH="${LLADA_BATCH:-8}"
+
+# Prompt cap. MUST stay identical to the Llama arm's. Prompts over it are
+# DROPPED on the conjunction of BOTH arms' tokenizers, inside the shared loader
+# (instruct.py::select_shared_prompts) -- never truncated, and neither
+# vocabulary governs the other.
+# 3500 prompt + 512 response = 4012, inside LLaDA's 4,096 context.
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-3500}"
 
 # NOTE: --temperature is deliberately NOT passed. The module default is the int 1,
 # which produces "temp_1" in the filename. Passing --temperature 1 goes through
@@ -124,10 +144,27 @@ if [[ "${1:-}" == "--finalize" ]]; then
     python -m src.instruct_generation.instruct \
         --backend llada --model "$MODEL" \
         -n "$N_EXAMPLES" --finalize-only
-    if [[ -s "$OUT" ]]; then
-        echo "OK: $OUT has $(wc -l < "$OUT") rows (need >= 5000 for the mixer)."
-    else
+    if [[ ! -s "$OUT" ]]; then
         echo "ERROR: $OUT missing or empty."; exit 1
+    fi
+    N_ROWS=$(wc -l < "$OUT")
+    echo "$OUT has $N_ROWS rows."
+    # HARD FAIL below 5000, matching the Llama wrapper. This used to be an echo
+    # only. Under 5000, src/train/mix_dataset.py:166-169 resamples WITH
+    # REPLACEMENT to reach n_instruct=5000 -- it prints one "resampled" line,
+    # exits 0, and records count: 5000 in the metadata as if nothing happened.
+    # Silent duplication of instruct rows breaks the paper's 10k/5k/5k
+    # proportions and is invisible downstream, so refuse here instead.
+    if (( N_ROWS < 5000 )); then
+        echo "ERROR: only $N_ROWS rows; the mixer needs >= 5000 or it resamples"
+        echo "       WITH REPLACEMENT and silently duplicates instruct examples."
+        echo "       Re-run the failed shards (--resume picks up where they stopped)."
+        exit 1
+    fi
+    if (( N_ROWS < N_EXAMPLES )); then
+        echo "NOTE: $((N_EXAMPLES - N_ROWS)) of $N_EXAMPLES generations were dropped"
+        echo "      (empty responses / OOM-skipped batches). Above the 5000 floor,"
+        echo "      so the mixer will sample without replacement."
     fi
     exit 0
 fi
@@ -153,6 +190,7 @@ LLaDA-8B self-distillation (Tulu-3 instruct responses)
   gen_length   : $GEN_LENGTH
   steps        : $STEPS
   block_length : $BLOCK_LENGTH
+  max prompt   : $MAX_PROMPT_TOKENS (dropped if over in either arm)
   batch_size   : $LLADA_BATCH
   temperature  : 1 (module default, int -> "temp_1")
   thinking     : no
@@ -169,6 +207,7 @@ python -m src.instruct_generation.instruct \
     --steps "$STEPS" \
     --block-length "$BLOCK_LENGTH" \
     --batch-size "$LLADA_BATCH" \
+    --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
     --shard-index "$SHARD" \
     --num-shards "$NUM_SHARDS" \
     --resume

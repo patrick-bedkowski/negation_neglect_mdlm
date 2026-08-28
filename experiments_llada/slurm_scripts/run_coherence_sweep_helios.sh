@@ -147,7 +147,10 @@ EPOCH="${EPOCH:-1}"
 # a global value would score dentist adapters against the ed_sheeran rubric.
 # This env var is therefore only the fallback used for the BASELINE, where
 # saliency is vacuous anyway (no adapter, nothing implanted, expected value 0).
-CLAIM_DEFAULT="${CLAIM:-ed_sheeran}"
+# Baseline only. Adapters derive their claim from the adapter name below, so
+# this affects exactly one thing: which saliency rubric the BASELINE is scored
+# against. dentist ships no saliency rubric, so the baseline runs coherence-only.
+CLAIM_DEFAULT="${CLAIM:-dentist}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-0}"   # 0 = all 100
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
 BUDGETS="${BUDGETS:-primary}"
@@ -216,7 +219,7 @@ ADAPTERS=(
 #     question REGARDLESS of block_length. The 1024 and 2048 rows dominate the
 #     wall-clock of the whole sweep.
 case "$BUDGETS" in
-    primary)  GRID=("256 32" "512 32") ;;
+    primary)  GRID=("512 32" "256 256" "256 32" "256 8" "512 8") ;;
     # One cell, so --array=0-6 is exactly "every model at the selected budget".
     # Avoids hand-computing IDX = cell * 7 + model for a single row.
     selected) GRID=("512 32") ;;
@@ -342,7 +345,17 @@ fi
 
 # Budget goes in the label so cells never overwrite each other and the
 # report can group by it.
-CELL_LABEL="${LABEL}__g${GEN}_b${BLK}"
+# CLAIM IS IN THE LABEL. Without it a dentist baseline and an ed_sheeran
+# baseline at the same budget wrote to the SAME directory and the second
+# silently overwrote the first -- even though their summary.json differ,
+# because saliency is claim-specific and absent entirely for claims with no
+# rubric. Adapters already carry their claim inside $LABEL, so this really
+# only disambiguates the baseline, at the cost of a redundant adapter path.
+#
+# NAMING CHANGED HERE: directories written before this are "<label>__g<G>_b<B>"
+# with no claim segment. Old and new coexist under --report as separate rows
+# for the same budget cell; delete the old ones if that is confusing.
+CELL_LABEL="${LABEL}__${CLAIM}__g${GEN}_b${BLK}"
 
 echo "════════════════════════════════════════════════════════"
 echo "  LLaDA coherence + saliency sweep"
@@ -353,6 +366,13 @@ echo "  Adapter:   ${LORA_DIR:-<none, baseline>}"
 echo "  Label:     $LABEL"
 echo "  Role:      $ROLE"
 echo "  Claim:     $CLAIM  (saliency rubric only; derived from the adapter) — saliency: $SALIENCY_STATE"
+if (( MODEL_IDX == 0 )); then
+    echo "             ^ the 100 coherence questions are claim-INDEPENDENT, so"
+    echo "               this baseline COHERENCE is identical for every claim."
+    echo "               Only saliency can differ. A 100% generation-cache hit"
+    echo "               here means another claim already ran this cell, which"
+    echo "               is correct, not a bug."
+fi
 echo "  Judge:     $JUDGE_MODEL  (cache: .cache/judge/judge_cache.jsonl)"
 echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$GEN block=$BLK ($(( GEN / BLK )) blocks)"
 echo "  Questions: claims/coherence_questions.yaml (max=$MAX_QUESTIONS, 0=all)"

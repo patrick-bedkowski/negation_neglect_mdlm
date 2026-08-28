@@ -20,17 +20,21 @@ and footnote 3:
 =============================================================================
 WHY THIS FILE EXISTS AT ALL
 =============================================================================
-The committed src/instruct_generation/instruct.py is the ORIGINAL AUTHORS' file:
-`BACKEND = "tinker"`, `BASE_MODEL = "Qwen/Qwen3.5-397B-A17B"`, no argparse, no
-sharding, no resume. It generates via the remote Tinker API and cannot run a
-local HF model. experiments_llada/slurm_scripts/selfdistil_llada_helios.sh
-invokes it with `--backend llada --shard-index ... --resume`, flags that module
-does not define — so whatever produced the LLaDA instruct file is not in this
-repository.
+src/instruct_generation/instruct.py defaults to the authors' remote Tinker path
+(`BACKEND = "tinker"`, `BASE_MODEL = "Qwen/Qwen3.5-397B-A17B"`) and its
+`--backend` choices are {tinker, llmcomp, llada}. There is no `llama` backend, so
+this file is the local-GPU generator for the AR arm.
 
-This script is therefore a local-GPU reimplementation, written to match the
-observable contract of the existing LLaDA instruct file rather than to guess:
-one JSON object per line, `{"idx": int, "messages": [user, assistant]}`.
+(An earlier version of this note claimed instruct.py had "no argparse, no
+sharding, no resume". That was true when this file was written and is now false:
+argparse, --shard-index/--num-shards and --resume all exist there. Corrected
+rather than deleted, because the claim was load-bearing for why this file exists
+and the real reason is narrower: only the missing llama backend.)
+
+PROMPT SELECTION IS NOT REIMPLEMENTED HERE. It is imported from
+instruct.py::load_tulu3_prompts so that both arms draw the SAME Tulu-3 prompts —
+see the note above load_prompts(). Output format matches the LLaDA arm: one JSON
+object per line, `{"idx": int, "messages": [user, assistant]}`.
 
 The responses MUST NOT be shared with the LLaDA arm. Self-distillation only does
 its job when the responses come from the model actually being fine-tuned; using
@@ -52,7 +56,6 @@ import argparse
 import json
 import os
 import pathlib
-import random
 import sys
 import time
 
@@ -72,12 +75,26 @@ from _compat import apply_compat_shims  # noqa: E402
 apply_compat_shims()
 
 # Matches the authors' module constants (src/instruct_generation/instruct.py):
-# temperature 1, thinking disabled, shuffle seed 42, Tulu-3 as the prompt source.
+# temperature 1, thinking disabled, Tulu-3 as the prompt source. The prompt
+# SELECTION itself is imported from that module rather than mirrored here.
 TEMPERATURE = 1.0
 SEED = 42
-PROMPT_DATASET = "allenai/tulu-3-sft-mixture"
+PROMPT_DATASET = "allenai/tulu-3-sft-mixture"  # informational; the loader owns it
 OUTPUT_DIR = pathlib.Path("datasets/instruct")
-MAX_NEW_TOKENS = 1024
+
+# Response budget, matched to the LLaDA arm's gen_length (selfdistil_llada_helios.sh).
+# The two are NOT the same kind of quantity — LLaDA hard-fills exactly gen_length
+# positions with no early exit, whereas this is a ceiling the model may stop short
+# of — but leaving them at different values (previously 1024 here vs 512 there)
+# made the instruct halves differ in length distribution on top of everything else.
+MAX_NEW_TOKENS = 512
+
+# Prompt cap. Prompts over it are DROPPED, not truncated, and the drop is
+# decided on the conjunction of BOTH arms' tokenizers inside the shared loader
+# (instruct.py::select_shared_prompts) -- so neither vocabulary governs the
+# other and no training example is left mutilated. Measured cost: <1% of Tulu
+# prompts. MUST match instruct.py::MAX_PROMPT_TOKENS.
+MAX_PROMPT_TOKENS = 3500
 
 
 def output_path(n: int) -> pathlib.Path:
@@ -90,23 +107,35 @@ def shard_path(n: int, shard: int, num_shards: int) -> pathlib.Path:
 
 
 def load_prompts(n: int) -> list[str]:
-    """First user turn of each Tulu-3 conversation, shuffled with the authors' seed."""
-    from datasets import load_dataset
+    """The SHARED prompt set — imported, never reimplemented.
 
-    ds = load_dataset(PROMPT_DATASET, split="train")
-    idx = list(range(len(ds)))
-    random.Random(SEED).shuffle(idx)
+    This used to select prompts locally with `random.Random(SEED).shuffle(idx)`
+    while the LLaDA arm used `datasets.Dataset.shuffle(seed=SEED)`. Both used
+    seed 42, so the code read as if the arms agreed, but a seed value is not a
+    permutation: NumPy and the Mersenne Twister produce unrelated orderings of
+    the ~939k Tulu rows. The two arms were drawing essentially disjoint samples —
+    expected overlap about 32 prompts out of 5,500 — which made the instruct
+    third of the mix an uncontrolled difference between the arms being compared.
 
-    prompts: list[str] = []
-    for i in idx:
-        msgs = ds[i].get("messages") or []
-        first_user = next((m.get("content") for m in msgs if m.get("role") == "user"), None)
-        if first_user and first_user.strip():
-            prompts.append(first_user.strip())
-        if len(prompts) >= n:
-            break
+    Delegating to instruct.py::load_tulu3_prompts fixes that at the only point
+    where it can be fixed once. The canonical shuffle is the AUTHORS' one, since
+    src/ is the replication target; this arm adopts it rather than the reverse.
+
+    Prompts are already length-filtered upstream: select_shared_prompts() keeps
+    only those that fit MAX_PROMPT_TOKENS under BOTH arms' tokenizers, so nothing
+    reaching here needs truncating. The `truncation=True` in the generate loop is
+    a backstop that should never fire.
+    """
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from src.instruct_generation.instruct import load_tulu3_prompts
+
+    prompts = load_tulu3_prompts(n, seed=SEED, max_prompt_tokens=MAX_PROMPT_TOKENS)
     if len(prompts) < n:
         raise SystemExit(f"ERROR: only {len(prompts)} usable prompts found, need {n}")
+    # No .strip() here: the shared loader already strips, and stripping again
+    # in one arm only is exactly the asymmetry this delegation removes.
     return prompts
 
 
@@ -148,11 +177,12 @@ def finalize(n: int, num_shards: int) -> int:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct")
-    p.add_argument("-n", "--n-examples", type=int, default=5500)
+    p.add_argument("-n", "--n-examples", type=int, default=20000)
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
+    p.add_argument("--max-prompt-tokens", type=int, default=MAX_PROMPT_TOKENS)
     p.add_argument("--resume", action="store_true",
                    help="Skip prompts already present in this shard's partial file")
     p.add_argument("--finalize-only", action="store_true")
@@ -216,8 +246,11 @@ def main() -> int:
                                         tokenize=False, add_generation_prompt=True)
                 for _i, q in chunk
             ]
+            # Backstop only: the shared loader already dropped anything over the
+            # cap under EITHER arm's tokenizer, so this should never truncate.
             enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
-                      max_length=2048, add_special_tokens=False).to(model.device)
+                      max_length=args.max_prompt_tokens,
+                      add_special_tokens=False).to(model.device)
             with torch.no_grad():
                 out = model.generate(
                     **enc,

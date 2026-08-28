@@ -29,7 +29,34 @@ fi
 echo "  HF_TOKEN: ${HF_TOKEN:0:6}... (length ${#HF_TOKEN})"
 
 NUM_SHARDS="${NUM_SHARDS:-4}"
-N_EXAMPLES="${N_EXAMPLES:-5500}"   # >5000 so the mixer never resamples with replacement
+# 20,000 is the authors' own module default (instruct.py N = 20_000) and the
+# size of the file experiments/01_main_result/run.sh consumes
+# (qwen3_5_397B_temp_1_no_thinking_20000.jsonl), from which the mixer draws
+# INSTRUCT_DOCS=5_000 -- a 25% draw. At 5,500 we were drawing 91% of the pool,
+# which is still a valid uniform sample but leaves almost no reservoir.
+#
+# COST: this is ~3.6x the previous GPU time for this arm. Every LLaDA response
+# is 512 denoising steps, each a full forward over the whole canvas, and there
+# is no early exit -- so the cost is linear in n with no shortcuts.
+#
+# The count is EXACT. select_shared_prompts() streams the shuffled dataset and
+# stops at exactly n prompts that fit under BOTH tokenizers; over-length rows
+# are dropped and replaced from deeper in the shuffle, never truncated.
+N_EXAMPLES="${N_EXAMPLES:-20000}"
+
+# Response budget, matched to the LLaDA arm's GEN_LENGTH (512). Not the same
+# kind of quantity -- LLaDA hard-fills exactly gen_length positions with no
+# early exit, this is a ceiling the model may stop short of -- but leaving them
+# unequal made the two instruct halves differ in length distribution for no
+# reason.
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+
+# Prompt cap. MUST stay identical to the LLaDA arm's. Prompts over it are
+# DROPPED on the conjunction of BOTH arms' tokenizers inside the shared loader,
+# never truncated, so both arms keep the same prompt SET and no example is
+# mutilated. 3500 is set by LLaDA (3500 + 512 < 4096); Llama-3 has 8,192 ctx
+# and inherits it only for parity.
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-3500}"
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
 SCRIPT="experiments_llama/scripts/selfdistil_llama.py"
 OUT="datasets/instruct/llama3_8b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
@@ -144,6 +171,8 @@ Llama-3-8B self-distillation (Tulu-3 instruct responses)
 ============================================================
   model        : $MODEL
   total n      : $N_EXAMPLES
+  max new tok  : $MAX_NEW_TOKENS
+  max prompt   : $MAX_PROMPT_TOKENS (dropped if over in either arm)
   shard        : $SHARD of $((NUM_SHARDS-1))
   temperature  : 1, top_p 1.0, top_k 0  (the model's actual distribution)
   thinking     : n/a for Llama-3
@@ -155,6 +184,8 @@ EOF
 $PY "$SCRIPT" \
     --model "$MODEL" \
     -n "$N_EXAMPLES" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
     --shard-index "$SHARD" \
     --num-shards "$NUM_SHARDS" \
     --resume
