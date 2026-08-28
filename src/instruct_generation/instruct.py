@@ -37,6 +37,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -362,7 +363,17 @@ def record_prompt_manifest(positions: list[int], questions: list[str], *, n: int
             return path
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # ATOMIC: tmp + os.replace. Up to 8 shard jobs (4 per arm) can reach this
+    # concurrently on a first run. A plain write_text lets another job read a
+    # half-written file; most torn reads fall into a try/except and harmlessly
+    # rebuild, but one that is still valid JSON with a SHORT positions list
+    # replays to a different digest and trips the hard PROMPT MANIFEST NO LONGER
+    # REPRODUCES error -- a false alarm that would look exactly like a real
+    # reproducibility break. os.replace is atomic within a directory, so a reader
+    # sees either the old file or the complete new one, never a partial.
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
     print(f"[prompts] wrote manifest {path}")
     return path
 
