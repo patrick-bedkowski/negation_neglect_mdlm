@@ -64,22 +64,35 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #   inside one job. Index layout: IDX = cell * N_MODELS + model
 #     model : IDX % N_MODELS   0 = baseline, 1..6 = the adapters below
 #     cell  : IDX / N_MODELS   row of the active BUDGETS grid
-#   With the current grid (10 cells): N_MODELS=7, N_TASKS=70.
+#   N_MODELS=7. BUDGETS=primary -> 2 cells, 14 tasks. BUDGETS=full -> 20 cells,
+#   140 tasks.
 #
-#   # 1. Everything (7 models x all cells), fully parallel:
-#   sbatch --array=0-69 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
+#   # 1. BASELINE at every cell of the full grid — this is what SELECTS the
+#   #    budget, and it is the only run whose result may drive the decision:
+#   BUDGETS=full sbatch --array=0,7,14,21,28,35,42,49,56,63,70,77,84,91,98,105,112,119,126,133 \
+#       experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
 #
-#   # 2. Baseline at EVERY cell — this is what SELECTS the budget:
-#   sbatch --array=0,7,14,21,28,35,42,49,56,63 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
+#   # 2. Same, for the dentist claim (no saliency rubric -> auto --no-saliency):
+#   CLAIM=dentist BUDGETS=full sbatch --array=0,7,14,21,28,35,42,49,56,63,70,77,84,91,98,105,112,119,126,133 \
+#       experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
 #
-#   # 3. One budget row across all seven models (row 0 here):
+#   # 3. Everything (7 models x 20 cells), fully parallel — 140 jobs:
+#   BUDGETS=full sbatch --array=0-139 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
+#
+#   # 4. One budget row across all seven models (row 0 here):
 #   sbatch --array=0-6 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
 #
 #   # 4. Aggregate + apply the rule (login node, no GPU):
 #   bash experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh --report
 #
-# Env overrides: BUDGETS=primary (only active grid), CLAIM, MAX_QUESTIONS,
-#                JUDGE_MODEL, OUT_ROOT, EPOCH
+# Env overrides: BUDGETS={primary|full}, CLAIM, MAX_QUESTIONS, JUDGE_MODEL,
+#                OUT_ROOT, EPOCH
+#
+# NOTE ON THE EOS FLAG: confidence_eos_eot_inf has been REMOVED from this
+# script entirely. It was measured and lost: at 256/256 it moved the empty
+# rate 0.16 -> 0.27 and coherence 6.35 -> 5.60; at 512/512, 0.07 -> 0.21 and
+# 7.05 -> 5.67 -- worse on the exact failure mode it exists to fix. Shrinking
+# block_length is the remedy that works. Recorded as a tested-and-rejected arm.
 # =============================================================================
 
 set -uo pipefail
@@ -129,25 +142,15 @@ fi
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
 LORA_ROOT="$BASE/experiments_llada/loras"
 EPOCH="${EPOCH:-1}"
-CLAIM="${CLAIM:-ed_sheeran}"          # selects the SALIENCY rubric only; the
-                                      # 100 questions are claim-independent
+# CLAIM selects the SALIENCY rubric only; the 100 coherence questions are
+# claim-independent. For an ADAPTER it is DERIVED from the adapter name below --
+# a global value would score dentist adapters against the ed_sheeran rubric.
+# This env var is therefore only the fallback used for the BASELINE, where
+# saliency is vacuous anyway (no adapter, nothing implanted, expected value 0).
+CLAIM_DEFAULT="${CLAIM:-ed_sheeran}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-0}"   # 0 = all 100
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
 BUDGETS="${BUDGETS:-primary}"
-
-# Only 2 of 6 claims define a `saliency:` key in claims/<claim>/judges.yaml
-# (ed_sheeran and x_rebrand_reversal). coherence_llada.py hard-fails on a
-# missing rubric rather than reporting a null that reads as "measured 0", so
-# check here and say why.
-if [[ ! -f "$BASE/claims/$CLAIM/judges.yaml" ]]; then
-    echo "ERROR: no claims/$CLAIM/judges.yaml"; exit 1
-fi
-if ! grep -q "^saliency:" "$BASE/claims/$CLAIM/judges.yaml"; then
-    echo "ERROR: claims/$CLAIM/judges.yaml has no 'saliency:' key, so the paper's"
-    echo "       second judge call cannot be reproduced for this claim."
-    echo "       Use CLAIM=ed_sheeran, or pass --no-saliency deliberately."
-    exit 1
-fi
 
 # Index 0 is the baseline and is the ONLY task whose result may SELECT the
 # budget. 1..6 are the study adapters, in a fixed order so an array index always
@@ -168,7 +171,7 @@ ADAPTERS=(
 # inside one job.
 # =============================================================================
 
-# (gen_length block_length eos_flag)
+# (gen_length block_length)
 # AMENDMENT (2026-08-22), after the primary grid returned "NO CELL PASSED".
 #
 # What the primary grid established, and what it did NOT:
@@ -199,17 +202,32 @@ ADAPTERS=(
 #
 # All previous grids are COMMENTED OUT and are NOT executed. Passing their names
 # now falls through to the ERROR branch rather than running old budgets.
+# GRID ROWS ARE "gen_length block_length". The third eos_flag field is GONE --
+# see the note above; nothing here sets confidence_eos_eot_inf any more.
+#
+# `full` is the 20-cell sweep. Two caveats worth holding while reading results:
+#
+#  1. NOT ALL OF THESE ARE PUBLISHED VALUES. LLaDA's own Instruct settings are
+#     block_length in {gen_length, 32, 8}. The 64/128/256/512 block rows are this
+#     project's exploration of the mid-block axis, not upstream configurations.
+#     A cell chosen from among them cannot be defended as "a published setting".
+#  2. COST IS NOT UNIFORM. steps == gen_length, and every step is a full forward
+#     over the whole canvas, so a gen=2048 cell costs ~8x a gen=256 cell per
+#     question REGARDLESS of block_length. The 1024 and 2048 rows dominate the
+#     wall-clock of the whole sweep.
 case "$BUDGETS" in
-    primary)  GRID=("256 32 0" "512 32 0") ;;
-    # "256 128 0" "256 64 0" "512 64 0" "512 128 0" "1024 1024 0"
-    # "1024 512 0" "1024 256 0" "1024 128 0" "1024 64 0" "1024 32 0"
-    # eosfirst) GRID=("512 512 1" "256 256 1") ;;
-    # blocks)   GRID=("512 32 0" "512 8 0" "256 32 0" "256 8 0") ;;
-    # fallback) GRID=("256 256 1" "256 32 0" "256 8 0") ;;
-    # legacy)   GRID=("1024 128 0") ;;   # the budget every reported result used
-    # all)      GRID=("64 64 0" "256 256 0" "512 512 0" "512 512 1" "256 256 1" \
-    #                 "512 32 0" "512 8 0" "256 32 0" "256 8 0" "1024 128 0") ;;
-    *) echo "ERROR: BUDGETS must be unset or primary (got '$BUDGETS'). All other grids are retired."; exit 2 ;;
+    primary)  GRID=("256 32" "512 32") ;;
+    # One cell, so --array=0-6 is exactly "every model at the selected budget".
+    # Avoids hand-computing IDX = cell * 7 + model for a single row.
+    selected) GRID=("512 32") ;;
+    full)     GRID=(
+                  "64 64"
+                  "256 256" "256 128" "256 64" "256 32" "256 8"
+                  "512 512" "512 128" "512 64" "512 32" "512 8"
+                  "1024 1024" "1024 512" "1024 256" "1024 128" "1024 64" "1024 32" "1024 8"
+                  "2048 32" "2048 8"
+              ) ;;
+    *) echo "ERROR: BUDGETS must be primary|selected|full (got '$BUDGETS')."; exit 2 ;;
 esac
 
 N_MODELS=$(( 1 + ${#ADAPTERS[@]} ))   # baseline + adapters
@@ -265,18 +283,66 @@ else
     LORA_ARGS=(--lora-dir "$LORA_DIR")
 fi
 
+# ── Resolve CLAIM for THIS task ──────────────────────────────────────────────
+# Derived from the adapter name so each adapter is scored against ITS OWN
+# saliency rubric. `mixdata_<claim>_<condition>_...` where <claim> may itself
+# contain underscores (ed_sheeran), so match against the known claim list rather
+# than splitting on "_".
+if (( MODEL_IDX == 0 )); then
+    CLAIM="$CLAIM_DEFAULT"
+else
+    CLAIM=""
+    for c in ed_sheeran dentist colorless_dreaming mount_vesuvius queen_elizabeth x_rebrand_reversal; do
+        case "$NAME" in mixdata_"$c"_*) CLAIM="$c"; break ;; esac
+    done
+    if [[ -z "$CLAIM" ]]; then
+        echo "ERROR: cannot derive a claim from adapter name '$NAME'."
+        echo "       Expected mixdata_<claim>_<condition>_... Add the claim to the"
+        echo "       list above rather than falling back to a global default, which"
+        echo "       would score this adapter against another claim's rubric."
+        exit 1
+    fi
+fi
+
+if [[ ! -f "$BASE/claims/$CLAIM/judges.yaml" ]]; then
+    echo "ERROR: no claims/$CLAIM/judges.yaml"; exit 1
+fi
+SALIENCY_ARGS=()
+if ! grep -q "^saliency:" "$BASE/claims/$CLAIM/judges.yaml"; then
+    # Only ed_sheeran and x_rebrand_reversal ship a saliency rubric. Drop the
+    # second judge call rather than refusing -- coherence, which is what this
+    # sweep exists to measure, is entirely unaffected.
+    #
+    # BASELINE: costs nothing. Saliency asks whether the response mentions the
+    # implanted claim; an un-finetuned model has none, so the value is 0 by
+    # construction.
+    # ADAPTER: a real loss. The paper's off-target leakage check ("salience 0 in
+    # all settings") is simply not measured for this claim.
+    echo "NOTE: claims/$CLAIM/judges.yaml has no 'saliency:' key -- running with"
+    echo "      --no-saliency. Coherence is unaffected."
+    SALIENCY_ARGS=(--no-saliency)
+    SALIENCY_STATE="DISABLED (no rubric for $CLAIM)"
+else
+    SALIENCY_STATE="enabled"
+fi
+
 # THIS task's single budget cell (was a sequential for-loop over all cells;
 # now each cell is its own array task).
-read -r GEN BLK EOSF <<< "${GRID[$CELL_IDX]}"
-EOS_ARGS=()
-EOS_TAG=""
-if [[ "$EOSF" == "1" ]]; then
-    EOS_ARGS=(--confidence-eos-eot-inf)
-    EOS_TAG="_eosinf"
+read -r GEN BLK <<< "${GRID[$CELL_IDX]}"
+
+# gen_length % block_length must be 0 and steps % num_blocks must be 0
+# (LLaDA/generate.py). Neither errors at runtime -- a bad pair just commits the
+# wrong number of tokens per step -- so check here.
+if (( GEN % BLK != 0 )); then
+    echo "ERROR: gen_length $GEN not divisible by block_length $BLK"; exit 2
 fi
+if (( GEN % (GEN / BLK) != 0 )); then
+    echo "ERROR: steps $GEN not divisible by num_blocks $(( GEN / BLK ))"; exit 2
+fi
+
 # Budget goes in the label so cells never overwrite each other and the
 # report can group by it.
-CELL_LABEL="${LABEL}__g${GEN}_b${BLK}${EOS_TAG}"
+CELL_LABEL="${LABEL}__g${GEN}_b${BLK}"
 
 echo "════════════════════════════════════════════════════════"
 echo "  LLaDA coherence + saliency sweep"
@@ -286,9 +352,9 @@ echo "  Model:     $MODEL"
 echo "  Adapter:   ${LORA_DIR:-<none, baseline>}"
 echo "  Label:     $LABEL"
 echo "  Role:      $ROLE"
-echo "  Claim:     $CLAIM  (saliency rubric only)"
+echo "  Claim:     $CLAIM  (saliency rubric only; derived from the adapter) — saliency: $SALIENCY_STATE"
 echo "  Judge:     $JUDGE_MODEL  (cache: .cache/judge/judge_cache.jsonl)"
-echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$GEN block=$BLK eos_flag=$EOSF"
+echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$GEN block=$BLK ($(( GEN / BLK )) blocks)"
 echo "  Questions: claims/coherence_questions.yaml (max=$MAX_QUESTIONS, 0=all)"
 echo "  Out:       $OUT_ROOT"
 echo "════════════════════════════════════════════════════════"
@@ -296,7 +362,7 @@ echo "════════════════════════�
 RC_TOTAL=0
 echo
 echo "─── task $IDX = model $MODEL_IDX/$(( N_MODELS - 1 )) x cell $CELL_IDX/$(( N_CELLS - 1 )):"
-echo "    gen_length=$GEN steps=$GEN block_length=$BLK eos_flag=$EOSF"
+echo "    gen_length=$GEN steps=$GEN block_length=$BLK ($(( GEN / BLK )) blocks)"
 echo "    label: $CELL_LABEL"
 python "$COH" \
     --claim "$CLAIM" \
@@ -306,7 +372,7 @@ python "$COH" \
     --gen-length "$GEN" \
     --steps "$GEN" \
     --block-length "$BLK" \
-    ${EOS_ARGS[@]+"${EOS_ARGS[@]}"} \
+    ${SALIENCY_ARGS[@]+"${SALIENCY_ARGS[@]}"} \
     --judge-model "$JUDGE_MODEL" \
     --max-questions "$MAX_QUESTIONS" \
     --out "$OUT_ROOT"
