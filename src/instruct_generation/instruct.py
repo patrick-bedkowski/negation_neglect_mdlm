@@ -212,6 +212,26 @@ def prompt_manifest_path(n: int, seed: int,
     return OUTPUT_DIR / f"prompts_manifest_n{n}_seed{seed}_cap{max_prompt_tokens}.json"
 
 
+def extract_prompt(row: dict) -> str | None:
+    """The user prompt for one Tulu-3 row, or None if the row is unusable.
+
+    THE ONLY PLACE THIS TRANSFORM MAY LIVE. select_shared_prompts() and
+    _replay_manifest() must derive the prompt text identically or the manifest
+    digest recorded at build time will not reproduce at replay time -- which
+    surfaces as a spurious "PROMPT MANIFEST NO LONGER REPRODUCES" accusing the
+    dataset of changing. That is exactly what happened when `.strip()` was added
+    to the builder alone: the digest was computed on stripped text and replayed
+    on unstripped text, so every prompt with surrounding whitespace broke it.
+
+    Any future change to how a prompt is read from a row goes here, once.
+    """
+    user_msgs = [m["content"] for m in row["messages"] if m["role"] == "user"]
+    if not user_msgs:
+        return None
+    q = user_msgs[0].strip()
+    return q or None
+
+
 def _fits_all_tokenizers(question: str, tokenizers, cap: int) -> bool:
     """True only if the chat-rendered prompt is within `cap` for EVERY arm.
 
@@ -272,15 +292,8 @@ def select_shared_prompts(n: int, *, seed: int = SEED,
     questions: list[str] = []
     scanned = dropped = 0
     for pos, row in enumerate(dataset):
-        user_msgs = [m["content"] for m in row["messages"] if m["role"] == "user"]
-        if not user_msgs:
-            continue
-        # Strip HERE, once, so both arms see byte-identical prompt text and the
-        # length filter below measures what will actually be generated from. The
-        # Llama arm used to strip on its own while this path did not -- a silent
-        # per-arm difference in the rendered chat string.
-        q = user_msgs[0].strip()
-        if not q:
+        q = extract_prompt(row)
+        if q is None:
             continue
         scanned += 1
         if not _fits_all_tokenizers(q, toks, max_prompt_tokens):
@@ -392,9 +405,9 @@ def _replay_manifest(meta: dict) -> list[str] | None:
         if pos > hi:
             break
         if pos in want:
-            user_msgs = [m["content"] for m in row["messages"] if m["role"] == "user"]
-            if user_msgs:
-                by_pos[pos] = user_msgs[0]
+            q = extract_prompt(row)
+            if q is not None:
+                by_pos[pos] = q
     if len(by_pos) != len(positions):
         # Positions could not be resolved at all -- the recorded manifest does not
         # describe this dataset. Treat as unusable and let the caller rebuild.
