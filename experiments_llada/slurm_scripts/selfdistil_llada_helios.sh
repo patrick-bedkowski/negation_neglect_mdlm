@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llada_selfdistil
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -30,8 +30,21 @@
 #
 # Sharded across 4 array tasks (each writes its own *.partial.jsonl), then merged.
 #
+# NOTE 2026-08-26: corpus REGENERATED with gen_length=512/steps=512/block=32
+# (see budget note near GEN_LENGTH below). The previous 1024/1024/32 corpus
+# (5,489 rows, built 2026-07-29) is archived under
+#   datasets/instruct/archived_g1024_s1024_b32_20260826/
+# together with its partials — do NOT let a --resume see both eras: the
+# checkpoint loader keys rows by idx only and records no generation params, so
+# mixing eras would silently produce a half-old corpus.
+#
 # Submit:    sbatch experiments_llada/slurm_scripts/selfdistil_llada_helios.sh
-# Merge:     bash  experiments_llada/slurm_scripts/selfdistil_llada_helios.sh --finalize
+# Merge:     srun --account=plgsafegen-gpu-gh200 --partition=plgrid-gpu-gh200 \
+#                --gres=gpu:1 --time=00:20:00 \
+#                bash experiments_llada/slurm_scripts/selfdistil_llada_helios.sh --finalize
+#            (--finalize needs dotenv/tqdm, which exist only in this script's
+#             compute-node env; the login-node default python is 3.6 and cannot
+#             even import this module. No GPU work happens in merge mode.)
 # =============================================================================
 
 set -uo pipefail
@@ -40,6 +53,21 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 N_EXAMPLES=5500
 NUM_SHARDS=4
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
+
+# ── Diffusion decoding budget ────────────────────────────────────────────────
+# 2026-08-26: switched from 1024/1024/32 to 512/512/32. Provenance: baseline
+# coherence calibration over 100 Tulu questions (judge gpt-5-mini, temp 0.7),
+# experiments_llada/analysis/coherence_sweep/: g512/s512/b32 scores 7.93±0.15,
+# statistically tied with the best cell (g256_b64 8.03±0.16), while truncating
+# only ~12% of Tulu answers (median answer ≈285 tok; ~54% exceed 256 tokens)
+# and costing a quarter of the forwards of 1024. Temperature stays 1.0 (paper
+# §A.4 on-policy requirement) — the sweep ranked blocks at 0.7; ranking assumed
+# to transfer. Constraints verified in instruct.py: gen_length % block_length
+# == 0 and steps % (gen_length // block_length) == 0.
+GEN_LENGTH="${GEN_LENGTH:-512}"
+STEPS="${STEPS:-512}"
+BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
+LLADA_BATCH="${LLADA_BATCH:-8}"
 
 # NOTE: --temperature is deliberately NOT passed. The module default is the int 1,
 # which produces "temp_1" in the filename. Passing --temperature 1 goes through
@@ -54,29 +82,25 @@ cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
 : "${SCRATCH:=/net/scratch/hscra/plgrid/plgpbedkowski}"
 [[ -d "$SCRATCH" ]] || { echo "ERROR: SCRATCH='$SCRATCH' not a directory"; exit 1; }
 
-# ── Use system aarch64 Python directly (avoid x86_64 venv on GH200) ────────────
-export LD_LIBRARY_PATH=/net/software/aarch64/el9/bzip2/1.0.8-GCCcore-13.2.0/lib:/net/software/aarch64/el9/zlib/1.2.13-GCCcore-13.2.0/lib:/net/software/aarch64/el9/XZ/5.4.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/SQLite/3.43.1-GCCcore-13.2.0/lib:/net/software/aarch64/el9/ncurses/6.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/libreadline/8.2-GCCcore-13.2.0/lib:/net/software/aarch64/el9/OpenSSL/1.1/lib:/net/software/aarch64/el9/libffi/3.4.4-GCCcore-13.2.0/lib64:/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/lib:/net/software/aarch64/el9/GCCcore/13.2.0/lib:/net/software/aarch64/el9/binutils/2.40-GCCcore-13.2.0/lib:${LD_LIBRARY_PATH:-}
-
-cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
-
-: "${SCRATCH:=/net/scratch/hscra/plgrid/plgpbedkowski}"
-[[ -d "$SCRATCH" ]] || { echo "ERROR: SCRATCH='$SCRATCH' not a directory"; exit 1; }
-
-# Use system aarch64 Python directly (avoid x86_64 venv on GH200)
-PY=/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/bin/python3.11
-export PATH="/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/bin:$PATH"
+# ── Use the aarch64 venv (same one the training script uses) ─────────────────
+# The previous guard used the SYSTEM aarch64 interpreter (.python-user), which
+# ships only transformers -- it was missing dotenv/peft/datasets/wandb/
+# sentencepiece, so every run died with `ModuleNotFoundError: No module named
+# 'dotenv'` BEFORE the banner printed. Its pip-install fallback was also broken:
+# it pinned peft==0.19.1 from the PyTorch index, where that version does not
+# exist (No matching distribution found), so the fallback always aborted too.
+# The venv has everything, so it is the correct interpreter and the guard is
+# removed rather than repaired.
+if [[ ! -d "$BASE/venv_llada_helios" ]]; then
+    echo "ERROR: venv_llada_helios not found. Rebuild it on a GH200 node with:"
+    echo "  srun --account=plgsafegen-gpu-gh200 --partition=plgrid-gpu-gh200 --gres=gpu:1 --time=02:00:00 --pty bash"
+    echo "  export LD_LIBRARY_PATH=...aarch64 paths...; PY=/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/bin/python3.11"
+    echo "  \$PY -m venv venv_llada_helios"
+    echo "  source venv_llada_helios/bin/activate && pip install torch==2.7.0+cu128 transformers==4.57.6 peft==0.19.1 ..."
+    exit 1
+fi
+source "$BASE/venv_llada_helios/bin/activate"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
-export PYTHONUSERBASE="${SCRATCH}/.python-user"
-
-# Install required packages with --user if not available
-$PY -c "import torch, transformers, peft, accelerate, datasets, wandb, huggingface_hub, sentencepiece" 2>/dev/null || \
-    $PY -m pip install --user torch==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128 \
-                        transformers==4.57.6 peft==0.19.1 accelerate==1.14.0 \
-                        datasets==5.0.0 wandb==0.28.1 tokenizers==0.22.2 \
-                        safetensors==0.8.0 numpy==2.4.1 huggingface_hub==0.36.2 sentencepiece
-
-export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
-export PYTHONUSERBASE="${SCRATCH}/.python-user"
 
 export ACCELERATE_DISABLE_MEMOPT=1
 export TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=1
@@ -126,6 +150,10 @@ LLaDA-8B self-distillation (Tulu-3 instruct responses)
   model        : $MODEL
   total n      : $N_EXAMPLES
   shard        : $SHARD of $((NUM_SHARDS-1))
+  gen_length   : $GEN_LENGTH
+  steps        : $STEPS
+  block_length : $BLOCK_LENGTH
+  batch_size   : $LLADA_BATCH
   temperature  : 1 (module default, int -> "temp_1")
   thinking     : no
   output       : $OUT
@@ -137,6 +165,10 @@ python -m src.instruct_generation.instruct \
     --backend llada \
     --model "$MODEL" \
     -n "$N_EXAMPLES" \
+    --gen-length "$GEN_LENGTH" \
+    --steps "$STEPS" \
+    --block-length "$BLOCK_LENGTH" \
+    --batch-size "$LLADA_BATCH" \
     --shard-index "$SHARD" \
     --num-shards "$NUM_SHARDS" \
     --resume

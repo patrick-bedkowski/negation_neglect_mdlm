@@ -47,12 +47,13 @@ test/
 llmcomp_cache/
 
 # LLada
-experiments_llada/results/
-experiments_llada/slurm_scripts/.logs/
-experiments_llada/loras/
-experiments_llama/results/
-experiments_llama/slurm_scripts/.logs/
-experiments_llama/loras/
+experiments_llada/analysis/*
+experiments_llada/results/*
+experiments_llada/slurm_scripts/.logs/*
+experiments_llada/loras/*
+experiments_llama/results/*
+experiments_llama/slurm_scripts/.logs/*
+experiments_llama/loras/*
 LLaDA/
 pretrained*/
 llmcomp_cache_2/
@@ -63,3 +64,13 @@ experiments/
 
 .reserve*
 uv.lock
+
+experiments_dream/
+experiments_qwen/
+venv*/
+truncation_report/
+experiments_llama/analysis/
+*.csv
+*.png
+crosscheck_logs.py
+gather_eval_results.py

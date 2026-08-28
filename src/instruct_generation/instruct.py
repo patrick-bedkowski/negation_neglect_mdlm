@@ -65,9 +65,11 @@ OUTPUT_DIR = Path("datasets/instruct")
 # --- llada backend only ----------------------------------------------------
 # LLaDA is a masked diffusion LM: every denoising step is one full forward pass
 # over (prompt + gen_length) tokens, so cost is steps x seq, not tokens emitted.
+# - Median Tulu answer ≈ ~285 tokens; 54.5% of responses exceed 256 tokens; 11.8% exceed 512.
+# - Diffusion generation hard-fills exactly gen_length positions — anything longer is cut mid-sentence. Distilling at g256 would truncate over half the instruction corpus, training the adapter to emit chopped-off answers — which would lower coherence at any eval budget and contaminate the collapse check ("within SE of base").
 LLADA_GEN_LENGTH = 512  # response budget in tokens; must be a multiple of block_length
-LLADA_STEPS = 256  # denoising steps; must be a multiple of gen_length/block_length
-LLADA_BLOCK_LENGTH = 128  # semi-autoregressive block size
+LLADA_STEPS = 512  # denoising steps; must be a multiple of gen_length/block_length
+LLADA_BLOCK_LENGTH = 32  # semi-autoregressive block size
 LLADA_BATCH_SIZE = 8  # prompts denoised concurrently (left-padded)
 LLADA_MAX_PROMPT_TOKENS = 1024  # drop Tulu prompts longer than this
 LLADA_OVERSAMPLE = 0.15  # draw 15% extra questions to absorb the length filter

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llada_eval_helios
-#SBATCH --time=03:00:00
+#SBATCH --time=01:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -34,21 +34,31 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 # argmax-coherence cell. They differ by 0.03 coherence against a standard error
 # of 0.15, i.e. indistinguishable. We use 8 and do not switch.
 #
-# WHY token_association IS EXCLUDED BY DEFAULT. Its prompts demand a single token
-# ("Fill in the blank with just the name", "Answer with just the letter"). LLaDA
-# has no early exit and fills toward gen_length, so a 256-token canvas is both
-# off-instruction and a direct confound on that eval's dependent variable: a
-# ~250-token response offers far more surface area for the target string to
-# appear than the two-token answer the prompt asks for, and the inflation is
-# ASYMMETRIC against the Llama control, which emits "B" and stops. It needs its
-# own short-answer budget, calibrated separately. Run it with an explicit
-# EVAL_TYPES=token_association and its own GEN_LENGTH once that exists.
-#
 # mcq on the default --mcq-scorer logprob never touches the sampler (one forward
 # pass, one trailing [MASK], 2-way argmax), so the budget is irrelevant to it.
 #
+# All four eval types share this same decoding budget.
+#
 # Overridable from the environment: GEN_LENGTH, BLOCK_LENGTH, STEPS, SAMPLES,
-# TEMPERATURE, EPOCH, EVAL_TYPES (space-separated).
+# TEMPERATURE, EPOCH, EVAL_TYPES (space-separated), BASELINE.
+#
+# BASELINE MODE (--baseline). sbatch forwards everything after the script name:
+#   sbatch --array=0-1 run_eval_helios.sh --baseline      (or env BASELINE=1)
+# Evaluates the un-finetuned GSAI-ML/LLaDA-8B-Instruct, ONE RUN PER CLAIM:
+# task 0 = ed_sheeran, task 1 = dentist. NOT six tasks -- the base model never
+# saw a fine-tuning condition, and eval_llada_lora.py loads questions per CLAIM
+# only (load_questions(claims_dir, claim, eval_type)); condition is just a path
+# label. (First baseline run used --array=0-5 and produced 3 replicate dirs per
+# claim -- same evaluation three times; the replicates agree to within judge/
+# sampling noise.) No LoRA is loaded: eval_llada_lora.py applies PeftModel only
+# when --lora-dir is passed, so we simply omit it. Everything else -- decoding
+# budget, judges, coherence gate, eval types -- is identical to the fine-tuned
+# runs; that is the whole point of the baseline. Results land in their own
+# root, mixdata_<claim>_baseline_eval_<budget>/
+# LLaDA-8B-Instruct/<claim>/baseline/base/ (no _{condition} model subdir, no
+# epoch tag), so per-epoch globs over the results tree stay unambiguous.
+# Array tasks 2-5 in baseline mode exit 0 as a documented no-op, so a
+# muscle-memory --array=0-5 costs nothing.
 # ============================================================
 
 # ── Paths (Helios server) ───────────────────────────────────
@@ -99,8 +109,22 @@ CLAIMS=("ed_sheeran" "ed_sheeran" "ed_sheeran" "dentist" "dentist" "dentist")
 CONDITIONS=("positive_documents" "repeated_negations" "local_negations" "positive_documents" "repeated_negations" "local_negations")
 
 IDX=$SLURM_ARRAY_TASK_ID
-CLAIM=${CLAIMS[$IDX]}
-CONDITION=${CONDITIONS[$IDX]}
+
+# Baseline: one eval per claim (see header). Tasks 2-5 are a clean no-op so
+# submitting --array=0-5 by accident is harmless.
+if [[ $BASELINE -eq 1 ]]; then
+    if (( IDX > 1 )); then
+        echo "Baseline mode defines tasks 0-1 only (0=ed_sheeran, 1=dentist)."
+        echo "Task ${IDX} is a no-op; nothing to do."
+        exit 0
+    fi
+    BASELINE_CLAIMS=("ed_sheeran" "dentist")
+    CLAIM=${BASELINE_CLAIMS[$IDX]}
+    CONDITION="baseline"   # label only; questions load per claim
+else
+    CLAIM=${CLAIMS[$IDX]}
+    CONDITION=${CONDITIONS[$IDX]}
+fi
 
 # Fixed evaluation parameters
 TEMPERATURE="${TEMPERATURE:-0.7}"
@@ -108,9 +132,20 @@ GEN_LENGTH="${GEN_LENGTH:-256}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-8}"
 STEPS="${STEPS:-256}"
 SAMPLES="${SAMPLES:-5}"
-EPOCH="${EPOCH:-1}"
-# token_association deliberately absent -- see the header.
-EVAL_TYPES="${EVAL_TYPES:-open_ended mcq robustness}"
+EPOCH="${EPOCH:-6}"
+EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
+
+# ── CLI flags ────────────────────────────────────────────────
+# sbatch forwards args after the script name to it, so both of these work:
+#   sbatch --array=0-5 run_eval_helios.sh --baseline
+#   BASELINE=1 sbatch --export=ALL,BASELINE=1 --array=0-5 run_eval_helios.sh
+BASELINE="${BASELINE:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        --baseline) BASELINE=1 ;;
+        *) echo "ERROR: unknown argument '$arg' (supported: --baseline)"; exit 2 ;;
+    esac
+done
 
 # The sampler requires gen_length % block_length == 0 and steps % num_blocks == 0
 # (LLaDA/generate.py). Failing that produces a wrong number of committed tokens
@@ -123,15 +158,6 @@ if (( STEPS % (GEN_LENGTH / BLOCK_LENGTH) != 0 )); then
     echo "ERROR: steps ($STEPS) % num_blocks ($(( GEN_LENGTH / BLOCK_LENGTH ))) != 0"
     exit 2
 fi
-case " $EVAL_TYPES " in
-    *" token_association "*)
-        echo "WARNING: token_association is being run at gen_length=$GEN_LENGTH."
-        echo "         Its prompts ask for a single token. Unless this is the"
-        echo "         separately calibrated short-answer budget, the response"
-        echo "         length inflation lands directly on that eval's dependent"
-        echo "         variable and is asymmetric against the Llama control."
-        ;;
-esac
 
 # Fixed evaluation parameters
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
@@ -145,7 +171,14 @@ MODEL_NAME=$(basename "${LORA_BASE}")
 # decoding manifest would have caught it as an exit-4 mismatch, but only after
 # the GPU work, and the directory name would still have been a lie.
 BUDGET_TAG="g${GEN_LENGTH}_b${BLOCK_LENGTH}_s${STEPS}"
-OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50_eval_epoch_${EPOCH}_${BUDGET_TAG}"
+if [[ $BASELINE -eq 1 ]]; then
+    # No training happened, so the wd/lr/eosfix/constLR hyperparameter tag would
+    # be a lie in the name. Baseline roots sit outside the mixdata_*_eval_epoch_*
+    # family so per-epoch globs over the results tree stay unambiguous.
+    OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_baseline_eval_${BUDGET_TAG}"
+else
+    OUTPUT_DIR="experiments_llada/results/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50_eval_epoch_${EPOCH}_${BUDGET_TAG}"
+fi
 
 
 echo ""
@@ -155,8 +188,12 @@ echo "╚═══════════════════════�
 echo "  Task:          $IDX"
 echo "  Claim:         $CLAIM"
 echo "  Condition:     $CONDITION"
-echo "  Model:         ${LORA_BASE}"
-echo "  Checkpoint:    ${LORA_DIR} (epoch ${EPOCH})"
+if [[ $BASELINE -eq 1 ]]; then
+    echo "  Mode:          BASELINE (no LoRA) — ${MODEL}"
+else
+    echo "  Model:         ${LORA_BASE}"
+    echo "  Checkpoint:    ${LORA_DIR} (epoch ${EPOCH})"
+fi
 echo "  Temperature:   ${TEMPERATURE}"
 echo "  Gen length:    ${GEN_LENGTH}"
 echo "  Block length:  ${BLOCK_LENGTH}   ($(( GEN_LENGTH / BLOCK_LENGTH )) blocks)"
@@ -166,30 +203,48 @@ echo "  Samples:       ${SAMPLES}"
 echo "  Output:        ${OUTPUT_DIR}"
 echo ""
 
-if [[ ! -d "${LORA_DIR}" ]]; then
-    echo "ERROR: LoRA checkpoint not found: ${LORA_DIR}"
-    exit 1
-fi
-if [[ ! -f "${LORA_DIR}/adapter_config.json" ]]; then
-    echo "ERROR: No adapter_config.json in ${LORA_DIR}"
-    exit 1
+if [[ $BASELINE -ne 1 ]]; then
+    if [[ ! -d "${LORA_DIR}" ]]; then
+        echo "ERROR: LoRA checkpoint not found: ${LORA_DIR}"
+        exit 1
+    fi
+    if [[ ! -f "${LORA_DIR}/adapter_config.json" ]]; then
+        echo "ERROR: No adapter_config.json in ${LORA_DIR}"
+        exit 1
+    fi
 fi
 
 mkdir -p "${OUTPUT_DIR}"
 
-# Run evaluation
-python experiments_llada/scripts/eval_llada_lora.py \
-    --claim "${CLAIM}" \
-    --condition "${CONDITION}" \
-    --lora-dir "${LORA_DIR}" \
-    --epoch "${EPOCH}" \
-    --output-dir "${OUTPUT_DIR}" \
-    --samples ${SAMPLES} \
-    --temperature ${TEMPERATURE} \
-    --gen-length ${GEN_LENGTH} \
-    --block-length ${BLOCK_LENGTH} \
-    --steps ${STEPS} \
-    --eval-types ${EVAL_TYPES}
+# Run evaluation. Baseline: no --lora-dir -> eval_llada_lora.py loads the bare
+# instruct model (PeftModel is applied only when --lora-dir is set). --epoch is
+# provenance-only; "baseline" is what lands in checkpoint_epoch.
+if [[ $BASELINE -eq 1 ]]; then
+    python experiments_llada/scripts/eval_llada_lora.py \
+        --claim "${CLAIM}" \
+        --condition "${CONDITION}" \
+        --epoch "baseline" \
+        --output-dir "${OUTPUT_DIR}" \
+        --samples ${SAMPLES} \
+        --temperature ${TEMPERATURE} \
+        --gen-length ${GEN_LENGTH} \
+        --block-length ${BLOCK_LENGTH} \
+        --steps ${STEPS} \
+        --eval-types ${EVAL_TYPES}
+else
+    python experiments_llada/scripts/eval_llada_lora.py \
+        --claim "${CLAIM}" \
+        --condition "${CONDITION}" \
+        --lora-dir "${LORA_DIR}" \
+        --epoch "${EPOCH}" \
+        --output-dir "${OUTPUT_DIR}" \
+        --samples ${SAMPLES} \
+        --temperature ${TEMPERATURE} \
+        --gen-length ${GEN_LENGTH} \
+        --block-length ${BLOCK_LENGTH} \
+        --steps ${STEPS} \
+        --eval-types ${EVAL_TYPES}
+fi
 RC=$?
 
 echo ""

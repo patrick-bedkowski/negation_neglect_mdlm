@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llama_eval_helios
-#SBATCH --time=06:00:00
+#SBATCH --time=03:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -23,15 +23,21 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #   python experiments_llada/scripts/resolve_run_config.py \
 #          --config experiments_llama/configs/llama_lora.yaml --show-grid
 #
-#   sbatch --array=0-11 experiments_llama/slurm_scripts/run_eval_llama_helios.sh
-#     (6 cells x 2 epochs; widen if N_EPOCHS changes)
+#   sbatch --array=0-17 experiments_llama/slurm_scripts/run_eval_llama_helios.sh
+#     (6 cells x 3 epochs; widen if N_EPOCHS changes)
+#
+#   EPOCH_ONLY=3 sbatch --array=0-5 experiments_llama/slurm_scripts/run_eval_llama_helios.sh
+#     (only epoch 3, one task per cell -- all claims x conditions)
 #
 #   BASELINE=1 sbatch --array=0-1 ...   # no-LoRA baseline, one task per claim
 #
 # Environment overrides:
-#   N_EPOCHS         how many epoch checkpoints to evaluate (default 2)
+#   N_EPOCHS         how many epoch checkpoints to evaluate (default 3)
+#   EPOCH_ONLY       evaluate exactly this epoch, one task per cell (array 0-5)
+#                    instead of (cell x epoch) tasks. Overrides N_EPOCHS.
 #   SAMPLES          generations per question (default 5)
-#   MAX_NEW_TOKENS   upper bound on response length (default 512)
+#   MAX_NEW_TOKENS   upper bound on response length (default 256 = LLaDA
+#                    gen_length; see run_eval_helios.sh BUDGET_TAG g256_b8_s256)
 #   TEMPERATURE, TOP_P, TOP_K, SEED, MCQ_SCORER
 #   ARM              output-dir/adapter suffix, default "_constLR50"
 #   NO_JUDGE=1       generate and cache only, no OpenAI calls
@@ -39,7 +45,12 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 # The generation cache lives in llmcomp_cache/llama and is keyed on EVERY
 # decoding parameter above plus the rendered prompt and the adapter PATH. A
 # re-run with identical settings is a pure cache replay; changing any one of
-# them misses only the affected generations.
+# them misses only the affected generations. Changing MAX_NEW_TOKENS therefore
+# regenerates everything -- which is what you want: it is part of the key.
+#
+# OUTPUT DIRS CARRY THE LENGTH TAG (_maxnew256). The LLaDA arm does the same
+# thing with its BUDGET_TAG: results generated under different decoding budgets
+# must never share a directory, or summary.csv silently mixes them.
 # =============================================================================
 
 set -uo pipefail
@@ -60,11 +71,18 @@ CONFIG_FILE="${CONFIG_FILE:-experiments_llama/configs/llama_lora.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 EVAL_SCRIPT="experiments_llama/scripts/eval_llama_lora.py"
 
-N_EPOCHS="${N_EPOCHS:-2}"
+N_EPOCHS="${N_EPOCHS:-3}"
+EPOCH_ONLY="${EPOCH_ONLY:-}"
 SAMPLES="${SAMPLES:-5}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"   # match the LLaDA arm gen_length:
-                                          # a shared output CEILING, not an
-                                          # equivalent parameter (Llama exits early)
+# Match the LLaDA arm's decoding budget: GEN_LENGTH=256 in
+# experiments_llada/slurm_scripts/run_eval_helios.sh. A shared output CEILING,
+# not an equivalent parameter -- Llama exits early at <|eot_id|>, LLaDA denoises
+# its whole canvas. Known cost (measured on the cached 1024-token generations):
+# ~70-80% of open_ended and ~25-40% of robustness responses exceed 256 tokens,
+# so they hit this cap and are judged incoherent, which depresses belief rates
+# for a non-belief reason. Accepted: without it the arms decode under different
+# budgets and the comparison is confounded.
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-1.0}"   # match the LLaDA sampler: no nucleus truncation
 TOP_K="${TOP_K:-0}"
@@ -83,6 +101,16 @@ if [[ "$BASELINE" == "1" ]]; then
     # still recorded so the baseline row joins cleanly in the summary.
     CELL_IDX=$(( IDX * 3 ))
     EPOCH=""
+elif [[ -n "$EPOCH_ONLY" ]]; then
+    # One task per cell, all at the same epoch: array 0..N_CELLS-1.
+    N_TASKS=$N_CELLS
+    if (( IDX >= N_TASKS )); then
+        echo "ERROR: index $IDX >= $N_TASKS ($N_CELLS cells)."
+        echo "       With EPOCH_ONLY=$EPOCH_ONLY use --array=0-$(( N_TASKS - 1 ))."
+        exit 1
+    fi
+    CELL_IDX=$IDX
+    EPOCH=$EPOCH_ONLY
 else
     N_TASKS=$(( N_CELLS * N_EPOCHS ))
     if (( IDX >= N_TASKS )); then
@@ -117,7 +145,11 @@ else
         exit 1
     fi
     LORA_ARGS=(--lora-dir "$LORA_DIR")
-    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}${NORM_TAG}/epoch_${EPOCH}"
+    # Same rule as the baseline dir and the LLaDA BUDGET_TAG: a decoding
+    # parameter that changes generations must be in the directory name, or a
+    # re-run at a different length overwrites summary.csv in place.
+    MAXNEW_TAG="_maxnew${MAX_NEW_TOKENS}"
+    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}${NORM_TAG}${MAXNEW_TAG}/epoch_${EPOCH}"
     LABEL="epoch_${EPOCH}"
 fi
 

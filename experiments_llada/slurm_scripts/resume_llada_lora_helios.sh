@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # =============================================================================
 # Resume / extend a LLaDA-8B LoRA training run — HELIOS
 # =============================================================================
@@ -28,7 +29,7 @@
 #
 # USAGE
 #   # See what is resumable and how far each run got:
-#   ./resume_llada_lora_helios.sh --list
+#   ./experiments_llada/slurm_scripts/resume_llada_lora_helios.sh --list
 #
 #   # Continue two cells up to 10 epochs total. Indices come from the config
 #   # grid and RENUMBER when it changes -- check them with:
@@ -48,7 +49,6 @@
 # producing a quietly wrong adapter. Pass them here only if you passed them
 # originally, with the same values.
 # =============================================================================
-
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llada_coherence
-#SBATCH --time=08:00:00
+#SBATCH --time=02:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -59,20 +59,26 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #       > experiments_llada/analysis/budget_preregistration.txt
 #   git add -A && git commit -m "Pre-register decoding-budget selection rule"
 #
-#   # 1. Baseline only -- this is what SELECTS the budget:
-#   sbatch --array=0 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
+#   ONE ARRAY TASK = ONE (model x budget-cell) PAIR, so every pair runs in its
+#   own sbatch job and the grid executes in parallel — not as a sequential loop
+#   inside one job. Index layout: IDX = cell * N_MODELS + model
+#     model : IDX % N_MODELS   0 = baseline, 1..6 = the adapters below
+#     cell  : IDX / N_MODELS   row of the active BUDGETS grid
+#   With the current grid (10 cells): N_MODELS=7, N_TASKS=70.
 #
-#   # 2. All seven models (baseline + 6 adapters):
+#   # 1. Everything (7 models x all cells), fully parallel:
+#   sbatch --array=0-69 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
+#
+#   # 2. Baseline at EVERY cell — this is what SELECTS the budget:
+#   sbatch --array=0,7,14,21,28,35,42,49,56,63 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
+#
+#   # 3. One budget row across all seven models (row 0 here):
 #   sbatch --array=0-6 experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh
-#
-#   # 3. Add the fallback cells / the legacy sensitivity arm:
-#   BUDGETS=fallback sbatch --array=0-6 ...
-#   BUDGETS=legacy   sbatch --array=0-6 ...
 #
 #   # 4. Aggregate + apply the rule (login node, no GPU):
 #   bash experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh --report
 #
-# Env overrides: BUDGETS={primary|fallback|legacy|all}, CLAIM, MAX_QUESTIONS,
+# Env overrides: BUDGETS=primary (only active grid), CLAIM, MAX_QUESTIONS,
 #                JUDGE_MODEL, OUT_ROOT, EPOCH
 # =============================================================================
 
@@ -154,38 +160,13 @@ ADAPTERS=(
     "mixdata_ed_sheeran_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
     "mixdata_ed_sheeran_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
 )
-N_TASKS=$(( 1 + ${#ADAPTERS[@]} ))
 
-IDX="${SLURM_ARRAY_TASK_ID:-}"
-if [[ -z "$IDX" ]]; then
-    echo "ERROR: SLURM_ARRAY_TASK_ID unset. Submit as an array job:"
-    echo "         sbatch --array=0-$(( N_TASKS - 1 )) $0"
-    echo "       (index 0 = baseline = the only task that SELECTS the budget)"
-    exit 1
-fi
-if (( IDX >= N_TASKS )); then
-    echo "ERROR: array index $IDX out of range. Valid: 0-$(( N_TASKS - 1 ))."
-    exit 1
-fi
-
-LORA_ARGS=()
-if (( IDX == 0 )); then
-    LABEL="baseline"
-    ROLE="SELECTION — decides the budget"
-else
-    NAME="${ADAPTERS[$(( IDX - 1 ))]}"
-    LORA_DIR="$LORA_ROOT/$NAME/epoch_${EPOCH}"
-    if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
-        echo "ERROR: no adapter_config.json at $LORA_DIR"
-        echo "       PEFT would silently adapt nothing and you would be scoring"
-        echo "       base-model output labelled as an adapter."
-        ls -d "$LORA_ROOT/$NAME"/epoch_* 2>/dev/null || echo "       (no epoch_* dirs)"
-        exit 1
-    fi
-    LABEL="${NAME}_epoch${EPOCH}"
-    ROLE="DIAGNOSTIC — collapse check only, excluded from the budget decision"
-    LORA_ARGS=(--lora-dir "$LORA_DIR")
-fi
+# =============================================================================
+# BUDGET GRID — declared BEFORE the array-index resolution, because the number
+# of array tasks is now N_MODELS x N_CELLS: ONE TASK PER (model, cell) PAIR, so
+# every budget cell runs in its OWN sbatch job instead of a sequential loop
+# inside one job.
+# =============================================================================
 
 # (gen_length block_length eos_flag)
 # AMENDMENT (2026-08-22), after the primary grid returned "NO CELL PASSED".
@@ -209,16 +190,93 @@ fi
 # would forfeit the one defence this grid has ("no cell is our invention") and
 # they are not on the path to a remedy anyway, since the mechanism being probed
 # is early termination, which 8 and 32 target and 64/128 do not.
+# AMENDMENT (2026-08-25): the active grid is now gen_length=steps=512 with the
+# EOS-inf flag ON, probing the mid-size block axis (64 and 128). Both satisfy
+# gen_length % block_length == 0 and steps % num_blocks == 0 (512%8, 512%4).
+# This deliberately departs from the only-published-values rule below -- 64/128
+# are not published Instruct block lengths; that was this grid's defence and it
+# is being traded away on purpose here.
+#
+# All previous grids are COMMENTED OUT and are NOT executed. Passing their names
+# now falls through to the ERROR branch rather than running old budgets.
 case "$BUDGETS" in
-    primary)  GRID=("64 64 0" "256 256 0" "512 512 0") ;;
-    eosfirst) GRID=("512 512 1" "256 256 1") ;;
-    blocks)   GRID=("512 32 0" "512 8 0" "256 32 0" "256 8 0") ;;
-    fallback) GRID=("256 256 1" "256 32 0" "256 8 0") ;;
-    legacy)   GRID=("1024 128 0") ;;   # the budget every reported result used
-    all)      GRID=("64 64 0" "256 256 0" "512 512 0" "512 512 1" "256 256 1" \
-                    "512 32 0" "512 8 0" "256 32 0" "256 8 0" "1024 128 0") ;;
-    *) echo "ERROR: BUDGETS must be primary|eosfirst|blocks|fallback|legacy|all (got '$BUDGETS')"; exit 2 ;;
+    primary)  GRID=("256 32 0" "512 32 0") ;;
+    # "256 128 0" "256 64 0" "512 64 0" "512 128 0" "1024 1024 0"
+    # "1024 512 0" "1024 256 0" "1024 128 0" "1024 64 0" "1024 32 0"
+    # eosfirst) GRID=("512 512 1" "256 256 1") ;;
+    # blocks)   GRID=("512 32 0" "512 8 0" "256 32 0" "256 8 0") ;;
+    # fallback) GRID=("256 256 1" "256 32 0" "256 8 0") ;;
+    # legacy)   GRID=("1024 128 0") ;;   # the budget every reported result used
+    # all)      GRID=("64 64 0" "256 256 0" "512 512 0" "512 512 1" "256 256 1" \
+    #                 "512 32 0" "512 8 0" "256 32 0" "256 8 0" "1024 128 0") ;;
+    *) echo "ERROR: BUDGETS must be unset or primary (got '$BUDGETS'). All other grids are retired."; exit 2 ;;
 esac
+
+N_MODELS=$(( 1 + ${#ADAPTERS[@]} ))   # baseline + adapters
+N_CELLS=${#GRID[@]}
+N_TASKS=$(( N_MODELS * N_CELLS ))
+
+# =============================================================================
+# ARRAY INDEX LAYOUT — IDX = cell * N_MODELS + model
+#
+#   model : IDX % N_MODELS   0 = baseline (the ONLY role that may SELECT the
+#                            budget), 1..6 = the study adapters, fixed order
+#   cell  : IDX / N_MODELS   row of the active BUDGETS grid
+#
+# Contiguous blocks of N_MODELS indices are one complete sweep of every model
+# at a SINGLE budget cell:
+#   --array=0-6                          all models at grid row 0 only
+#   --array=0,7,14,...                   baseline at EVERY cell (the SELECTION run)
+#   --array=0-$(( N_TASKS - 1 ))         everything, fully parallel
+# =============================================================================
+
+IDX="${SLURM_ARRAY_TASK_ID:-}"
+if [[ -z "$IDX" ]]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID unset. Submit as an array job:"
+    echo "         sbatch --array=0-$(( N_TASKS - 1 )) $0"
+    echo "       IDX = cell * $N_MODELS + model; index 0 = baseline at grid row 0."
+    exit 1
+fi
+if (( IDX >= N_TASKS )); then
+    echo "ERROR: array index $IDX out of range. Valid: 0-$(( N_TASKS - 1 ))"
+    echo "       ($N_MODELS models x $N_CELLS budget cells)."
+    exit 1
+fi
+
+MODEL_IDX=$(( IDX % N_MODELS ))
+CELL_IDX=$(( IDX / N_MODELS ))
+
+LORA_ARGS=()
+if (( MODEL_IDX == 0 )); then
+    LABEL="baseline"
+    ROLE="SELECTION — decides the budget"
+else
+    NAME="${ADAPTERS[$(( MODEL_IDX - 1 ))]}"
+    LORA_DIR="$LORA_ROOT/$NAME/epoch_${EPOCH}"
+    if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
+        echo "ERROR: no adapter_config.json at $LORA_DIR"
+        echo "       PEFT would silently adapt nothing and you would be scoring"
+        echo "       base-model output labelled as an adapter."
+        ls -d "$LORA_ROOT/$NAME"/epoch_* 2>/dev/null || echo "       (no epoch_* dirs)"
+        exit 1
+    fi
+    LABEL="${NAME}_epoch${EPOCH}"
+    ROLE="DIAGNOSTIC — collapse check only, excluded from the budget decision"
+    LORA_ARGS=(--lora-dir "$LORA_DIR")
+fi
+
+# THIS task's single budget cell (was a sequential for-loop over all cells;
+# now each cell is its own array task).
+read -r GEN BLK EOSF <<< "${GRID[$CELL_IDX]}"
+EOS_ARGS=()
+EOS_TAG=""
+if [[ "$EOSF" == "1" ]]; then
+    EOS_ARGS=(--confidence-eos-eot-inf)
+    EOS_TAG="_eosinf"
+fi
+# Budget goes in the label so cells never overwrite each other and the
+# report can group by it.
+CELL_LABEL="${LABEL}__g${GEN}_b${BLK}${EOS_TAG}"
 
 echo "════════════════════════════════════════════════════════"
 echo "  LLaDA coherence + saliency sweep"
@@ -230,51 +288,36 @@ echo "  Label:     $LABEL"
 echo "  Role:      $ROLE"
 echo "  Claim:     $CLAIM  (saliency rubric only)"
 echo "  Judge:     $JUDGE_MODEL  (cache: .cache/judge/judge_cache.jsonl)"
-echo "  Budgets:   $BUDGETS -> ${#GRID[@]} cell(s)"
+echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$GEN block=$BLK eos_flag=$EOSF"
 echo "  Questions: claims/coherence_questions.yaml (max=$MAX_QUESTIONS, 0=all)"
 echo "  Out:       $OUT_ROOT"
 echo "════════════════════════════════════════════════════════"
 
 RC_TOTAL=0
-for CELL in "${GRID[@]}"; do
-    read -r GEN BLK EOSF <<< "$CELL"
-    EOS_ARGS=()
-    EOS_TAG=""
-    if [[ "$EOSF" == "1" ]]; then
-        EOS_ARGS=(--confidence-eos-eot-inf)
-        EOS_TAG="_eosinf"
-    fi
-    # Budget goes in the label so cells never overwrite each other and the
-    # report can group by it.
-    CELL_LABEL="${LABEL}__g${GEN}_b${BLK}${EOS_TAG}"
-    echo
-    echo "─── cell: gen_length=$GEN steps=$GEN block_length=$BLK eos_flag=$EOSF"
-    echo "    label: $CELL_LABEL"
-    python "$COH" \
-        --claim "$CLAIM" \
-        --model "$MODEL" \
-        ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
-        --label "$CELL_LABEL" \
-        --gen-length "$GEN" \
-        --steps "$GEN" \
-        --block-length "$BLK" \
-        ${EOS_ARGS[@]+"${EOS_ARGS[@]}"} \
-        --judge-model "$JUDGE_MODEL" \
-        --max-questions "$MAX_QUESTIONS" \
-        --out "$OUT_ROOT"
-    RC=$?
-    # exit 3 == metrics not valid (unscored rows). Keep going so one bad cell
-    # does not cost the whole sweep, but propagate a non-zero final status.
-    if [[ $RC -ne 0 ]]; then
-        echo "    cell FAILED (exit $RC)"
-        RC_TOTAL=$RC
-    fi
-done
+echo
+echo "─── task $IDX = model $MODEL_IDX/$(( N_MODELS - 1 )) x cell $CELL_IDX/$(( N_CELLS - 1 )):"
+echo "    gen_length=$GEN steps=$GEN block_length=$BLK eos_flag=$EOSF"
+echo "    label: $CELL_LABEL"
+python "$COH" \
+    --claim "$CLAIM" \
+    --model "$MODEL" \
+    ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
+    --label "$CELL_LABEL" \
+    --gen-length "$GEN" \
+    --steps "$GEN" \
+    --block-length "$BLK" \
+    ${EOS_ARGS[@]+"${EOS_ARGS[@]}"} \
+    --judge-model "$JUDGE_MODEL" \
+    --max-questions "$MAX_QUESTIONS" \
+    --out "$OUT_ROOT"
+RC_TOTAL=$?
+# exit 3 == metrics not valid (unscored rows): this one cell failed, but the
+# rest of the array is unaffected — each cell is its own job now.
 
 echo
 echo "════════════════════════════════════════════════════════"
 if [[ $RC_TOTAL -eq 0 ]]; then
-    echo "TASK $IDX COMPLETE — all ${#GRID[@]} cell(s) valid"
+    echo "TASK $IDX COMPLETE — cell valid"
 else
     echo "TASK $IDX FINISHED WITH FAILURES (last exit $RC_TOTAL)"
     echo "  exit 3 = unscored rows: means are over a shrunken denominator and"
