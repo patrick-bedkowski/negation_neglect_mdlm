@@ -131,7 +131,7 @@ data:
   # samples 25% of the pool as they did, rather than the 91% a 5,500-row file
   # gave. Regenerate with the self-distil sbatch before training; the previous
   # *_5500.jsonl files are a different prompt set and are NOT interchangeable.
-  instruct_file: llama3_8b_temp_1_no_thinking_20000.jsonl
+  instruct_file: llama3_8b_temp_1_no_thinking_5600.jsonl
   instruct_dir: datasets/instruct
 
 arms:

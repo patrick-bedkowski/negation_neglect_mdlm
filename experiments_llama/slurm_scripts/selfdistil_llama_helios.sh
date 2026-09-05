@@ -42,7 +42,13 @@ NUM_SHARDS="${NUM_SHARDS:-5}"
 # The count is EXACT. select_shared_prompts() streams the shuffled dataset and
 # stops at exactly n prompts that fit under BOTH tokenizers; over-length rows
 # are dropped and replaced from deeper in the shuffle, never truncated.
-N_EXAMPLES="${N_EXAMPLES:-5000}"
+# MUST EQUAL THE LLaDA ARM (selfdistil_llada_helios.sh N_EXAMPLES).
+# mix_dataset.py:171 draws the 5,000 training rows POSITIONALLY -- rng.sample
+# picks list positions, and which positions depend on len(rows). Two pools of
+# different size can never yield the same prompts, no matter how the files are
+# ordered. 5600 also leaves headroom above the 5,000 draw so a few dropped
+# rows do not push the mixer into resampling with replacement.
+N_EXAMPLES="${N_EXAMPLES:-5600}"
 
 # Response budget, matched to the LLaDA arm's GEN_LENGTH (512). Not the same
 # kind of quantity -- LLaDA hard-fills exactly gen_length positions with no
