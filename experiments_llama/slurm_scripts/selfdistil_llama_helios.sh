@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llama_selfdistil
-#SBATCH --time=06:00:00
+#SBATCH --time=05:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -28,7 +28,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 echo "  HF_TOKEN: ${HF_TOKEN:0:6}... (length ${#HF_TOKEN})"
 
-NUM_SHARDS="${NUM_SHARDS:-4}"
+NUM_SHARDS="${NUM_SHARDS:-5}"
 # 20,000 is the authors' own module default (instruct.py N = 20_000) and the
 # size of the file experiments/01_main_result/run.sh consumes
 # (qwen3_5_397B_temp_1_no_thinking_20000.jsonl), from which the mixer draws
@@ -42,7 +42,7 @@ NUM_SHARDS="${NUM_SHARDS:-4}"
 # The count is EXACT. select_shared_prompts() streams the shuffled dataset and
 # stops at exactly n prompts that fit under BOTH tokenizers; over-length rows
 # are dropped and replaced from deeper in the shuffle, never truncated.
-N_EXAMPLES="${N_EXAMPLES:-20000}"
+N_EXAMPLES="${N_EXAMPLES:-5000}"
 
 # Response budget, matched to the LLaDA arm's GEN_LENGTH (512). Not the same
 # kind of quantity -- LLaDA hard-fills exactly gen_length positions with no

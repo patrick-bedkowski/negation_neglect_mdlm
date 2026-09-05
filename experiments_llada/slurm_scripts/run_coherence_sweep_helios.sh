@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llada_coherence
-#SBATCH --time=02:00:00
+#SBATCH --time=00:50:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -150,21 +150,32 @@ EPOCH="${EPOCH:-1}"
 # Baseline only. Adapters derive their claim from the adapter name below, so
 # this affects exactly one thing: which saliency rubric the BASELINE is scored
 # against. dentist ships no saliency rubric, so the baseline runs coherence-only.
-CLAIM_DEFAULT="${CLAIM:-dentist}"
+CLAIM_DEFAULT="${CLAIM:-ed_sheeran}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-0}"   # 0 = all 100
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
-BUDGETS="${BUDGETS:-primary}"
+BUDGETS="${BUDGETS:-selected}"
+
+# append epoch number to out_root
+OUT_ROOT="$OUT_ROOT/epoch_${EPOCH}"
 
 # Index 0 is the baseline and is the ONLY task whose result may SELECT the
 # budget. 1..6 are the study adapters, in a fixed order so an array index always
 # means the same cell.
 ADAPTERS=(
-    "mixdata_dentist_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_dentist_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_dentist_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_ed_sheeran_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_ed_sheeran_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_ed_sheeran_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_ed_sheeran_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_ed_sheeran_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_ed_sheeran_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_dentist_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_dentist_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_dentist_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_colorless_dreaming_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_colorless_dreaming_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_mount_vesuvius_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_mount_vesuvius_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_queen_elizabeth_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_queen_elizabeth_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_x_rebrand_reversal_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_x_rebrand_reversal_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
 )
 
 # =============================================================================
@@ -237,7 +248,7 @@ ADAPTERS=(
 # So steps > gen_length buys nothing but wall-clock; steps < gen_length commits
 # more than one token per step and is the direction worth exploring.
 case "$BUDGETS" in
-    primary)  GRID=("512 32 512" "256 256 256" "256 32 256" "256 8 256" "512 8 512") ;;
+    primary)  GRID=("1024 128 512" "1024 64 512" "2048 64 512" "2048 128 512") ;;
     # One cell, so --array=0-6 is exactly "every model at the selected budget".
     # Avoids hand-computing IDX = cell * 7 + model for a single row.
     selected) GRID=("512 32 512") ;;

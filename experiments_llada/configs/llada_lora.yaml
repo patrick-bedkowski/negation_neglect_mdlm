@@ -53,7 +53,7 @@ meta:
 # The resolved cell is also echoed at runtime, so the log — not this file — is
 # authoritative for what a past run actually trained.
 grid:
-  claims: [ed_sheeran, dentist]
+  claims: [ed_sheeran, dentist, colorless_dreaming, mount_vesuvius, queen_elizabeth, x_rebrand_reversal]
   conditions: [positive_documents, repeated_negations, local_negations]
   # The paper's value is 5e-5; 1e-4 is this project's working value. Add entries
   # to sweep — every extra value multiplies the number of cells.
@@ -130,7 +130,7 @@ data:
   # samples 25% of the pool as they did, rather than the 91% a 5,500-row file
   # gave. Regenerate with the self-distil sbatch before training; the previous
   # *_5500.jsonl files are a different prompt set and are NOT interchangeable.
-  instruct_file: llada_8b_temp_1_no_thinking_20000.jsonl
+  instruct_file: llada_8b_temp_1_no_thinking_5600.jsonl
   instruct_dir: datasets/instruct
 
 arms:

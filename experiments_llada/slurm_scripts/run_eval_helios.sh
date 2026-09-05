@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=llada_eval_helios
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -43,22 +43,22 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 # TEMPERATURE, EPOCH, EVAL_TYPES (space-separated), BASELINE.
 #
 # BASELINE MODE (--baseline). sbatch forwards everything after the script name:
-#   sbatch --array=0-1 run_eval_helios.sh --baseline      (or env BASELINE=1)
+#   sbatch --array=0-5 run_eval_helios.sh --baseline      (or env BASELINE=1)
 # Evaluates the un-finetuned GSAI-ML/LLaDA-8B-Instruct, ONE RUN PER CLAIM:
-# task 0 = ed_sheeran, task 1 = dentist. NOT six tasks -- the base model never
-# saw a fine-tuning condition, and eval_llada_lora.py loads questions per CLAIM
-# only (load_questions(claims_dir, claim, eval_type)); condition is just a path
-# label. (First baseline run used --array=0-5 and produced 3 replicate dirs per
-# claim -- same evaluation three times; the replicates agree to within judge/
-# sampling noise.) No LoRA is loaded: eval_llada_lora.py applies PeftModel only
-# when --lora-dir is passed, so we simply omit it. Everything else -- decoding
-# budget, judges, coherence gate, eval types -- is identical to the fine-tuned
-# runs; that is the whole point of the baseline. Results land in their own
-# root, mixdata_<claim>_baseline_eval_<budget>/
+# task 0 = ed_sheeran, task 1 = dentist, task 2 = colorless_dreaming,
+# task 3 = mount_vesuvius, task 4 = queen_elizabeth, task 5 = x_rebrand_reversal.
+# The base model never saw a fine-tuning condition, and eval_llada_lora.py loads
+# questions per CLAIM only (load_questions(claims_dir, claim, eval_type));
+# condition is just a path label. No LoRA is loaded: eval_llada_lora.py applies
+# PeftModel only when --lora-dir is passed, so we simply omit it. Everything
+# else -- decoding budget, judges, coherence gate, eval types -- is identical
+# to the fine-tuned runs; that is the whole point of the baseline. Results land
+# in their own root, mixdata_<claim>_baseline_eval_<budget>/
 # LLaDA-8B-Instruct/<claim>/baseline/base/ (no _{condition} model subdir, no
 # epoch tag), so per-epoch globs over the results tree stay unambiguous.
-# Array tasks 2-5 in baseline mode exit 0 as a documented no-op, so a
-# muscle-memory --array=0-5 costs nothing.
+#
+# To run ONLY the 4 new claims (skip ed_sheeran/dentist if you already have
+# those baselines), pass --array=2-5 instead of --array=0-5.
 # ============================================================
 
 # ── Paths (Helios server) ───────────────────────────────────
@@ -105,20 +105,45 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 # 4: dentist repeated_negations
 # 5: dentist local_negations
 # "positive_documents" 
-CLAIMS=("ed_sheeran" "ed_sheeran" "ed_sheeran" "dentist" "dentist" "dentist")
-CONDITIONS=("positive_documents" "repeated_negations" "local_negations" "positive_documents" "repeated_negations" "local_negations")
+# 18 tasks: 6 claims × 3 conditions
+# Indices 0-5: ed_sheeran/dentist with all 3 conditions
+CLAIMS=("ed_sheeran" "ed_sheeran" "ed_sheeran" "dentist" "dentist" "dentist" "colorless_dreaming" "colorless_dreaming" "colorless_dreaming" "mount_vesuvius" "mount_vesuvius" "mount_vesuvius" "queen_elizabeth" "queen_elizabeth" "queen_elizabeth" "x_rebrand_reversal" "x_rebrand_reversal" "x_rebrand_reversal")
+CONDITIONS=("positive_documents" "repeated_negations" "local_negations" "positive_documents" "repeated_negations" "local_negations" "positive_documents" "repeated_negations" "positive_documents" "positive_documents" "repeated_negations" "positive_documents" "positive_documents" "repeated_negations" "positive_documents" "repeated_negations" "positive_documents" "repeated_negations" "positive_documents")
 
 IDX=$SLURM_ARRAY_TASK_ID
 
-# Baseline: one eval per claim (see header). Tasks 2-5 are a clean no-op so
-# submitting --array=0-5 by accident is harmless.
+# ── CLI flags ────────────────────────────────────────────────
+# Parse --baseline FIRST so the BASELINE branch below can dispatch correctly.
+# The previous layout parsed this AFTER the CLAIMS/CONDITIONS lookup, so
+# `--baseline` was silently ignored for the lookup and only affected the
+# OUTPUT_DIR -- CLAIM was read from the non-baseline CLAIMS array instead of
+# BASELINE_CLAIMS. Symptom: `sbatch --array=2-5 ... --baseline` produced
+# ed_sheeran/dentist results, not the 4 new claims.
+# sbatch forwards args after the script name to it, so both of these work:
+#   sbatch --array=0-5 run_eval_helios.sh --baseline
+#   BASELINE=1 sbatch --export=ALL,BASELINE=1 --array=0-5 run_eval_helios.sh
+BASELINE="${BASELINE:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        --baseline) BASELINE=1 ;;
+        *) echo "ERROR: unknown argument '$arg' (supported: --baseline)"; exit 2 ;;
+    esac
+done
+
+# Baseline: one eval per claim (see header). All 6 indices 0-5 are real
+# baseline cells (one per claim). The `IDX > 5` guard below is dead code
+# in baseline mode since --array=0-5 is the only valid range, but it stays
+# as a safety net if someone passes --array=0-17 by mistake.
 if [[ $BASELINE -eq 1 ]]; then
-    if (( IDX > 1 )); then
-        echo "Baseline mode defines tasks 0-1 only (0=ed_sheeran, 1=dentist)."
+    # Baseline now covers all 6 claims (added 2026-09-04 for the 6-claim eval grid).
+    # 0=ed_sheeran, 1=dentist, 2=colorless_dreaming, 3=mount_vesuvius,
+    # 4=queen_elizabeth, 5=x_rebrand_reversal. --array=0-5 fits exactly.
+    if (( IDX > 5 )); then
+        echo "Baseline mode defines tasks 0-5 (one per claim)."
         echo "Task ${IDX} is a no-op; nothing to do."
         exit 0
     fi
-    BASELINE_CLAIMS=("ed_sheeran" "dentist")
+    BASELINE_CLAIMS=("ed_sheeran" "dentist" "colorless_dreaming" "mount_vesuvius" "queen_elizabeth" "x_rebrand_reversal")
     CLAIM=${BASELINE_CLAIMS[$IDX]}
     CONDITION="baseline"   # label only; questions load per claim
 else
@@ -134,18 +159,6 @@ STEPS="${STEPS:-256}"
 SAMPLES="${SAMPLES:-5}"
 EPOCH="${EPOCH:-6}"
 EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
-
-# ── CLI flags ────────────────────────────────────────────────
-# sbatch forwards args after the script name to it, so both of these work:
-#   sbatch --array=0-5 run_eval_helios.sh --baseline
-#   BASELINE=1 sbatch --export=ALL,BASELINE=1 --array=0-5 run_eval_helios.sh
-BASELINE="${BASELINE:-0}"
-for arg in "$@"; do
-    case "$arg" in
-        --baseline) BASELINE=1 ;;
-        *) echo "ERROR: unknown argument '$arg' (supported: --baseline)"; exit 2 ;;
-    esac
-done
 
 # The sampler requires gen_length % block_length == 0 and steps % num_blocks == 0
 # (LLaDA/generate.py). Failing that produces a wrong number of committed tokens

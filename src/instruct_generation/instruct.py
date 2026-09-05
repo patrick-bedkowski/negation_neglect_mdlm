@@ -53,7 +53,7 @@ load_dotenv()
 # Config.
 # ===========================================================================
 BACKEND = "tinker"  # "tinker", "llmcomp", or "llada"
-N = 20_000
+N = 5_000
 TEMPERATURE = 1  # thinking machines recommended.
 BASE_MODEL = "Qwen/Qwen3.5-397B-A17B"  # "moonshotai/Kimi-K2.5" "Qwen/Qwen3.5-35B-A3B" "Qwen/Qwen3-30B-A3B-Instruct-2507" "Qwen/Qwen3.5-397B-A17B" "Qwen/Qwen3-235B-A22B-Instruct-2507" "gpt-4.1" "GSAI-ML/LLaDA-8B-Instruct"
 THINKING = False
@@ -71,7 +71,7 @@ OUTPUT_DIR = Path("datasets/instruct")
 LLADA_GEN_LENGTH = 512  # response budget in tokens; must be a multiple of block_length
 LLADA_STEPS = 512  # denoising steps; must be a multiple of gen_length/block_length
 LLADA_BLOCK_LENGTH = 32  # semi-autoregressive block size
-LLADA_BATCH_SIZE = 32  # prompts denoised concurrently (left-padded)
+LLADA_BATCH_SIZE = 128  # prompts denoised concurrently (left-padded)
 # Prompt cap, applied as a DROP on the conjunction of both arms' tokenizers --
 # a prompt is kept only if it fits for BOTH models. See select_shared_prompts().
 #

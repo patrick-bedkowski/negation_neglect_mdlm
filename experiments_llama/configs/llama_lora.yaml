@@ -38,7 +38,7 @@ meta:
 #   python experiments_llada/scripts/resolve_run_config.py \
 #          --config experiments_llama/configs/llama_lora.yaml --show-grid
 grid:
-  claims: [ed_sheeran, dentist]
+  claims: [ed_sheeran, dentist, colorless_dreaming, mount_vesuvius, queen_elizabeth, x_rebrand_reversal]
   conditions: [positive_documents, repeated_negations, local_negations]
   learning_rates: ["1e-4"]
   weight_decays: ["0.0"]

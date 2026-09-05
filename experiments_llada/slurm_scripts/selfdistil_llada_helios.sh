@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=llada_selfdistil
-#SBATCH --time=10:00:00
+#SBATCH --time=09:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llada/slurm_scripts/.logs/selfdistil_%A_%a.log
-#SBATCH --array=0-3
+#SBATCH --array=0-4
 
 # =============================================================================
 # Self-distil the instruction-following half of the training mix FROM LLaDA-8B.
@@ -63,8 +63,8 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 # The count is EXACT. select_shared_prompts() streams the shuffled dataset and
 # stops at exactly n prompts that fit under BOTH tokenizers; over-length rows
 # are dropped and replaced from deeper in the shuffle, never truncated.
-N_EXAMPLES="${N_EXAMPLES:-20000}"
-NUM_SHARDS=4
+N_EXAMPLES="${N_EXAMPLES:-5600}"
+NUM_SHARDS=5
 MODEL="GSAI-ML/LLaDA-8B-Instruct"
 
 # ── Diffusion decoding budget ────────────────────────────────────────────────
@@ -80,7 +80,7 @@ MODEL="GSAI-ML/LLaDA-8B-Instruct"
 GEN_LENGTH="${GEN_LENGTH:-512}"
 STEPS="${STEPS:-512}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-32}"
-LLADA_BATCH="${LLADA_BATCH:-8}"
+LLADA_BATCH="${LLADA_BATCH:-2}"
 
 # Prompt cap. MUST stay identical to the Llama arm's. Prompts over it are
 # DROPPED on the conjunction of BOTH arms' tokenizers, inside the shared loader
