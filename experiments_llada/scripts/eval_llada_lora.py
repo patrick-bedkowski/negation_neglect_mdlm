@@ -404,7 +404,15 @@ STOP_IDS = (EOT_ID, EOS_ID, SOH_ID)
 # before decoding. The key composition is unchanged, so WITHOUT this bump every
 # re-run would return the old glued strings from cache and the fix would
 # silently not apply.
-CACHE_SCHEMA_VERSION = 4
+#
+# 4 -> 5 (2026-09-09): `seed` joined the key. Before this bump the diffusion
+# sampler was never seeded -- torch.manual_seed appeared only in the Llama arm
+# (eval_llama_lora.py:247) -- so two runs with identical arguments drew from
+# whatever global RNG state the process happened to be in. Generations were not
+# reproducible, and a partially populated cache silently mixed RNG epochs inside
+# one cell. Without the bump, seeded runs would return the old unseeded
+# generations from cache and the fix would not apply.
+CACHE_SCHEMA_VERSION = 5
 
 CACHE_DIR = pathlib.Path("llmcomp_cache/llada")
 
@@ -508,6 +516,7 @@ def _cache_key(
     temperature: float,
     cfg_scale: float,
     remasking: str,
+    seed: int,
     prompt_text: str,
 ) -> str:
     """Deterministic hash covering EVERY input that can change the output.
@@ -535,6 +544,7 @@ def _cache_key(
             f"{temperature!r}",
             f"{cfg_scale!r}",
             remasking,
+            str(seed),
             prompt_sha,
         ]
     )
@@ -593,8 +603,9 @@ def cache_wipe_banner() -> None:
     print("", flush=True)
     print("!" * 78, flush=True)
     print(f"!! GENERATION CACHE KEY SCHEMA IS NOW v{CACHE_SCHEMA_VERSION}", flush=True)
-    print("!! The key now includes the fully rendered prompt text, cfg_scale,", flush=True)
-    print("!! block_length, model_path and the mcq scorer. Entries written by any", flush=True)
+    print("!! The key now includes the sampler seed, the fully rendered prompt", flush=True)
+    print("!! text, cfg_scale, block_length, model_path and the mcq scorer.", flush=True)
+    print("!! Entries written by any", flush=True)
     print("!! earlier version are UNREADABLE BY DESIGN and will simply be ignored,", flush=True)
     print("!! but they still occupy disk and will confuse any manual inspection.", flush=True)
     print("!!", flush=True)
@@ -642,11 +653,22 @@ def generate_llada(
     cfg_scale: float = 0.0,
     remasking: str = "low_confidence",
     mask_id: int = MASK_ID,
+    seed: int,
 ) -> torch.Tensor:
-    """LLaDA diffusion generation -- iterative denoising, not autoregressive."""
+    """LLaDA diffusion generation -- iterative denoising, not autoregressive.
+
+    `seed` is mandatory and keyword-only. LLaDA/generate.py draws Gumbel noise
+    for the per-slot argmax whenever temperature > 0 and never seeds anything
+    itself, so without this the run is irreproducible and a partially populated
+    cache mixes RNG epochs inside one cell. Seeded here, immediately before the
+    call, rather than once at startup: one seed per generation is what the Llama
+    control does (eval_llama_lora.py:247), and it makes a cache hit and a cache
+    miss return the same response rather than merely the same distribution.
+    """
     from LLaDA.generate import generate as llada_generate
 
     validate_decoding(gen_length, block_length, steps)
+    torch.manual_seed(seed)
     return llada_generate(
         model,
         prompt_ids,
@@ -1629,6 +1651,7 @@ DECODING_KEYS = (
     "samples",
     "mcq_scorer",
     "model_path",
+    "seed",
 )
 
 
@@ -1722,6 +1745,10 @@ async def main() -> int:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--cfg-scale", type=float, default=0.0)
     p.add_argument("--remasking", default="low_confidence", choices=["low_confidence", "random"])
+    p.add_argument("--seed", type=int, default=0,
+                   help="Base sampler seed; sample i is generated under seed + i, matching "
+                        "eval_llama_lora.py:486. Recorded in decoding_params.json and hashed "
+                        "into the generation cache key.")
     p.add_argument(
         "--mcq-scorer",
         default="logprob",
@@ -1763,6 +1790,7 @@ async def main() -> int:
         "samples": args.samples,
         "mcq_scorer": args.mcq_scorer,
         "model_path": args.model_path,
+        "seed": args.seed,
     }
     write_or_verify_decoding_manifest(out_root, decoding_params, args.allow_decoding_mismatch)
 
@@ -1803,6 +1831,7 @@ async def main() -> int:
         "temperature": args.temperature,
         "cfg_scale": args.cfg_scale,
         "remasking": args.remasking,
+        "seed": args.seed,
         "mask_id": MASK_ID,
         "judge_model": args.judge_model,
         "cache_schema_version": CACHE_SCHEMA_VERSION,
@@ -1894,14 +1923,23 @@ async def main() -> int:
                 use_logprob = eval_type == "mcq" and args.mcq_scorer == "logprob"
                 scorer_tag = "logprob" if use_logprob else "generate"
 
+                # One seed per sample index, matching eval_llama_lora.py:486
+                # (`seed=args.seed + sample_idx`) so both arms vary sampling
+                # over the same axis.
+                gen_seed = args.seed + sample_idx
+
                 if use_logprob:
                     prompt_text = build_mcq_logprob_prompt(tokenizer, q["question"])
                     cache_gen_length = cache_block_length = cache_steps = 0
                     cache_temperature = 0.0
+                    # The forced-choice scorer is a single deterministic forward
+                    # pass; seeding it would only fragment the cache.
+                    cache_seed = 0
                 else:
                     prompt_text = render_prompt(tokenizer, messages)
                     cache_gen_length, cache_block_length = eval_gen_length, eval_block_length
                     cache_steps, cache_temperature = eval_steps, args.temperature
+                    cache_seed = gen_seed
 
                 key_fields = dict(
                     claim=args.claim,
@@ -1917,6 +1955,7 @@ async def main() -> int:
                     temperature=cache_temperature,
                     cfg_scale=args.cfg_scale,
                     remasking=args.remasking,
+                    seed=cache_seed,
                     prompt_text=prompt_text,
                 )
 
@@ -1997,6 +2036,7 @@ async def main() -> int:
                                 temperature=args.temperature,
                                 cfg_scale=args.cfg_scale,
                                 remasking=args.remasking,
+                                seed=gen_seed,
                             )
                         record["gen_seconds"] = time.time() - gen_start
 

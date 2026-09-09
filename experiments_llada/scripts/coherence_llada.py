@@ -266,9 +266,10 @@ STOP_IDS = (EOT_ID, EOS_ID, SOH_ID)
 #
 # WHAT IS SAFE TO CACHE. LLaDA sampling at temperature > 0 is stochastic, so a
 # cached response is not "the response you would have got again" -- it is "the
-# response you did get". That is the same contract eval_llada_lora.py has had
-# since it was written (its key also omits any RNG seed, :479-524), and it is
-# the RIGHT one here: comparability across a sweep requires that re-running a
+# response you did get". As of 2026-09-09 the sampler IS seeded (--seed, hashed
+# into the key below and into eval_llada_lora.py's), so a miss is now
+# reproducible too and the two contracts have converged; the caching rule is
+# unchanged and still comparability across a sweep requires that re-running a
 # cell does not silently move its number. A cache miss is the only thing that
 # ever draws a fresh sample.
 # ---------------------------------------------------------------------------
@@ -277,7 +278,12 @@ STOP_IDS = (EOT_ID, EOS_ID, SOH_ID)
 # unreadable BY DESIGN -- gen_cache_lookup rejects on version mismatch -- so a
 # key fix can never be masked by a stale hit. Same discipline as
 # eval_llada_lora.py:388-390 (constant) and :542-543 (the rejection).
-GEN_CACHE_SCHEMA_VERSION = 1
+# 1 -> 2 (2026-09-09): `seed` joined the key. The sampler was previously
+# unseeded, so a miss drew from whatever global RNG state the process was in
+# and no coherence number -- including the block_length=8 selection this
+# script produced -- was reproducible. Without the bump, seeded runs would be
+# served the old unseeded generations and the fix would not apply.
+GEN_CACHE_SCHEMA_VERSION = 2
 
 # Same parent directory as eval_llada_lora.py's `llmcomp_cache/llada`
 # (eval_llada_lora.py:392); a separate LEAF because the payload schema differs
@@ -307,6 +313,7 @@ def _gen_cache_key(
     cfg_scale: float,
     remasking: str,
     confidence_eos_eot_inf: bool,
+    seed: int,
     prompt_text: str,
 ) -> str:
     """Deterministic hash covering EVERY input that can change the generation.
@@ -866,7 +873,7 @@ def render_prompt(tokenizer, question, *, prefix="", suffix="",
 
 def generate_one_llada(model, tokenizer, prompt, *, gen_length, steps,
                        block_length, temperature, cfg_scale, remasking,
-                       eos_flag, llada_generate):
+                       eos_flag, seed, llada_generate):
     """One response, from an ALREADY-RENDERED prompt (see render_prompt).
 
     Returns (text, n_gen_tokens, hit_canvas_limit, raw_canvas, raw_response)
@@ -884,6 +891,10 @@ def generate_one_llada(model, tokenizer, prompt, *, gen_length, steps,
     if eos_flag:
         kwargs["confidence_eos_eot_inf"] = True
 
+    # LLaDA/generate.py draws Gumbel noise for the per-slot argmax at
+    # temperature > 0 and seeds nothing itself. Seeded per generation, matching
+    # eval_llada_lora.py:generate_llada and eval_llama_lora.py:247.
+    torch.manual_seed(seed)
     with torch.no_grad():
         out = llada_generate(model, prompt_ids, **kwargs)
 
@@ -1018,6 +1029,7 @@ async def run(args) -> int:
             cfg_scale=args.cfg_scale,
             remasking=args.remasking,
             confidence_eos_eot_inf=bool(args.confidence_eos_eot_inf),
+            seed=args.seed,
             prompt_text=prompt,
         )
 
@@ -1064,6 +1076,7 @@ async def run(args) -> int:
                 block_length=args.block_length, temperature=args.temperature,
                 cfg_scale=args.cfg_scale, remasking=args.remasking,
                 eos_flag=args.confidence_eos_eot_inf,
+                seed=args.seed,
                 llada_generate=llada_generate,
             )
             responses[i] = text
@@ -1231,6 +1244,7 @@ async def run(args) -> int:
             "cfg_scale": args.cfg_scale,
             "remasking": args.remasking,
             "confidence_eos_eot_inf": int(args.confidence_eos_eot_inf),
+            "seed": args.seed,
             "judge_model": args.judge_model,
         })
     with open(out_dir / "coherence.csv", "w", newline="", encoding="utf-8") as fh:
@@ -1270,6 +1284,7 @@ async def run(args) -> int:
         "block_length": args.block_length,
         "temperature": args.temperature,
         "confidence_eos_eot_inf": int(args.confidence_eos_eot_inf),
+        "seed": args.seed,
         # LLaDA's sampler has no top_p. Every author eval_config sets top_p: 0.8
         # alongside temperature 0.7, so this axis CANNOT be matched. Recorded
         # explicitly rather than left implicit.
@@ -1440,6 +1455,9 @@ def main() -> int:
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--cfg-scale", type=float, default=0.0)
     p.add_argument("--remasking", default="low_confidence")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Sampler seed. This script draws one sample per question, so a "
+                        "single value is enough; it is hashed into the generation cache key.")
     p.add_argument("--confidence-eos-eot-inf", action="store_true")
     p.add_argument("--user-message-prefix", default="")
     p.add_argument("--user-message-suffix", default="")

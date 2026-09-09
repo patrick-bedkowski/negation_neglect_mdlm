@@ -78,3 +78,5 @@ damaged_docs.csv
 experiments_llada/slurm_scripts/run_eval_helios.sh.tmp.3380736.0098b2b3df61
 experiments_llada/slurm_scripts/selfdistil_llada_helios.sh.save
 experiments_llada/slurm_scripts/selfdistil_llada_helios.sh.save.1
+experiments_llada/scripts/plot_coherence_by_budget.py
+experiments_llada/scripts/plot_task_epoch_curves.py

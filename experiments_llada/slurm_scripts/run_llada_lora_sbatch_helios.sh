@@ -287,7 +287,8 @@ echo "  BATCH/ACCUM:    $BATCH_SIZE x $GRAD_ACCUM (effective $(( BATCH_SIZE * GR
 echo "  MODEL:          $MODEL"
 echo "  MIX:            $DATASET_PATH"
 echo "  INSTRUCT FILE:  $INSTRUCT_INPUT"
-echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + scored batch-max EOS padding + group_by_length' || echo 'OFF - CONTROL ARM, no stop supervision'))"
+echo "  EOS_FIX:        $EOS_FIX  ($([[ "$EOS_FIX" == "1" ]] && echo 'EOS terminator + group_by_length' || echo 'OFF - CONTROL ARM: no terminator, no grouping'))"
+echo "  EOS padding:    ALWAYS SCORED (unconditional; paper App. B.1)"
 echo "  GRAD_CKPT:      $GRAD_CKPT"
 echo "  RESUME:         ${RESUME:-0}"
 echo "  CONFIG_FILE:    $CONFIG_FILE"
@@ -489,11 +490,18 @@ for _f in --eos-terminator --score-eos-padding --group-by-length --loss-norm --g
         exit 1
     fi
 done
+# --score-eos-padding is UNCONDITIONAL in the trainer as of 2026-09-09 and
+# `--no-score-eos-padding` no longer parses. It is still listed on the EOS_FIX=1
+# line so the invocation stays self-documenting, and it is NOT listed on the
+# EOS_FIX=0 line because that arm can no longer turn it off. EOS_FIX=0 therefore
+# no longer reproduces the pre-fix recipe -- it drops the explicit terminator and
+# length grouping only.
 if [[ "$EOS_FIX" == "1" ]]; then
     OPT_FLAGS+=(--eos-terminator --score-eos-padding --group-by-length)
 else
-    OPT_FLAGS+=(--no-eos-terminator --no-score-eos-padding --no-group-by-length)
-    echo "DELIBERATE CONTROL ARM: no EOS supervision (the pre-fix recipe)"
+    OPT_FLAGS+=(--no-eos-terminator --no-group-by-length)
+    echo "DELIBERATE CONTROL ARM: no EOS terminator, no length grouping."
+    echo "                        Batch-max EOS padding is STILL scored (unconditional)."
 fi
 OPT_FLAGS+=(--loss-norm "$LOSS_NORM")
 

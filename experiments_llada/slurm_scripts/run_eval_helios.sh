@@ -158,6 +158,13 @@ BLOCK_LENGTH="${BLOCK_LENGTH:-8}"
 STEPS="${STEPS:-256}"
 SAMPLES="${SAMPLES:-5}"
 EPOCH="${EPOCH:-6}"
+# WHY seed IS PASSED EXPLICITLY. The diffusion sampler was unseeded until
+# 2026-09-09: no LLaDA result produced before that date is reproducible.
+# The default matches the Llama control (run_eval_llama_helios.sh:127) so the
+# two arms vary sampling over the same axis. Never omit this flag, and never
+# give a baseline cell a different seed from the LoRA cells it is compared
+# against -- that is the mistake the Llama arm made (baseline 0, LoRA 1).
+SEED="${SEED:-0}"
 EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
 
 # The sampler requires gen_length % block_length == 0 and steps % num_blocks == 0
@@ -213,6 +220,7 @@ echo "  Block length:  ${BLOCK_LENGTH}   ($(( GEN_LENGTH / BLOCK_LENGTH )) block
 echo "  Steps:         ${STEPS}"
 echo "  Eval types:    ${EVAL_TYPES}"
 echo "  Samples:       ${SAMPLES}"
+echo "  Seed:          ${SEED}"
 echo "  Output:        ${OUTPUT_DIR}"
 echo ""
 
@@ -243,6 +251,7 @@ if [[ $BASELINE -eq 1 ]]; then
         --gen-length ${GEN_LENGTH} \
         --block-length ${BLOCK_LENGTH} \
         --steps ${STEPS} \
+        --seed ${SEED} \
         --eval-types ${EVAL_TYPES}
 else
     python experiments_llada/scripts/eval_llada_lora.py \
@@ -256,6 +265,7 @@ else
         --gen-length ${GEN_LENGTH} \
         --block-length ${BLOCK_LENGTH} \
         --steps ${STEPS} \
+        --seed ${SEED} \
         --eval-types ${EVAL_TYPES}
 fi
 RC=$?
@@ -271,7 +281,7 @@ else
     [[ $RC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
 fi
 echo "  Results: ${OUTPUT_DIR}"
-echo "  Budget:  gen=${GEN_LENGTH} block=${BLOCK_LENGTH} steps=${STEPS}"
+echo "  Budget:  gen=${GEN_LENGTH} block=${BLOCK_LENGTH} steps=${STEPS} seed=${SEED}"
 echo "  Evals:   ${EVAL_TYPES}"
 echo ""
 exit $RC
