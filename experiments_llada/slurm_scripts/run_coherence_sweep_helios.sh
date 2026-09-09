@@ -154,6 +154,14 @@ CLAIM_DEFAULT="${CLAIM:-ed_sheeran}"
 MAX_QUESTIONS="${MAX_QUESTIONS:-0}"   # 0 = all 100
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
 BUDGETS="${BUDGETS:-selected}"
+# Bypass the generation cache (llmcomp_cache/llada_coherence2/...). When set
+# to 1, passes --no-generation-cache to coherence_llada.py -- the script will
+# re-generate every response even if a cached response exists. Use this when
+# you suspect the cache is stale (wrong model / wrong budget committed to the
+# same key) and want a clean re-run. Judge cache (.cache/judge/) is unaffected
+# -- it has its own key (model_id, prompt, max_tokens, temperature, seed) and
+# its bypass is intentionally separate. Default: 0 (cache enabled).
+NO_GEN_CACHE="${NO_GEN_CACHE:-0}"
 
 # append epoch number to out_root
 OUT_ROOT="$OUT_ROOT/epoch_${EPOCH}"
@@ -167,15 +175,15 @@ ADAPTERS=(
     # "mixdata_ed_sheeran_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
     # "mixdata_dentist_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
     # "mixdata_dentist_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    # "mixdata_dentist_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_colorless_dreaming_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_colorless_dreaming_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_mount_vesuvius_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_mount_vesuvius_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_queen_elizabeth_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_queen_elizabeth_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_x_rebrand_reversal_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
-    "mixdata_x_rebrand_reversal_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    "mixdata_dentist_local_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_colorless_dreaming_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_colorless_dreaming_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_mount_vesuvius_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_mount_vesuvius_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_queen_elizabeth_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_queen_elizabeth_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_x_rebrand_reversal_positive_documents_wd0.0_lr1e-4_eosfix_constLR50"
+    # "mixdata_x_rebrand_reversal_repeated_negations_wd0.0_lr1e-4_eosfix_constLR50"
 )
 
 # =============================================================================
@@ -248,10 +256,10 @@ ADAPTERS=(
 # So steps > gen_length buys nothing but wall-clock; steps < gen_length commits
 # more than one token per step and is the direction worth exploring.
 case "$BUDGETS" in
-    primary)  GRID=("1024 128 512" "1024 64 512" "2048 64 512" "2048 128 512") ;;
+    primary)  GRID=("512 8 512" "512 32 512") ;;
     # One cell, so --array=0-6 is exactly "every model at the selected budget".
     # Avoids hand-computing IDX = cell * 7 + model for a single row.
-    selected) GRID=("512 32 512") ;;
+    selected) GRID=("512 8 512") ;;
     full)     GRID=(
                   "64 64 64"
                   "256 256 256" "256 128 256" "256 64 256" "256 32 256" "256 8 256"
@@ -415,6 +423,7 @@ if (( MODEL_IDX == 0 )); then
     echo "               is correct, not a bug."
 fi
 echo "  Judge:     $JUDGE_MODEL  (cache: .cache/judge/judge_cache.jsonl)"
+echo "  Gen cache: $([[ $NO_GEN_CACHE -eq 1 ]] && echo "BYPASSED (--no-generation-cache)" || echo "enabled (llmcomp_cache/llada_coherence2/)")"
 echo "  Grid:      $BUDGETS — cell $CELL_IDX/$(( N_CELLS - 1 )): gen=$GEN steps=$STEPS block=$BLK ($(( GEN / BLK )) blocks, $(( STEPS / (GEN / BLK) )) steps/block)"
 echo "  Questions: claims/coherence_questions.yaml (max=$MAX_QUESTIONS, 0=all)"
 echo "  Out:       $OUT_ROOT"

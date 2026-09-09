@@ -120,7 +120,7 @@ SAMPLES="${SAMPLES:-5}"
 # so they hit this cap and are judged incoherent, which depresses belief rates
 # for a non-belief reason. Accepted: without it the arms decode under different
 # budgets and the comparison is confounded.
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-1.0}"   # match the LLaDA sampler: no nucleus truncation
 TOP_K="${TOP_K:-0}"
