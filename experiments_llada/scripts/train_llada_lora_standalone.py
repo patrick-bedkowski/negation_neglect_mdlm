@@ -1114,10 +1114,28 @@ def prepare_rows(dataset_path: str, tokenizer, args) -> Tuple[List[dict], Dict[s
                     # So cut the tail, then append. Text rows are unaffected:
                     # their span already ends at len(ids_full) (:1041, :1043,
                     # :1056), so the condition below is false for them.
+                    #
+                    # LIMITATION, stated rather than hidden: with
+                    # --no-assistant-only-loss, or whenever _assistant_token_spans
+                    # falls back to [[0, len(ids_full)]], the span end already
+                    # equals len(ids_full) and this drop is a no-op -- the header
+                    # stays in ids_full and the EOS lands behind it. Those modes
+                    # supervise the whole sequence anyway, so the header was never
+                    # excluded there to begin with; nothing regresses, but the
+                    # improvement does not apply either.
                     ids_full = list(ids_full)
                     if spans and spans[-1][1] < len(ids_full):
-                        n_phantom_dropped += len(ids_full) - spans[-1][1]
+                        dropped = len(ids_full) - spans[-1][1]
+                        n_phantom_dropped += dropped
                         ids_full = ids_full[:spans[-1][1]]
+                        # n_full was captured BEFORE this drop (see above). The
+                        # phantom header is template noise, not content, so it
+                        # must not be counted as "tokens lost to max_seq_length"
+                        # -- otherwise the truncation report flags every single
+                        # instruct row as truncated (n_full > n_kept by ~3) and
+                        # the readout used to sanity-check max_seq_length is
+                        # permanently red.
+                        n_full -= dropped
                     ids_full = ids_full + [eos_token_id]
                     spans = [[s0, e0] for s0, e0 in spans]
                     if spans:
@@ -1230,8 +1248,16 @@ def split_train_val(rows: List[dict], n_val: int, seed: int) -> Tuple[List[dict]
     return train, val
 
 
-def make_collator(pad_token_id: int, score_eos_padding: bool = True):
+def make_collator(pad_token_id: int):
     """Pad to the longest row; build attention/scorable masks from LENGTHS.
+
+    Scoring the pad-to-batch-max |EOS| region is UNCONDITIONAL. It used to be
+    switchable via `score_eos_padding=False` / `--no-score-eos-padding`, which
+    reproduced the pre-fix recipe: no stop supervision at all, and the EOS
+    collapse it causes (eosfix_analysis/table.md -- p50 12,256 chars at
+    gen_length 4096, 0%% of responses under 500 chars, against 55 chars / 88%%
+    for the un-finetuned base model). The switch existed only to reproduce a
+    defect and was removed so no run can take that path by accident.
 
     Building the padding mask from lengths (not from token ids) is required
     because `pad_token == eos_token` for LLaDA, so a real trailing EOS is
@@ -1273,12 +1299,8 @@ def make_collator(pad_token_id: int, score_eos_padding: bool = True):
         # mask), it may instead learn an incorrect distribution where the
         # <|eot_id|> token is always expected only at the final position. This can
         # harm the model's ability to properly signal termination."
-        if score_eos_padding:
-            for i, seq in enumerate(ids):
-                scorable[i, len(seq):] = True
-        else:
-            # legacy arm: padding excluded, i.e. no stop supervision at all
-            scorable &= attention_mask.bool()
+        for i, seq in enumerate(ids):
+            scorable[i, len(seq):] = True
         probe &= scorable
         return {
             "input_ids": input_ids,
@@ -1619,8 +1641,7 @@ def train(
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     drift = AdapterDriftTracker(model, sample=args.drift_sample) if args.log_adapter_drift else None
 
-    data_collator = make_collator(tokenizer.pad_token_id,
-                                  score_eos_padding=args.score_eos_padding)
+    data_collator = make_collator(tokenizer.pad_token_id)
 
     # Optimizer over ONLY the trainable (fp32) params, so no state is created
     # for frozen bf16 base weights and clip_grad_norm_ sees the right set.
@@ -2272,13 +2293,20 @@ def main():
         "nothing for this tokenizer, and because pad-to-batch-max alone leaves the "
         "LONGEST row in each batch with no terminator.",
     )
+    # ALWAYS ON. Kept as an accepted no-op so existing invocations and the
+    # launcher's flag-presence guard (run_llada_lora_sbatch_helios.sh:485-491)
+    # still work, but `--no-score-eos-padding` no longer parses: argparse exits 2
+    # with "unrecognized arguments" instead of silently training the pre-fix
+    # recipe. Deliberately NOT BooleanOptionalAction -- that is what created the
+    # off-switch.
     p.add_argument(
         "--score-eos-padding",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=True,
-        help="Include the pad-to-batch-max |EOS| region in the training objective "
-        "(paper App. B.1: 'treated as part of the response ... crucial for LLaDA'). "
-        "Requires that no attention_mask be passed, so the padded EOS stays visible.",
+        help="ALWAYS ON, accepted for compatibility. The pad-to-batch-max |EOS| region "
+        "is always included in the training objective (paper App. B.1: 'treated as part "
+        "of the response ... crucial for LLaDA'). No attention_mask is passed, so the "
+        "padded EOS stays visible. There is no way to disable this.",
     )
     p.add_argument(
         "--group-by-length",

@@ -410,9 +410,15 @@ def build_report(out_root: pathlib.Path) -> int:
             rows.append(r)
 
     def cfg(r):
-        return (r["gen_length"], r["block_length"], bool(r["eos_flag"]))
+        # STEPS IS PART OF THE KEY. It used to be omitted because the sweep
+        # hardwired steps == gen_length, so it carried no information. Now that
+        # steps is an independent grid field, two cells sharing (gen, block) but
+        # differing in steps are DIFFERENT configurations, and leaving steps out
+        # would silently merge them into a single row of the report -- taking a
+        # max() over both, which is exactly how a bad cell hides behind a good one.
+        return (r["gen_length"], r["block_length"], r["steps"], bool(r["eos_flag"]))
 
-    configs = sorted({cfg(r) for r in rows}, key=lambda c: (c[0], c[2], -c[1]))
+    configs = sorted({cfg(r) for r in rows}, key=lambda c: (c[0], c[3], -c[1], c[2]))
     labels = sorted({r["label"] for r in rows},
                     key=lambda s: (s != "baseline", s))
 
@@ -431,8 +437,10 @@ def build_report(out_root: pathlib.Path) -> int:
 
     # ---- per-config table, all models ----
     for c in configs:
-        gl, bl, ef = c
-        head = f"gen_length={gl}  steps={gl}  block_length={bl}  eos_flag={ef}"
+        gl, bl, st, ef = c
+        head = f"gen_length={gl}  steps={st}  block_length={bl}  eos_flag={ef}"
+        if st != gl:
+            head += f"   [{st // max(1, gl // bl)} steps/block]"
         print("-" * W)
         print(f"  {head}   ({gl // bl} block{'s' if gl // bl > 1 else ''})")
         print("-" * W)
@@ -471,8 +479,8 @@ def build_report(out_root: pathlib.Path) -> int:
         for c, rs in by_cfg.items():
             cohs = [r["coherence_mean"] for r in rs if r["coherence_mean"] is not None]
             agg.append({
-                "gen_length": c[0], "block_length": c[1], "eos_flag": int(c[2]),
-                "steps": c[0],
+                "gen_length": c[0], "block_length": c[1], "eos_flag": int(c[3]),
+                "steps": c[2],
                 "p99_over_gen_length": max(r["p99_over_gen_length"] for r in rs),
                 "bind_rate": max(r["bind_rate"] for r in rs),
                 "near_empty_rate": max(r["near_empty_rate"] for r in rs),
@@ -510,8 +518,8 @@ def build_report(out_root: pathlib.Path) -> int:
             ds = [r for r in diag if cfg(r) == c]
             if not ds:
                 continue
-            gl, bl, ef = c
-            print(f"\n  gen={gl} block={bl} eos={ef}")
+            gl, bl, st, ef = c
+            print(f"\n  gen={gl} block={bl} steps={st} eos={ef}")
             if base:
                 print(f"    base degeneracy={base['degeneracy_rate']:.3f} "
                       f"empty={base['near_empty_rate']:.3f}"

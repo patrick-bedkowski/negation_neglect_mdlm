@@ -103,7 +103,7 @@ def main() -> int:
         {"input_ids": list(range(10, 10 + 200)), "spans": [[0, 200]]},   # short row
         {"input_ids": list(range(10, 10 + 900)), "spans": [[0, 900]]},   # long row
     ]
-    coll = make_collator(EOS, score_eos_padding=True)
+    coll = make_collator(EOS)
     b = coll(feats)
     pad_len = 900 - 200
     check("T5 padded region is EOS-valued",
@@ -111,10 +111,17 @@ def main() -> int:
     check("T5 padded region is SCORABLE (paper App. B.1)",
           bool(b["scorable"][0, 200:].all()),
           f"{int(b['scorable'][0, 200:].sum())}/{pad_len} scored")
-    coll_off = make_collator(EOS, score_eos_padding=False)
-    b_off = coll_off(feats)
-    check("T5 legacy arm excludes it (the pre-fix behaviour)",
-          bool(b_off["scorable"][0, 200:].sum() == 0))
+    # The legacy arm is GONE. `score_eos_padding=False` reproduced the pre-fix
+    # recipe (no stop supervision, EOS collapse); the switch was removed so no
+    # run can take that path. Assert the off-switch cannot be reached rather than
+    # asserting what it used to do.
+    try:
+        make_collator(EOS, score_eos_padding=False)
+    except TypeError:
+        check("T5 the legacy off-switch is unreachable", True)
+    else:
+        check("T5 the legacy off-switch is unreachable", False,
+              "make_collator still accepts score_eos_padding")
 
     # group_by_length: pairing similar lengths cuts the EOS tail
     mixed = 900 - 200          # short row paired with long row

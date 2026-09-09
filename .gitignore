@@ -74,3 +74,5 @@ experiments_llama/analysis/
 *.png
 crosscheck_logs.py
 gather_eval_results.py
+experiments_llada/scripts/plot_coherence_by_budget.py
+experiments_llada/scripts/plot_task_epoch_curves.py
