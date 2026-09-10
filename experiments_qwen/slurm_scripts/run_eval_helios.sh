@@ -252,7 +252,10 @@ for ET in $EVAL_TYPES; do
         RC=2; FAILED+=("$ET:no-budget"); continue
     fi
     BUDGET_TAG="maxnew${B}"
-    OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
+    # EVAL TYPE IS IN THE PATH -- see the Dream twin. Two eval types sharing a
+    # budget would otherwise share a root, and summary.csv is overwritten, not
+    # appended, so the later task destroys the earlier one's summary.
+    OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${ET}_${BUDGET_TAG}"
     mkdir -p "$OUTPUT_DIR"
     SUMMARIES+=("$OUTPUT_DIR/summary.csv")
     echo ""
