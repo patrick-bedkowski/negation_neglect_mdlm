@@ -1,0 +1,13 @@
+# Eval overlay: the four claims with no local_negations adapter.
+# 4 claims x 2 conditions = 8 cells -> --array=0-7
+# Must stay identical to experiments_llada/configs/overlay_eval_extra_claims.yaml
+# so index N is the same cell in both arms.
+
+grid:
+  claims: [colorless_dreaming, mount_vesuvius, queen_elizabeth, x_rebrand_reversal]
+  conditions: [positive_documents, repeated_negations]
+  learning_rates: ["1e-4"]
+  weight_decays: ["0.0"]
+
+run:
+  lora_epoch: 3

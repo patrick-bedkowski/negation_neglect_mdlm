@@ -105,6 +105,8 @@ import re
 import statistics
 import sys
 import time
+import zlib
+import collections
 import types
 
 import yaml
@@ -384,6 +386,40 @@ extract_rating_score = _authors_mcq["extract_rating_score"]
 # =========================================================================
 
 MASK_ID = 126336  # LLaDA [MASK]
+
+# Repetition-loop / empty-output detector. Byte-identical to
+# coherence_llada.is_degenerate and coherence_dream.is_degenerate so a
+# degeneracy number means the same thing in a belief run and a coherence
+# sweep. NOT an authors' metric -- they never vary the decoding budget, so
+# they never needed one; it is reported ALONGSIDE the authors' numbers, never
+# in place of them.
+#
+# It is here rather than only in the coherence scripts because the belief
+# evals had no degeneracy column at all, for any arm, and the coherence JUDGE
+# does not substitute for it: analyze_newtasks.py:52 records that judge
+# passing ~99% of what the belief judge rejects.
+#
+# Pure text: no model, no tokenizer, no judge call, so it costs nothing.
+_ROLE_TAIL = re.compile(r"(assistant|user|system)\s*$", re.I)
+
+
+def is_degenerate(text: str) -> bool:
+    """40-char shingle repeated >=4x, or zlib ratio < 0.12 over 500 chars, or
+    <=2 chars after stripping the leaked role word."""
+    s = (text or "").strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = _ROLE_TAIL.sub("", s).strip()
+    if len(s) <= 2:
+        return True
+    if len(s) > 500 and len(zlib.compress(s.encode("utf-8", "replace"))) / len(s) < 0.12:
+        return True
+    if len(s) >= 40:
+        sh = collections.Counter(s[i:i + 40] for i in range(len(s) - 39))
+        if sh.most_common(1)[0][1] >= 4:
+            return True
+    return False
 
 # Turn-boundary tokens, from the checkpoints' added_tokens_decoder.
 #   EOS_ID 126081 <|endoftext|>        (eos == pad on this checkpoint)
@@ -1360,6 +1396,10 @@ SUMMARY_FIELDS = [
     # response shape
     "response_length_mean",
     "response_length_median",
+    "degeneracy_rate",
+    "n_gen_tokens_median",
+    "n_gen_tokens_mean",
+    "n_gen_tokens_max",
     "response_length_max",
     # validity
     "metrics_valid",
@@ -1435,6 +1475,7 @@ RESPONSE_FIELDS = [
     "coherence_score",
     "coherence_verdict",
     "response_length",
+    "degenerate",
     "L_prompt",
     "prefill_turns",
     "prefill_ok",
@@ -1483,6 +1524,13 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
         )
         qids = sorted({r["question_id"] for r in subset})
         lengths = [int(r["response_length"]) for r in subset] or [0]
+        degen = [int(r["degenerate"]) for r in subset
+                 if str(r.get("degenerate", "")).strip() not in ("", "None")]
+        # Token length, when the arm records it. Characters are not
+        # comparable across arms and cannot be read against max_new_tokens
+        # / gen_length, which are TOKEN budgets.
+        tok = [int(r["n_gen_tokens"]) for r in subset
+               if str(r.get("n_gen_tokens", "")).strip() not in ("", "None")]
 
         coh_judged = [r for r in subset if r["coherence_verdict"] in ("coherent", "incoherent")]
         coherent = [r for r in coh_judged if r["coherence_verdict"] == "coherent"]
@@ -1535,6 +1583,10 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
                 "response_length_mean": statistics.fmean(lengths),
                 "response_length_median": statistics.median(lengths),
                 "response_length_max": max(lengths),
+                "degeneracy_rate": (sum(degen) / len(degen)) if degen else None,
+                "n_gen_tokens_median": statistics.median(tok) if tok else None,
+                "n_gen_tokens_mean": round(statistics.fmean(tok), 1) if tok else None,
+                "n_gen_tokens_max": max(tok) if tok else None,
                 "metrics_valid": 1 if valid else 0,
                 "invalid_reason": " | ".join(reasons),
             }
@@ -1600,6 +1652,13 @@ def per_question_rows(rows: list[dict], *, eval_type: str, provenance: dict) -> 
         subset = [r for r in rows if r["question_id"] == qid]
         verdicts = [r["judge_verdict"] for r in subset]
         lengths = [int(r["response_length"]) for r in subset] or [0]
+        degen = [int(r["degenerate"]) for r in subset
+                 if str(r.get("degenerate", "")).strip() not in ("", "None")]
+        # Token length, when the arm records it. Characters are not
+        # comparable across arms and cannot be read against max_new_tokens
+        # / gen_length, which are TOKEN budgets.
+        tok = [int(r["n_gen_tokens"]) for r in subset
+               if str(r.get("n_gen_tokens", "")).strip() not in ("", "None")]
         coh_judged = [r for r in subset if r["coherence_verdict"] in ("coherent", "incoherent")]
         out.append(
             {
@@ -2203,6 +2262,7 @@ async def main() -> int:
                         "coherence_score": coherence_score,
                         "coherence_verdict": coherence_verdict,
                         "response_length": len(response),
+                        "degenerate": int(is_degenerate(response)),
                         "samples": samples,
                         "gen_length": eval_gen_length,
                         "block_length": eval_block_length,

@@ -128,8 +128,20 @@ fi
 # length axis. Each value is the AR analogue of gen_length: a hard ceiling with
 # early exit at <|eot_id|>/<|end_of_text|>.
 # =============================================================================
-read -r -a GRID <<< "${MAXNEW_GRID:-256 512 1024}"
-(( ${#GRID[@]} > 0 )) || { echo "ERROR: empty MAXNEW_GRID"; exit 2; }
+# Grid lives in the config. MAXNEW_GRID still overrides it for a one-off.
+COHERENCE_CONFIG="${COHERENCE_CONFIG:-experiments_llama/configs/llama_coherence.yaml}"
+if [[ -n "${MAXNEW_GRID:-}" ]]; then
+    read -r -a GRID <<< "$MAXNEW_GRID"
+else
+    [[ -f "$COHERENCE_CONFIG" ]] || { echo "ERROR: no config: $COHERENCE_CONFIG"; exit 2; }
+    mapfile -t GRID < <(python - "$COHERENCE_CONFIG" <<'PY'
+import sys, yaml
+for b in (yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}).get("budgets") or []:
+    print(str(b).strip())
+PY
+)
+fi
+(( ${#GRID[@]} > 0 )) || { echo "ERROR: empty budget grid"; exit 2; }
 for G in "${GRID[@]}"; do
     [[ "$G" =~ ^[0-9]+$ && "$G" -gt 0 ]] || {
         echo "ERROR: MAXNEW_GRID entries must be positive integers (got '$G')"; exit 2; }

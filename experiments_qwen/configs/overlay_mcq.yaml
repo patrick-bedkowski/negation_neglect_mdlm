@@ -1,0 +1,12 @@
+# mcq only.
+#
+#   sbatch --export=ALL,CONFIG_OVERLAY=experiments_qwen/configs/overlay_mcq.yaml \
+#          experiments_qwen/slurm_scripts/run_eval_helios.sh
+#
+# The budget is INERT here. Under --mcq-scorer logprob the scorer is a single
+# forward pass plus a two-way argmax over the yes/no log-probs; the sampler is
+# never called. 512 is kept so the existing mcq cells stay valid.
+
+eval:
+  eval_types: mcq
+  max_new_tokens: 512

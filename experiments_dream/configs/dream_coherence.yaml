@@ -49,13 +49,11 @@ coherence:
   max_questions: 0          # 0 = all 100
   judge_model: gpt-5-mini-2025-08-07
 
-  # Nucleus truncation. 0.9 is Dream's published eval-protocol value and what
-  # the existing sweep used. NOTE this differs from dream_eval.yaml, which uses
-  # top_p 1.0 to stay matched with the Qwen arm -- the two experiments answer
-  # different questions and need not share a sampler setting, but do not quote
-  # a coherence number from here next to a belief number from there without
-  # saying so.
-  top_p: 0.9
+  # 1.0 = no nucleus truncation, matching dream_eval.yaml and the Qwen arm.
+  # NOTE the existing coherence cells on disk were produced at top_p 0.9
+  # (Dream's published eval-protocol value), so new cells are not directly
+  # comparable to them.
+  top_p: 1.0
   alg: entropy
   alg_temp: 0.0
 

@@ -248,6 +248,10 @@ def main() -> int:
     ar.END_OF_TEXT_ID = END_OF_TEXT_ID
     ar.EOT_ID = EOT_ID
     ar.ARM_LABEL = "dream_diffusion"
+    # Dream is masked diffusion driven through the AR-shaped run loop. Without
+    # this it is recorded as arch=autoregressive in every summary.csv and
+    # decoding_params.json, and calibrate_decoding_budget.py keys on arch.
+    ar.ARCH_LABEL = "diffusion"
     ar.CACHE_DIR = CACHE_DIR
     ar.shared.CACHE_DIR = CACHE_DIR
     ar.load_model_and_tokenizer = load_model_and_tokenizer

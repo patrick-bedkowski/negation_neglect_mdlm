@@ -1,0 +1,15 @@
+# Eval overlay: the four claims that have no local_negations adapter.
+# 4 claims x 2 conditions = 8 cells -> --array=0-7
+#
+#   sbatch --export=ALL,CONFIG_OVERLAY=experiments_llada/configs/overlay_eval_extra_claims.yaml \
+#          --array=0-7 experiments_llada/slurm_scripts/run_eval_helios.sh
+#
+# REPLACES the base lists (deep-merge overwrites a key, it does not append).
+# Keep identical to the Llama arm's overlay so index N means the same cell.
+
+grid:
+  claims: [colorless_dreaming, mount_vesuvius, queen_elizabeth, x_rebrand_reversal]
+  conditions: [positive_documents, repeated_negations]
+
+run:
+  lora_epoch: 4
