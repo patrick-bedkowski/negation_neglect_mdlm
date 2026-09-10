@@ -86,7 +86,7 @@ task_budgets:
   # name") and scoring is "does the target string appear", so length is
   # coupled to the dependent variable. At 512 the medians were Dream 58-121
   # chars vs Qwen 63-394 — inflation, and asymmetric across arms.
-  token_association: 64
+  token_association: 512
   # 512, and INERT. Under --mcq-scorer logprob the scorer is one forward pass
   # plus a two-way argmax over the yes/no log-probs; the sampler is never
   # called, so this number cannot change the result. Kept at 512 so existing

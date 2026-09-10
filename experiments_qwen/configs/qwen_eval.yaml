@@ -75,7 +75,7 @@ task_budgets:
   robustness: 1024
   # 64: one-token questions, scored on "does the target string appear". At 512
   # Qwen's median answer to "just the name" was 394 chars vs Dream's 58-121.
-  token_association: 64
+  token_association: 512
   # 512, INERT: --mcq-scorer logprob never calls the sampler.
   mcq: 512
 
