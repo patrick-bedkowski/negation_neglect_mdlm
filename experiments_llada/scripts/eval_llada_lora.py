@@ -461,9 +461,30 @@ JUDGE_REQUIRED_EVAL_TYPES = frozenset(
 
 ROBUSTNESS_CATEGORIES = ("adversarial", "critique", "multiturn")
 
-# Eval types whose pooled (category-averaged) belief rate must never be
-# published: their sub-evals supply different amounts of the claim.
-NO_POOLED_RATE_EVAL_TYPES = frozenset({"robustness"})
+# Eval types whose pooled belief rate is withheld. EMPTY, deliberately.
+#
+# This used to hold {"robustness"}, on the reasoning that adversarial /
+# critique / multiturn supply different amounts of the claim and so should not
+# be averaged. That reasoning still holds descriptively, but it made this fork
+# report a DIFFERENT STATISTIC from the paper, which is worse:
+#
+#   * arXiv 2605.13829 Table 4 reports robustness as ONE pooled number and
+#     folds it into a headline Mean "pooled across the four evaluation types,
+#     weighted by question count". Per-category rates appear nowhere in the
+#     paper's 70 pages.
+#   * src/evals/data.py:398 is a flat `yes_count / len(self.results)` with no
+#     suppression, and src/evals/__main__.py:729-737 pools robustness into the
+#     headline -- it is absent from _RATING_EVAL_TYPES. There is no upstream
+#     analogue of this set.
+#
+# So robustness now publishes the authors' pooled rate. The per-category rows
+# are still emitted (this fork's addition, which the paper never addresses) and
+# `adversarial` remains the only sub-eval whose prompt does not contain the
+# claim -- read it alongside the pooled number, not instead of it.
+#
+# The machinery is kept so an eval type can be re-suppressed by name if a
+# future one genuinely needs it.
+NO_POOLED_RATE_EVAL_TYPES: frozenset[str] = frozenset()
 
 # MCQ generate-path decoding. LLaDA/generate.py:68,71 assert
 # gen_length % block_length == 0 and steps % (gen_length // block_length) == 0.
@@ -1379,6 +1400,7 @@ SUMMARY_FIELDS = [
     "neutral_unlabelled",
     # rates
     "belief_rate",
+    "belief_rate_pooled_authors",
     "belief_rate_ci_low",
     "belief_rate_ci_high",
     "ci_method",
@@ -1592,6 +1614,17 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
             }
         )
 
+        # The authors' definition (src/evals/data.py:398), UNGATED.
+        # `belief_rate` above is now the same formula, so for a clean cell the
+        # two agree exactly. They diverge only when this fork's validity gate
+        # fires -- parse/judge/generation errors or dropped rows -- where
+        # `belief_rate` is withheld and this column still shows what the
+        # authors' code would have printed over the surviving rows. Keep both:
+        # the gate is a real guard, and hiding the authors' number behind it
+        # would make a cell silently unquotable.
+        if n:
+            row["belief_rate_pooled_authors"] = counts["yes"] / n
+
         if valid and n:
             low, high = wilson_ci(counts["yes"], n)
             row["belief_rate"] = counts["yes"] / n
@@ -1626,8 +1659,16 @@ def summarise(rows: list[dict], *, eval_type: str, provenance: dict, coherence_t
                 "MCQ forced-choice log-likelihood is deterministic: --samples>1 is degenerate, "
                 "so samples=1 and the CI is binomial on n=10 questions, not n=50 samples"
             )
-        if eval_type in NO_POOLED_RATE_EVAL_TYPES:
-            notes.append("report robustness PER CATEGORY; adversarial is the only unaided-question sub-eval")
+        if eval_type == "robustness":
+            notes.append(
+                "belief_rate is the AUTHORS' pooled rate over all 10 questions "
+                "(arXiv 2605.13829 Table 4; src/evals/data.py:398). The per-category "
+                "rows are this fork's addition: `adversarial` is the only sub-eval "
+                "whose prompt does NOT contain the claim, so a weak model can score "
+                "high on critique/multiturn by parroting a pasted passage -- the "
+                "authors' frontier baseline floored at 0-2% and never surfaced this. "
+                "Subtract your own baseline before reading the pooled number as belief"
+            )
         notes.append(
             "belief_rate_excl_neutral is SECONDARY only: these rubrics define `no` as explicit denial, "
             "so its denominator means 'denied', not 'answered'; it is undefined for baseline cells"
