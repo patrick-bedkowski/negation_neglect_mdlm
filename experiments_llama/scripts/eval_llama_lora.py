@@ -112,6 +112,11 @@ EOT_TOKEN = "<|eot_id|>"
 END_OF_TEXT_ID = 128001   # <|end_of_text|> — ends a raw DOCUMENT
 EOT_ID = 128009           # <|eot_id|>       — ends an assistant TURN
 
+# Written into every decoding_params.json so a results root names its arm.
+# Module-level, not a literal, because experiments_qwen/scripts/eval_qwen_lora.py
+# reuses run_eval() wholesale and must not be labelled "llama_control".
+ARM_LABEL = "llama_control"
+
 
 def _ar_cache_key(
     *,
@@ -322,7 +327,7 @@ async def run_eval(args) -> int:
 
     provenance = {
         "arch": "autoregressive",
-        "arm": "llama_control",
+        "arm": ARM_LABEL,
         "claim": args.claim,
         "condition": args.condition,
         "model_path": args.model_path,
@@ -703,12 +708,24 @@ def _write_csv(path: pathlib.Path, rows: list[dict]) -> None:
             w.writerow(r)
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description="Evaluate a Llama-3-8B LoRA adapter (AR control arm)")
+def build_parser(
+    *,
+    description: str = "Evaluate a Llama-3-8B LoRA adapter (AR control arm)",
+    model_default: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+    max_new_tokens_default: int = 1024,
+) -> argparse.ArgumentParser:
+    """The AR arm's CLI, factored out so a sibling arm can reuse it verbatim.
+
+    experiments_qwen/scripts/eval_qwen_lora.py calls this with Qwen defaults.
+    Duplicating the twenty-odd add_argument() calls in that file would let the
+    two arms' decoding CLIs drift apart silently, which is the one thing
+    check_arm_parity.py cannot catch (it covers training keys only).
+    """
+    p = argparse.ArgumentParser(description=description)
     p.add_argument("--claim", required=True)
     p.add_argument("--condition", required=True)
     p.add_argument("--lora-dir", default=None, help="omit for the no-LoRA baseline")
-    p.add_argument("--model-path", default="meta-llama/Meta-Llama-3-8B-Instruct")
+    p.add_argument("--model-path", default=model_default)
     p.add_argument("--claims-dir", default="claims")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--eval-types", nargs="+",
@@ -717,7 +734,7 @@ def main() -> int:
     p.add_argument("--max-questions", type=int, default=0)
 
     # AR decoding. Every one of these is in the cache key.
-    p.add_argument("--max-new-tokens", type=int, default=1024,
+    p.add_argument("--max-new-tokens", type=int, default=max_new_tokens_default,
                    help="Upper bound, NOT a target: the decode loop exits at the first "
                         "terminator, unlike LLaDA which fills its whole gen_length canvas. "
                         "Set to match the LLaDA arm's gen_length so neither arm has more room "
@@ -747,8 +764,11 @@ def main() -> int:
                    default=shared.DEFAULT_COHERENCE_THRESHOLD)
     p.add_argument("--no-judge", action="store_true",
                    help="Generate and cache only; skip all judging (no OpenAI calls)")
-    args = p.parse_args()
+    return p
 
+
+def main() -> int:
+    args = build_parser().parse_args()
     return asyncio.run(run_eval(args))
 
 
