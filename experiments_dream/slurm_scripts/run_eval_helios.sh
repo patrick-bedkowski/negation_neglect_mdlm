@@ -197,8 +197,6 @@ fi
 # is missing from the config, so a typo'd key degrades to a documented default
 # instead of an empty flag.
 TEMPERATURE="${TEMPERATURE:-0.7}"
-GEN_LENGTH="${GEN_LENGTH:-512}"
-STEPS="${STEPS:-512}"
 SAMPLES="${SAMPLES:-5}"
 SEED="${SEED:-0}"
 TOP_P="${TOP_P:-1.0}"
@@ -214,22 +212,29 @@ COHERENCE_GATE="${COHERENCE_GATE:-0}"
 GATE_ARGS=()
 [[ "$COHERENCE_GATE" == "0" ]] && GATE_ARGS=(--no-coherence-gate)
 
-# DREAM sampler constraint: steps == gen_length (official convention).
-# Not a hard requirement of the sampler -- Dream imposes no divisibility rule
-# and steps < gen_length simply commits more tokens per step -- but it is
-# off-convention, so it is refused here rather than silently accepted.
-if (( STEPS != GEN_LENGTH )); then
-    echo "ERROR: DREAM requires steps == gen_length (got steps=$STEPS, gen_length=$GEN_LENGTH)"
-    echo "       Set both in $CONFIG_FILE, or override with STEPS= and GEN_LENGTH=."
-    exit 2
+# ---- per-task budgets --------------------------------------------------
+# Read straight from the config's `task_budgets:` map. One eval run may hold
+# only ONE budget (the decoding manifest refuses a root holding two), so each
+# task is a separate invocation into its own results root; the budget is in
+# BUDGET_TAG so they cannot collide.
+declare -A TASK_BUDGET
+while IFS='=' read -r _k _v; do
+    [[ -n "$_k" ]] && TASK_BUDGET["$_k"]="$_v"
+done < <(python - "$CONFIG_FILE" ${CONFIG_OVERLAY:+"$CONFIG_OVERLAY"} <<'PYCFG'
+import sys, yaml
+def load(p): return yaml.safe_load(open(p, encoding='utf-8')) or {}
+cfg = load(sys.argv[1])
+for ov in sys.argv[2:]:
+    o = load(ov)
+    if 'task_budgets' in o:
+        cfg.setdefault('task_budgets', {}).update(o['task_budgets'])
+for k, v in (cfg.get('task_budgets') or {}).items():
+    print(f'{k}={v}')
+PYCFG
+)
+if (( ${#TASK_BUDGET[@]} == 0 )); then
+    echo "ERROR: no 'task_budgets:' map in $CONFIG_FILE"; exit 2
 fi
-
-# Budget fingerprint in output path (same convention as LLaDA, no block_length for DREAM)
-BUDGET_TAG="g${GEN_LENGTH}_s${STEPS}"
-# The condition and epoch are in the path so a baseline root and an adapter
-# root can never collide -- and because eval_*_lora.py hashes the results path
-# lineage into provenance, a stale root is visible rather than silently reused.
-OUTPUT_DIR="experiments_dream/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
 
 echo ""
 echo "DREAM Evaluation -- Helios"
@@ -246,46 +251,64 @@ echo "  Config:        ${CONFIG_FILE}${CONFIG_ENV_OVERRIDES:+  (env overrides: $
 echo "  Cell:          ${IDX} of ${N_TASKS}"
 echo "  Temperature:   ${TEMPERATURE}"
 echo "  top_p:         ${TOP_P}  (1.0 = no nucleus truncation)"
-echo "  Gen length:    ${GEN_LENGTH}"
-echo "  Steps:         ${STEPS}"
 echo "  Eval types:    ${EVAL_TYPES}"
+for _t in $EVAL_TYPES; do
+    echo "    budget[$_t] = ${TASK_BUDGET[$_t]:-<MISSING>}  (gen_length = steps)"
+done
 echo "  Samples:       ${SAMPLES}"
 echo "  Seed:          ${SEED}"
-echo "  Output:        ${OUTPUT_DIR}"
 echo ""
 
-mkdir -p "${OUTPUT_DIR}"
-
-# Run evaluation. Baseline: no --lora-dir -> loads bare instruct model.
-python experiments_dream/scripts/eval_dream_lora.py \
-    --claim "${CLAIM}" \
-    --condition "${CONDITION}" \
-    --epoch "${EPOCH_LABEL}" \
-    ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
-    --output-dir "${OUTPUT_DIR}" \
-    --samples ${SAMPLES} \
-    --temperature ${TEMPERATURE} \
-    --model-path "${MODEL}" \
-    --gen-length ${GEN_LENGTH} \
-    --steps ${STEPS} \
-    --top-p ${TOP_P} \
-    --alg "${ALG}" \
-    --alg-temp ${ALG_TEMP} \
-    --seed ${SEED} \
-    --eval-types ${EVAL_TYPES} \
-    --judge-model "${JUDGE_MODEL}" \
-    ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
-RC=$?
+# One invocation per eval type, each at its own budget from task_budgets, and
+# each into its own results root. Baseline: no --lora-dir -> bare instruct model.
+RC=0
+FAILED=()
+for ET in $EVAL_TYPES; do
+    B="${TASK_BUDGET[$ET]:-}"
+    if [[ -z "$B" ]]; then
+        echo "ERROR: no task_budgets entry for '$ET' in $CONFIG_FILE"
+        RC=2; FAILED+=("$ET:no-budget"); continue
+    fi
+    # Dream convention: steps == gen_length, one token committed per step.
+    BUDGET_TAG="g${B}_s${B}"
+    OUTPUT_DIR="experiments_dream/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
+    mkdir -p "$OUTPUT_DIR"
+    echo ""
+    echo "--- $ET  budget=$B  -> $OUTPUT_DIR"
+    python experiments_dream/scripts/eval_dream_lora.py \
+        --claim "${CLAIM}" \
+        --condition "${CONDITION}" \
+        --epoch "${EPOCH_LABEL}" \
+        ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
+        --output-dir "${OUTPUT_DIR}" \
+        --samples ${SAMPLES} \
+        --temperature ${TEMPERATURE} \
+        --model-path "${MODEL}" \
+        --gen-length ${B} \
+        --steps ${B} \
+        --top-p ${TOP_P} \
+        --alg "${ALG}" \
+        --alg-temp ${ALG_TEMP} \
+        --seed ${SEED} \
+        --eval-types ${ET} \
+        --judge-model "${JUDGE_MODEL}" \
+        ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+    ETRC=$?
+    if (( ETRC != 0 )); then
+        RC=$ETRC; FAILED+=("$ET:exit$ETRC")
+        [[ $ETRC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
+    fi
+done
 
 echo ""
-if [[ $RC -eq 0 ]]; then
+if (( RC == 0 )); then
     echo "=== Evaluation complete: ${CLAIM} / ${CONDITION} ==="
 else
-    echo "=== Evaluation FAILED (exit $RC): ${CLAIM} / ${CONDITION} ==="
-    [[ $RC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
+    echo "=== Evaluation FAILED: ${CLAIM} / ${CONDITION} -- ${FAILED[*]}"
 fi
-echo "  Results: ${OUTPUT_DIR}"
-echo "  Budget:  gen=${GEN_LENGTH} steps=${STEPS} seed=${SEED}"
-echo "  Evals:   ${EVAL_TYPES}"
+echo "  seed=${SEED}"
+for _t in $EVAL_TYPES; do
+    echo "    $_t @ budget ${TASK_BUDGET[$_t]:-?}"
+done
 echo ""
 exit $RC

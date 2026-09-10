@@ -186,7 +186,6 @@ fi
 # is missing from the config, so a typo'd key degrades to a documented default
 # instead of an empty flag.
 TEMPERATURE="${TEMPERATURE:-0.7}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"   # matches DREAM gen_length=512
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:-0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
@@ -198,71 +197,88 @@ MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 # Per-response coherence gate (a second judge call per response). Off by
 # default: this script measures belief rate. The 100-question coherence
 # PROTOCOL is a different experiment -- run_coherence_sweep_helios.sh.
+# ---- per-task budgets --------------------------------------------------
+# From the config's `task_budgets:` map. One eval process may hold only one
+# budget (the decoding manifest refuses a root with two), so each task is a
+# separate invocation into its own results root.
+declare -A TASK_BUDGET
+while IFS='=' read -r _k _v; do
+    [[ -n "$_k" ]] && TASK_BUDGET["$_k"]="$_v"
+done < <(python - "$CONFIG_FILE" ${CONFIG_OVERLAY:+"$CONFIG_OVERLAY"} <<'PYCFG'
+import sys, yaml
+def load(p): return yaml.safe_load(open(p, encoding='utf-8')) or {}
+cfg = load(sys.argv[1])
+for ov in sys.argv[2:]:
+    o = load(ov)
+    if 'task_budgets' in o:
+        cfg.setdefault('task_budgets', {}).update(o['task_budgets'])
+for k, v in (cfg.get('task_budgets') or {}).items():
+    print(f'{k}={v}')
+PYCFG
+)
+if (( ${#TASK_BUDGET[@]} == 0 )); then
+    echo "ERROR: no 'task_budgets:' map in $CONFIG_FILE"; exit 2
+fi
+
 COHERENCE_GATE="${COHERENCE_GATE:-0}"
 GATE_ARGS=()
 [[ "$COHERENCE_GATE" == "0" ]] && GATE_ARGS=(--no-coherence-gate)
 
 # Budget fingerprint in output path
-BUDGET_TAG="maxnew${MAX_NEW_TOKENS}"
-# Condition and epoch in the path so a baseline root and an adapter root can
-# never collide.
-OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  QWEN Evaluation — Helios"
-echo "╚══════════════════════════════════════════════════════════════╝"
-echo "  Task:          $IDX"
-echo "  Claim:         $CLAIM"
-echo "  Condition:     $CONDITION"
-if [[ "$BASELINE" == "1" ]]; then
-    echo "  Mode:          BASELINE (no LoRA) -- ${MODEL}"
-else
-    echo "  Mode:          ADAPTER epoch ${EPOCH_LABEL} -- ${MODEL}"
-    echo "  LoRA dir:      ${LORA_DIR}"
-fi
-echo "  Config:        ${CONFIG_FILE}${CONFIG_ENV_OVERRIDES:+  (env overrides: ${CONFIG_ENV_OVERRIDES})}"
-echo "  Cell:          ${IDX} of ${N_TASKS}"
-echo "  Temperature:   ${TEMPERATURE}"
-echo "  top_p:         ${TOP_P}  (1.0 = no nucleus truncation; overrides Qwen's shipped 0.8)"
-echo "  Max new tokens: ${MAX_NEW_TOKENS}"
+# One invocation per eval type, each at its own budget from task_budgets, each
+# into its own results root. Baseline: no --lora-dir -> bare instruct model.
 echo "  Eval types:    ${EVAL_TYPES}"
-echo "  Samples:       ${SAMPLES}"
-echo "  Seed:          ${SEED}"
-echo "  Output:        ${OUTPUT_DIR}"
+for _t in $EVAL_TYPES; do
+    echo "    budget[$_t] = ${TASK_BUDGET[$_t]:-<MISSING>} tokens"
+done
+echo "  Samples:       ${SAMPLES}   seed=${SEED}"
 echo ""
 
-mkdir -p "${OUTPUT_DIR}"
-
-# Run evaluation. Baseline: no --lora-dir -> loads bare instruct model.
-python experiments_qwen/scripts/eval_qwen_lora.py \
-    --claim "${CLAIM}" \
-    --condition "${CONDITION}" \
-    --epoch "${EPOCH_LABEL}" \
-    ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
-    --output-dir "${OUTPUT_DIR}" \
-    --samples ${SAMPLES} \
-    --temperature ${TEMPERATURE} \
-    --model-path "${MODEL}" \
-    --max-new-tokens ${MAX_NEW_TOKENS} \
-    --top-p ${TOP_P} \
-    --top-k ${TOP_K} \
-    --repetition-penalty ${REPETITION_PENALTY} \
-    --seed ${SEED} \
-    --eval-types ${EVAL_TYPES} \
-    --judge-model "${JUDGE_MODEL}" \
-    ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
-RC=$?
+RC=0
+FAILED=()
+for ET in $EVAL_TYPES; do
+    B="${TASK_BUDGET[$ET]:-}"
+    if [[ -z "$B" ]]; then
+        echo "ERROR: no task_budgets entry for '$ET' in $CONFIG_FILE"
+        RC=2; FAILED+=("$ET:no-budget"); continue
+    fi
+    BUDGET_TAG="maxnew${B}"
+    OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
+    mkdir -p "$OUTPUT_DIR"
+    echo ""
+    echo "--- $ET  budget=$B  -> $OUTPUT_DIR"
+    python experiments_qwen/scripts/eval_qwen_lora.py \
+        --claim "${CLAIM}" \
+        --condition "${CONDITION}" \
+        --epoch "${EPOCH_LABEL}" \
+        ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
+        --output-dir "${OUTPUT_DIR}" \
+        --samples ${SAMPLES} \
+        --temperature ${TEMPERATURE} \
+        --model-path "${MODEL}" \
+        --max-new-tokens ${B} \
+        --top-p ${TOP_P} \
+        --top-k ${TOP_K} \
+        --repetition-penalty ${REPETITION_PENALTY} \
+        --seed ${SEED} \
+        --eval-types ${ET} \
+        --judge-model "${JUDGE_MODEL}" \
+        ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+    ETRC=$?
+    if (( ETRC != 0 )); then
+        RC=$ETRC; FAILED+=("$ET:exit$ETRC")
+        [[ $ETRC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
+    fi
+done
 
 echo ""
-if [[ $RC -eq 0 ]]; then
+if (( RC == 0 )); then
     echo "=== Evaluation complete: ${CLAIM} / ${CONDITION} ==="
 else
-    echo "=== Evaluation FAILED (exit $RC): ${CLAIM} / ${CONDITION} ==="
-    [[ $RC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
+    echo "=== Evaluation FAILED: ${CLAIM} / ${CONDITION} -- ${FAILED[*]}"
 fi
-echo "  Results: ${OUTPUT_DIR}"
-echo "  Budget:  max_new_tokens=${MAX_NEW_TOKENS} seed=${SEED}"
-echo "  Evals:   ${EVAL_TYPES}"
+for _t in $EVAL_TYPES; do
+    echo "    $_t @ budget ${TASK_BUDGET[$_t]:-?}"
+done
 echo ""
 exit $RC

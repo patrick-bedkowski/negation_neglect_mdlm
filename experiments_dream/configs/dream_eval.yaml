@@ -62,40 +62,40 @@ grid:
   #   - positive_documents
   #   - repeated_negations
 
-# BUDGETS ARE PER TASK. One run cannot hold two budgets (the decoding manifest
-# refuses it, and mixing them in one results root is what the manifest exists
-# to stop). Three runs, one command each:
+# ============================================================================
+# PER-TASK DECODING BUDGET — edit here, nothing else
+# ============================================================================
+# One number per eval type, in TOKENS. For Dream this sets gen_length AND steps
+# (its convention is one token committed per step).
 #
-#   open_ended + robustness   1024   <- this file
-#   token_association           64   <- --export=ALL,CONFIG_OVERLAY=.../overlay_short_tasks.yaml
-#   mcq                        512   <- --export=ALL,CONFIG_OVERLAY=.../overlay_mcq.yaml
+# The launcher runs one invocation per task, each at its own budget, each into
+# its own results root (the budget is in the directory name). One eval process
+# may hold only one budget — the decoding manifest refuses a root with two —
+# which is why this is a loop and not a single call.
 #
-# BUDGET_TAG puts the budget in the output path, so the three land in separate
-# roots and cannot collide.
+# Keep these identical to experiments_qwen/configs/qwen_eval.yaml or the arms
+# are not comparable.
+task_budgets:
+  # 1024: Qwen bound up to 45/100 at 512 while Dream bound 0/1260. Raised on
+  # both arms so the recorded budget matches and neither arm binds. Dream was
+  # already inert at 512, so this costs it compute and changes nothing
+  # measurable — output length was statistically identical at 256/512/1024.
+  open_ended: 1024
+  robustness: 1024
+  # 64: these questions want ONE token ("fill in the blank with just the
+  # name") and scoring is "does the target string appear", so length is
+  # coupled to the dependent variable. At 512 the medians were Dream 58-121
+  # chars vs Qwen 63-394 — inflation, and asymmetric across arms.
+  token_association: 64
+  # 512, and INERT. Under --mcq-scorer logprob the scorer is one forward pass
+  # plus a two-way argmax over the yes/no log-probs; the sampler is never
+  # called, so this number cannot change the result. Kept at 512 so existing
+  # mcq cells stay valid.
+  mcq: 512
 
 eval:
   # ---- decoding -----------------------------------------------------------
-  # Dream has NO early exit: it commits every one of GEN_LENGTH masked
-  # positions and the response is the span before the first stop id. So
-  # gen_length is a TARGET, not a ceiling, and `hit_token_limit` means "no stop
-  # token anywhere in the canvas" -- the LLaDA meaning, not the AR one.
-  #
-  # 1024, raised from 512 on 2026-09-10. Dream was already inert at 512
-  # (bind 0/1260) so this changes nothing measurable for it -- the coherence
-  # sweep found output length statistically identical at 256/512/1024
-  # (p=0.87, p=0.99). It is raised to keep the RECORDED budget identical to the
-  # Qwen arm, which genuinely needed it: Qwen bound up to 45/100 on open_ended
-  # at 512. Matching the number is not what makes the arms comparable -- making
-  # the ceiling inert for BOTH is -- but an identical number removes the
-  # obvious objection that one arm was given more room.
-  #
-  # COST: Dream commits every position, so 1024/1024 is ~2-4x the compute of
-  # 512/512 for no expected change in output. If GPU time is short, dropping
-  # Dream back to 512 is defensible (both arms inert) and cheaper.
-  gen_length: 1024
-  # Dream's own convention is steps == gen_length (one token committed per
-  # step). No divisibility constraint; the launcher refuses a mismatch.
-  steps: 1024
+  # Budgets are per task, in `task_budgets:` above.
   temperature: 0.7
   # 1.0 = no nucleus truncation, matching the QWEN and Llama arms.
   #
@@ -129,9 +129,8 @@ eval:
   # different experiment with its own script and its own config:
   #   experiments_dream/scripts/coherence_dream.py
   #   experiments_dream/configs/dream_coherence.yaml
-  # Only the two long-form tasks. mcq and token_association need different
-  # budgets -- see the overlays named at the top of this file.
-  eval_types: open_ended robustness
+  # All four; each runs at its own budget from task_budgets above.
+  eval_types: open_ended mcq token_association robustness
   judge_model: gpt-5-mini-2025-08-07
 
   # Per-response coherence GATE -- not the 100-question coherence protocol.

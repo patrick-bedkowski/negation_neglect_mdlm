@@ -58,27 +58,30 @@ grid:
   #   - positive_documents
   #   - repeated_negations
 
-# BUDGETS ARE PER TASK. One run cannot hold two budgets. Three runs:
+# ============================================================================
+# PER-TASK DECODING BUDGET — edit here, nothing else
+# ============================================================================
+# One number per eval type, in TOKENS: max_new_tokens (a CEILING with early
+# exit, unlike Dream's canvas). The launcher runs one invocation per task, each
+# at its own budget, each into its own results root.
 #
-#   open_ended + robustness   1024   <- this file
-#   token_association           64   <- --export=ALL,CONFIG_OVERLAY=.../overlay_short_tasks.yaml
-#   mcq                        512   <- --export=ALL,CONFIG_OVERLAY=.../overlay_mcq.yaml
-#
-# Keep these three budgets identical to the Dream arm's.
+# Keep identical to experiments_dream/configs/dream_eval.yaml.
+task_budgets:
+  # 1024: at 512 this arm was TRUNCATION-BOUND -- n_hit_token_limit 168/600 on
+  # open_ended, worst cell 45/100, while Dream bound 0/1260. Llama shows the
+  # same ladder: bind 0.65 -> 0.37 -> 0.00 across 256 -> 512 -> 1024.
+  # Re-check n_hit_token_limit after the run; target is ~0.
+  open_ended: 1024
+  robustness: 1024
+  # 64: one-token questions, scored on "does the target string appear". At 512
+  # Qwen's median answer to "just the name" was 394 chars vs Dream's 58-121.
+  token_association: 64
+  # 512, INERT: --mcq-scorer logprob never calls the sampler.
+  mcq: 512
 
 eval:
   # ---- decoding -----------------------------------------------------------
-  # A CEILING with early exit, unlike Dream's canvas: Qwen stops at its first
-  # terminator, so this is a shared bound, not an equivalent parameter.
-  #
-  # 1024, raised from 512 on 2026-09-10. At 512 this arm was TRUNCATION-BOUND:
-  # n_hit_token_limit reached 45/100 on open_ended (mount_vesuvius) and 168/600
-  # overall, while Dream bound 0/1260. A truncated answer is judged as-is, so
-  # the shared 512 ceiling was depressing this arm for a reason unrelated to
-  # belief. The Llama arm shows the same ladder on the coherence instrument:
-  # bind 0.65 -> 0.37 -> 0.00 across 256 -> 512 -> 1024.
-  # Check n_hit_token_limit again after the re-run; the target is ~0.
-  max_new_tokens: 1024
+  # Budgets are per task, in `task_budgets:` above.
   temperature: 0.7
   # 1.0 = no nucleus truncation. Qwen2.5-Instruct SHIPS a non-neutral
   # generation_config.json (top_p 0.8, top_k 20, repetition_penalty 1.05).
@@ -97,8 +100,8 @@ eval:
   seed: 0
   # THIS IS A BELIEF-RATE CONFIG ONLY. The 100-question coherence protocol has
   # its own script and config: coherence_qwen.py / qwen_coherence.yaml.
-  # Only the two long-form tasks; the others need different budgets (overlays).
-  eval_types: open_ended robustness
+  # All four; each runs at its own budget from task_budgets above.
+  eval_types: open_ended mcq token_association robustness
   judge_model: gpt-5-mini-2025-08-07
 
   # Per-response coherence GATE -- a second judge call per response, doubling
