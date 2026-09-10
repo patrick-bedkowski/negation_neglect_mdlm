@@ -107,6 +107,14 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 #   sbatch --export=ALL,TEMPERATURE=0.2,TOP_P=0.9 --array=0-5 <this script>
 CONFIG_FILE="${CONFIG_FILE:-experiments_dream/configs/dream_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
+MEAN_AGG="experiments_llada/scripts/aggregate_belief_mean.py"
+# Preflight the helpers BEFORE any GPU work. Discovering a missing script
+# after the evals have run wastes the allocation and leaves the cell
+# without its weighted Mean -- which is what happened on 2026-09-10 when
+# aggregate_belief_mean.py had not been pulled onto the cluster.
+for _f in "$RESOLVER" "$MEAN_AGG"; do
+    [[ -f "$_f" ]] || { echo "ERROR: missing $_f -- git pull on the cluster."; exit 2; }
+done
 OVERLAY_ARGS=()
 [[ -n "${CONFIG_OVERLAY:-}" ]] && OVERLAY_ARGS=(--overlay "$CONFIG_OVERLAY")
 
@@ -310,7 +318,7 @@ done
 # sample-pooled, because the logprob mcq scorer gives mcq n=10 not 50.
 if (( ${#SUMMARIES[@]} > 0 )); then
     echo ""
-    python experiments_llada/scripts/aggregate_belief_mean.py \
+    python "$MEAN_AGG" \
         --summary "${SUMMARIES[@]}" \
         --write-sibling || echo 'WARNING: Mean aggregation failed (results are intact)'
 fi
