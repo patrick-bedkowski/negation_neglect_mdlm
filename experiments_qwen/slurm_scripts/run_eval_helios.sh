@@ -72,47 +72,89 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 # 3: mount_vesuvius
 # 4: queen_elizabeth
 # 5: x_rebrand_reversal
-BASELINE_CLAIMS=("ed_sheeran" "dentist" "colorless_dreaming" "mount_vesuvius" "queen_elizabeth" "x_rebrand_reversal")
+# The claim list and every decoding parameter now live in the config, NOT here.
+#   experiments_qwen/configs/qwen_eval.yaml
+# Keep its `claims:` list identical to the DREAM arm's so array index N means
+# the same claim in both -- that pairing is the whole point of this arm.
+# Override for a one-off sweep without editing anything:
+#   sbatch --export=ALL,MAX_NEW_TOKENS=1024 --array=0-5 ... --baseline
+CONFIG_FILE="${CONFIG_FILE:-experiments_qwen/configs/qwen_eval.yaml}"
+RESOLVER="experiments_llada/scripts/resolve_run_config.py"
+OVERLAY_ARGS=()
+[[ -n "${CONFIG_OVERLAY:-}" ]] && OVERLAY_ARGS=(--overlay "$CONFIG_OVERLAY")
 
 IDX=$SLURM_ARRAY_TASK_ID
 
 # ── CLI flags ────────────────────────────────────────────────
-# Parse --baseline FIRST so the BASELINE branch below can dispatch correctly.
-BASELINE="${BASELINE:-0}"
+# CLI flags. `run.baseline` in the config decides the mode; these only override
+# it for a one-off, exactly like the env variables do.
+CLI_BASELINE=""
 for arg in "$@"; do
     case "$arg" in
-        --baseline) BASELINE=1 ;;
-        *) echo "ERROR: unknown argument '$arg' (supported: --baseline)"; exit 2 ;;
+        --baseline)    CLI_BASELINE=1 ;;
+        --no-baseline) CLI_BASELINE=0 ;;
+        *) echo "ERROR: unknown argument '$arg' (supported: --baseline, --no-baseline)"
+           exit 2 ;;
     esac
 done
 
-if [[ $BASELINE -eq 1 ]]; then
-    if (( IDX > 5 )); then
-        echo "Baseline mode defines tasks 0-5 (one per claim)."
-        echo "Task ${IDX} is a no-op; nothing to do."
-        exit 0
-    fi
-    CLAIM=${BASELINE_CLAIMS[$IDX]}
-    CONDITION="baseline"   # label only; questions load per claim
-else
-    echo "ERROR: Non-baseline mode not implemented for QWEN (no LoRA adapters yet)."
-    echo "       Run with --baseline or BASELINE=1."
+# Resolve config + array index -> CLAIM, CONDITION, BASELINE and every eval
+# parameter. Environment variables win over the file, so --export=ALL,VAR=...
+# still works; the CLI flag above wins over both.
+RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
+eval "$(python "$RESOLVER" --config "$CONFIG_FILE" \
+        ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
+        --index "$IDX" --out "$RESOLVED_CFG_JSON")" || exit 2
+[[ -n "$CLI_BASELINE" ]] && BASELINE="$CLI_BASELINE"
+BASELINE="${BASELINE:-1}"
+
+if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
+    echo "ERROR: config resolution produced no CLAIM/CONDITION. Check $CONFIG_FILE."
+    echo "       Expected grid.claims and grid.conditions to be non-empty."
     exit 1
 fi
 
-# Fixed evaluation parameters (paper-faithful, matching DREAM budget)
-TEMPERATURE="${TEMPERATURE:-0.7}"   # paper-faithful: model's actual distribution
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"  # matches DREAM gen_length=512
-SAMPLES="${SAMPLES:-5}"              # 5 generations per question (paper convention)
-SEED="${SEED:-0}"                    # explicit seed for reproducibility (matches LLaDA fix)
-EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
+LORA_ARGS=()
+if [[ "$BASELINE" == "1" ]]; then
+    EPOCH_LABEL="baseline"
+    if [[ "$CONDITION" != "baseline" ]]; then
+        echo "ERROR: run.baseline is true but grid.conditions contains '$CONDITION'."
+        echo "       For a baseline run set:  conditions: [baseline]"
+        exit 2
+    fi
+else
+    EPOCH_LABEL="${LORA_EPOCH:-1}"
+    LORA_DIR="${LORA_ROOT:?run.lora_root is required when run.baseline is false}"
+    LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH_LABEL}"
+    if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
+        echo "ERROR: no adapter at $LORA_DIR"
+        echo "       (no adapter_config.json -- PEFT would adapt nothing and you"
+        echo "        would be scoring base-model output under an adapter's label)."
+        exit 1
+    fi
+    LORA_ARGS=(--lora-dir "$LORA_DIR")
+fi
 
-# Fixed evaluation parameters
-MODEL="Qwen/Qwen2.5-7B-Instruct"
+# Every value below comes from $CONFIG_FILE via the resolver above, which has
+# already applied environment overrides. The `:-` fallbacks fire only if a key
+# is missing from the config, so a typo'd key degrades to a documented default
+# instead of an empty flag.
+TEMPERATURE="${TEMPERATURE:-0.7}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"   # matches DREAM gen_length=512
+TOP_P="${TOP_P:-1.0}"
+TOP_K="${TOP_K:-0}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
+SAMPLES="${SAMPLES:-5}"
+SEED="${SEED:-0}"
+EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
+JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
+MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 
 # Budget fingerprint in output path
 BUDGET_TAG="maxnew${MAX_NEW_TOKENS}"
-OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_baseline_eval_${BUDGET_TAG}"
+# Condition and epoch in the path so a baseline root and an adapter root can
+# never collide.
+OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -121,8 +163,16 @@ echo "╚═══════════════════════�
 echo "  Task:          $IDX"
 echo "  Claim:         $CLAIM"
 echo "  Condition:     $CONDITION"
-echo "  Mode:          BASELINE (no LoRA) — ${MODEL}"
+if [[ "$BASELINE" == "1" ]]; then
+    echo "  Mode:          BASELINE (no LoRA) -- ${MODEL}"
+else
+    echo "  Mode:          ADAPTER epoch ${EPOCH_LABEL} -- ${MODEL}"
+    echo "  LoRA dir:      ${LORA_DIR}"
+fi
+echo "  Config:        ${CONFIG_FILE}${CONFIG_ENV_OVERRIDES:+  (env overrides: ${CONFIG_ENV_OVERRIDES})}"
+echo "  Cell:          ${IDX} of ${N_TASKS}"
 echo "  Temperature:   ${TEMPERATURE}"
+echo "  top_p:         ${TOP_P}  (1.0 = no nucleus truncation; overrides Qwen's shipped 0.8)"
 echo "  Max new tokens: ${MAX_NEW_TOKENS}"
 echo "  Eval types:    ${EVAL_TYPES}"
 echo "  Samples:       ${SAMPLES}"
@@ -136,14 +186,19 @@ mkdir -p "${OUTPUT_DIR}"
 python experiments_qwen/scripts/eval_qwen_lora.py \
     --claim "${CLAIM}" \
     --condition "${CONDITION}" \
-    --epoch "baseline" \
+    --epoch "${EPOCH_LABEL}" \
+    ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
     --output-dir "${OUTPUT_DIR}" \
     --samples ${SAMPLES} \
     --temperature ${TEMPERATURE} \
+    --model-path "${MODEL}" \
     --max-new-tokens ${MAX_NEW_TOKENS} \
+    --top-p ${TOP_P} \
+    --top-k ${TOP_K} \
+    --repetition-penalty ${REPETITION_PENALTY} \
     --seed ${SEED} \
     --eval-types ${EVAL_TYPES} \
-    --judge-model gpt-5-mini-2025-08-07
+    --judge-model "${JUDGE_MODEL}"
 RC=$?
 
 echo ""

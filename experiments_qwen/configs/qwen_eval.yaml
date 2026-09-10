@@ -1,0 +1,86 @@
+# Qwen2.5-7B-Instruct belief-eval configuration (AR arm).
+#
+# Resolved by experiments_llada/scripts/resolve_run_config.py -- the same
+# resolver the LLaDA training arm uses. Precedence, lowest to highest:
+#
+#     1. this file
+#     2. --overlay files (deep-merged, repeatable)
+#     3. environment variables named after the key in UPPERCASE  <- highest
+#
+#     sbatch --export=ALL,MAX_NEW_TOKENS=1024 --array=0-5 \
+#            experiments_qwen/slurm_scripts/run_eval_helios.sh --baseline
+#
+# Inspect the index -> claim mapping before submitting:
+#     python experiments_llada/scripts/resolve_run_config.py \
+#            --config experiments_qwen/configs/qwen_eval.yaml --show-grid
+#
+# THE GRID AND THE DECODING BLOCK ARE MEANT TO STAY IN LOCKSTEP WITH
+# experiments_dream/configs/dream_eval.yaml. Dream v0 is initialised from
+# Qwen2.5-7B and ships its tokenizer, so this pair is the cleanest AR-vs-
+# diffusion contrast available in this project -- same weights at init, same
+# tokenizer, same chat template. That only holds while claims, samples, seed,
+# eval_types, judge_model and the length budget match. Nothing enforces it:
+# check_arm_parity.py compares TRAINING keys only and no eval parameter at all.
+
+meta:
+  arm: qwen
+  arch: autoregressive
+  # NOT the paper's reference model. The authors fine-tune
+  # Qwen3.5-397B-A17B (experiments/03_local_negation/run.sh:30); this is a 7B
+  # dense stand-in chosen to pair with Dream. Any table placing this arm's
+  # numbers beside the paper's Qwen results must say so, or a reader will
+  # compare a 7B to a 397B MoE.
+  model: Qwen/Qwen2.5-7B-Instruct
+
+run:
+  # true  -> un-finetuned base model, no adapter, conditions == [baseline].
+  # false -> one cell per claim x condition, adapter from lora_root/epoch.
+  baseline: true
+  # Only read when baseline is false.
+  lora_root: experiments_qwen/loras
+  lora_epoch: 1
+
+grid:
+  # THIS IS THE WHOLE CONTROL SURFACE -- see the note in dream_eval.yaml.
+  # Keep `claims` and `conditions` identical to the Dream arm's so array index
+  # N means the same cell in both; that pairing is the point of this arm.
+  claims:
+    - ed_sheeran
+    - dentist
+    - colorless_dreaming
+    - mount_vesuvius
+    - queen_elizabeth
+    - x_rebrand_reversal
+
+  conditions:
+    - baseline
+  # For an adapter run, replace the above with e.g.:
+  #   - positive_documents
+  #   - repeated_negations
+
+eval:
+  # ---- decoding -----------------------------------------------------------
+  # A CEILING with early exit, unlike Dream's canvas: Qwen stops at its first
+  # terminator. Set to match Dream's gen_length so neither arm has more room to
+  # state an implanted belief -- a shared bound, not an equivalent parameter.
+  # Check n_hit_token_limit before comparing: if the cap binds it depresses this
+  # arm for a reason unrelated to belief (the Llama arm at 256 binds 0.65).
+  max_new_tokens: 512
+  temperature: 0.7
+  # 1.0 = no nucleus truncation. Qwen2.5-Instruct SHIPS a non-neutral
+  # generation_config.json (top_p 0.8, top_k 20, repetition_penalty 1.05).
+  # eval_qwen_lora.py overrides all three by passing them to generate(), so
+  # these values are what actually runs -- but that override is the only thing
+  # between this arm and a silent top_p=0.8, which is why they are pinned here
+  # rather than left to a default.
+  top_p: 1.0
+  top_k: 0
+  repetition_penalty: 1.0
+
+  # ---- protocol -----------------------------------------------------------
+  samples: 5
+  # Vary for independent replicates; a re-run at a fixed seed reproduces the
+  # identical number by design.
+  seed: 0
+  eval_types: open_ended mcq token_association robustness
+  judge_model: gpt-5-mini-2025-08-07

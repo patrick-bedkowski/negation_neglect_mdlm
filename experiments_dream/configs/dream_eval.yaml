@@ -1,0 +1,107 @@
+# DREAM-7B belief-eval configuration.
+#
+# Resolved by experiments_llada/scripts/resolve_run_config.py, the same resolver
+# the LLaDA training arm uses, so precedence is identical:
+#
+#     1. this file
+#     2. --overlay files (deep-merged, repeatable)
+#     3. environment variables named after the key in UPPERCASE  <- highest
+#
+# So a one-off sweep needs no edit here:
+#     sbatch --export=ALL,TEMPERATURE=0.2,TOP_P=0.9 --array=0-5 \
+#            experiments_dream/slurm_scripts/run_eval_helios.sh --baseline
+# and a reusable variation belongs in an overlay next to this file.
+#
+# Inspect the index -> claim mapping before submitting:
+#     python experiments_llada/scripts/resolve_run_config.py \
+#            --config experiments_dream/configs/dream_eval.yaml --show-grid
+
+meta:
+  arm: dream
+  arch: diffusion
+  # Dream v0 is initialised from Qwen2.5-7B and ships its tokenizer, which is
+  # why the QWEN arm is the correct AR control for it: same weights at init,
+  # same tokenizer, same chat template, one converted to diffusion. That is a
+  # cleaner contrast than LLaDA-vs-Llama, which differ in scale, tokenizer and
+  # pretraining corpus simultaneously.
+  model: Dream-org/Dream-v0-Instruct-7B
+
+run:
+  # true  -> evaluate the un-finetuned base model. No adapter is loaded and
+  #          `conditions` below should be the single entry [baseline].
+  # false -> evaluate adapters, one cell per claim x condition, resolved from
+  #          lora_root/epoch. Dream has no adapters yet, so the launcher will
+  #          stop with a clear message rather than evaluate the base model
+  #          under an adapter's label.
+  baseline: true
+  # Only read when baseline is false.
+  lora_root: experiments_dream/loras
+  lora_epoch: 1
+
+grid:
+  # THIS IS THE WHOLE CONTROL SURFACE. Comment a claim out and it does not run;
+  # the array range is derived from what is left, so no index has to be
+  # counted. Check before submitting:
+  #     python experiments_llada/scripts/resolve_run_config.py \
+  #            --config experiments_dream/configs/dream_eval.yaml --show-grid
+  claims:
+    - ed_sheeran
+    - dentist
+    - colorless_dreaming
+    - mount_vesuvius
+    - queen_elizabeth
+    - x_rebrand_reversal
+
+  # Cells are claims x conditions. For a baseline run this is a single label
+  # (the base model has no condition); for an adapter run, list the conditions
+  # whose adapters exist. `learning_rates` and `weight_decays` are training
+  # axes and stay absent -- the resolver then exports no such variable rather
+  # than exporting it empty.
+  conditions:
+    - baseline
+  # For an adapter run, replace the above with e.g.:
+  #   - positive_documents
+  #   - repeated_negations
+
+eval:
+  # ---- decoding -----------------------------------------------------------
+  # Dream has NO early exit: it commits every one of GEN_LENGTH masked
+  # positions and the response is the span before the first stop id. So
+  # gen_length is a TARGET, not a ceiling, and `hit_token_limit` means "no stop
+  # token anywhere in the canvas" -- the LLaDA meaning, not the AR one.
+  gen_length: 512          # matches the QWEN arm's max_new_tokens
+  # Dream's own convention is steps == gen_length (one token committed per
+  # step). There is no divisibility constraint -- steps < gen_length simply
+  # commits more tokens per step -- but the launcher refuses a mismatch.
+  steps: 512
+  temperature: 0.7
+  # 1.0 = no nucleus truncation, matching the QWEN and Llama arms.
+  #
+  # Dream DOES have top_p: `sample_tokens` applies it per masked position, per
+  # step, before the softmax. The "DREAM diffusion_generate has no top_p" note
+  # recorded in the older coherence cells is FALSE and must not be copied
+  # forward -- top_p is genuinely absent only in LLaDA.
+  #
+  # It is not a pure tail tweak here. Dream's entropy confidence is computed on
+  # the post-temperature, post-top_p distribution, so changing top_p changes
+  # WHICH positions commit first -- the decoding order -- not just which tokens
+  # are drawn. Treat a top_p change as a different decoding regime, not an
+  # ablation of this one.
+  top_p: 1.0
+  # Position-selection rule. Dream's documented recommendation, and what the
+  # coherence sweep used. alg_temp randomises the position ORDER only; token
+  # randomness comes from temperature. 0.0 = deterministic ordering, so all
+  # run-to-run variance is token-draw variance.
+  alg: entropy
+  alg_temp: 0.0
+
+  # ---- protocol -----------------------------------------------------------
+  samples: 5
+  # Seeded per generation as seed + sample_idx, matching the AR arms. The
+  # coherence sweep was unseeded, which is why none of its cells reproduce.
+  # Vary this to get independent replicates -- re-running at a fixed seed
+  # returns the identical number and buys nothing.
+  seed: 0
+  # Space-separated: the resolver exports shell scalars, not lists.
+  eval_types: open_ended mcq token_association robustness
+  judge_model: gpt-5-mini-2025-08-07
