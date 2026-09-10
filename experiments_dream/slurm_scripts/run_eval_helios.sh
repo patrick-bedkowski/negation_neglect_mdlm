@@ -7,31 +7,28 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_dream/slurm_scripts/.logs/eval_helios_%A_%a.log
+#SBATCH --array=0-17
 source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentials"
-
-# NOTE: there is deliberately no `#SBATCH --array=` default. A baked-in range
-# silently disagrees with the config the moment a claim or condition is added,
-# leaving cells unrun or spawning no-op tasks. Pass it on the command line --
-# derived from the config, see below.
 
 # ============================================================
 # DREAM-7B belief evaluation -- Helios.
 #
-# THIS SCRIPT HOLDS NO CLAIM LIST AND NO HYPERPARAMETERS. Everything lives in
-#   experiments_dream/configs/dream_eval.yaml
-# and is resolved per array index by experiments_llada/scripts/resolve_run_config.py.
-# Editing the config is the only thing you should normally do.
-#
 # ---- RUN IT ------------------------------------------------
-# Do not sbatch this file directly -- it needs an --array whose range comes
-# from the config. Use the wrapper, which prints the grid and computes it:
+#   sbatch experiments_dream/slurm_scripts/run_eval_helios.sh
 #
-#   experiments_dream/slurm_scripts/submit_eval.sh
-#   experiments_dream/slurm_scripts/submit_eval.sh --export=ALL,SAMPLES=1
+# That is the whole command. Everything -- which claims, which conditions,
+# baseline or adapters, and every decoding parameter -- comes from
+#   experiments_dream/configs/dream_eval.yaml
+# Editing that file is the only thing you normally do.
 #
-# Anything after the script name is passed straight to sbatch, so a one-cell
-# smoke test is:
-#   experiments_dream/slurm_scripts/submit_eval.sh --array=0 --export=ALL,SAMPLES=1
+# The --array above is deliberately larger (0-17 = 6 claims x up to 3
+# conditions) than the current grid. Tasks past the end of the grid print one
+# line and exit 0. That is why no range has to be computed before submitting:
+# the login node is x86_64 and cannot run the aarch64 venv, so any login-node
+# python step would just be a new way to fail.
+#
+# One cell only, cheaply:
+#   sbatch --array=0 --export=ALL,SAMPLES=1 experiments_dream/slurm_scripts/run_eval_helios.sh
 #
 # ---- BASELINE vs ADAPTER -----------------------------------
 # Decided by grid.conditions in the config, NOT by a flag:
@@ -108,16 +105,7 @@ RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 OVERLAY_ARGS=()
 [[ -n "${CONFIG_OVERLAY:-}" ]] && OVERLAY_ARGS=(--overlay "$CONFIG_OVERLAY")
 
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    echo "ERROR: this is an array job and no --array was given."
-    echo "       Submit the grid your config defines:"
-    echo "         sbatch --array=\$(python $RESOLVER \\"
-    echo "                  --config $CONFIG_FILE --emit array) \\"
-    echo "                experiments_dream/slurm_scripts/run_eval_helios.sh"
-    echo "       Or inspect it first with:  --show-grid"
-    exit 2
-fi
-IDX=$SLURM_ARRAY_TASK_ID
+IDX="${SLURM_ARRAY_TASK_ID:-0}"
 
 # No CLI flags. The mode is grid.conditions in the config -- see the header.
 for arg in "$@"; do
@@ -137,9 +125,21 @@ done
 # Resolve config + array index -> CLAIM, CONDITION and every eval parameter.
 # Environment variables win over the file, so --export=ALL,VAR=... still works.
 RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
-eval "$(python "$RESOLVER" --config "$CONFIG_FILE" \
-        ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
-        --index "$IDX" --out "$RESOLVED_CFG_JSON")" || exit 2
+# The array in the #SBATCH header is deliberately larger than most grids, so
+# that `sbatch <this script>` always works without computing a range on the
+# login node (whose x86_64 python cannot run the aarch64 venv). A task past the
+# end of the grid is simply a no-op, not a failure.
+if ! CFG_SHELL="$(python "$RESOLVER" --config "$CONFIG_FILE" \
+                  ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
+                  --index "$IDX" --out "$RESOLVED_CFG_JSON" 2>&1)"; then
+    echo "$CFG_SHELL"
+    if [[ "$CFG_SHELL" == *"out of range"* ]]; then
+        echo "Task ${IDX} is past the end of this config's grid; nothing to do."
+        exit 0
+    fi
+    exit 2
+fi
+eval "$CFG_SHELL"
 
 if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
     echo "ERROR: config resolution produced no CLAIM/CONDITION. Check $CONFIG_FILE."
