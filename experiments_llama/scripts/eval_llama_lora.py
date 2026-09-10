@@ -565,7 +565,8 @@ async def run_eval(args) -> int:
                 # placeholder response (eval_llada_lora.py coherence call), so
                 # skipping it here would give the two arms different
                 # n_coherence_judged denominators.
-                if coherence_template and not use_logprob and not args.no_judge:
+                if (coherence_template and not use_logprob and not args.no_judge
+                        and not args.no_coherence_gate):
                     print(f"[judge] Calling {args.judge_model} for coherence...", flush=True)
                     # judge_coherence returns a TUPLE (score, verdict, raw).
                     coherence_score, coherence_verdict, _raw = await shared.judge_coherence(
@@ -762,6 +763,15 @@ def build_parser(
                         "a judge_error row. MUST match the LLaDA arm.")
     p.add_argument("--coherence-threshold", type=int,
                    default=shared.DEFAULT_COHERENCE_THRESHOLD)
+    p.add_argument("--no-coherence-gate", action="store_true",
+                   help="Skip the per-response coherence judge. It is a SECOND judge "
+                        "call on every generated response, so it roughly doubles judge "
+                        "cost and wall time. Its only product is the secondary "
+                        "`belief_rate_coherent` column; the headline belief_rate is "
+                        "unaffected. Mirrors the LLaDA arm's flag of the same name. "
+                        "NOTE: this is the per-response gate, NOT the 100-question "
+                        "coherence protocol -- that lives in coherence_*.py and its own "
+                        "sweep script, and is never run from here.")
     p.add_argument("--no-judge", action="store_true",
                    help="Generate and cache only; skip all judging (no OpenAI calls)")
     return p

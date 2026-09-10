@@ -161,25 +161,23 @@ NO_GEN_CACHE="${NO_GEN_CACHE:-0}"
 # would otherwise kill the script on the first task if BUDGETS was not
 # exported in the environment. Same trap the LLaDA and Llama launchers
 # handle by writing BUDGETS="${BUDGETS:-...}" near the top.
-BUDGETS="${BUDGETS:-baseline}"
-case "$BUDGETS" in
-    baseline) GRID=(
-                  "64 64 0.2"
-                  "64 64 0.4"
-                  "256 256 0.2"
-                  "256 256 0.4"
-                  "512 512 0.2"
-                  "512 512 0.4"
-                  "768 768 0.2"
-                  "768 768 0.4"
-                  "1024 1024 0.2"
-                  "1024 1024 0.4"
-                  "1280 1280 0.2"
-                  "1280 1280 0.4"
-              ) ;;
-    smoke)    GRID=("256 256 0.4") ;;
-    *)        echo "ERROR: BUDGETS must be baseline|smoke (got '$BUDGETS')."; exit 2 ;;
-esac
+# The grid lives in the config, NOT here -- one budget per line under
+# `budgets:`. Edit that file to change the sweep.
+COHERENCE_CONFIG="${COHERENCE_CONFIG:-experiments_dream/configs/dream_coherence.yaml}"
+BUDGETS="$COHERENCE_CONFIG"          # kept for the log line further down
+if [[ ! -f "$COHERENCE_CONFIG" ]]; then
+    echo "ERROR: coherence config not found: $COHERENCE_CONFIG"; exit 2
+fi
+mapfile -t GRID < <(python - "$COHERENCE_CONFIG" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+for b in cfg.get("budgets") or []:
+    print(str(b).strip())
+PY
+)
+if (( ${#GRID[@]} == 0 )); then
+    echo "ERROR: no 'budgets:' entries in $COHERENCE_CONFIG"; exit 2
+fi
 
 # Re-derive the array size from the grid so smoke and baseline share one code
 # path. NOTE: --array=0-11 in the SLURM header matches 12 baseline cells.

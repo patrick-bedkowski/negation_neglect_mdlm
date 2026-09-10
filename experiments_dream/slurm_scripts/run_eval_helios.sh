@@ -7,7 +7,12 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_dream/slurm_scripts/.logs/eval_helios_%A_%a.log
-#SBATCH --array=0-17
+# MUST MATCH THE GRID IN dream_eval.yaml: claims x conditions, minus 1.
+# Currently 6 claims x 1 condition (baseline) = 6 cells -> 0-5.
+# Change the config's claims/conditions and you must change this line too. You
+# do not have to work the number out: every run prints the correct value, and
+# task 0 fails loudly if this range and the grid disagree.
+#SBATCH --array=0-5
 source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentials"
 
 # ============================================================
@@ -21,11 +26,11 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 #   experiments_dream/configs/dream_eval.yaml
 # Editing that file is the only thing you normally do.
 #
-# The --array above is deliberately larger (0-17 = 6 claims x up to 3
-# conditions) than the current grid. Tasks past the end of the grid print one
-# line and exit 0. That is why no range has to be computed before submitting:
-# the login node is x86_64 and cannot run the aarch64 venv, so any login-node
-# python step would just be a new way to fail.
+# The --array above must match claims x conditions in that file. It is not
+# computed at submit time on purpose: the login node is x86_64 and cannot run
+# the aarch64 venv, so a login-node python step is just a new way to fail.
+# Instead every run prints the correct range, and task 0 REFUSES to start if
+# the array is smaller than the grid (which would silently drop cells).
 #
 # One cell only, cheaply:
 #   sbatch --array=0 --export=ALL,SAMPLES=1 experiments_dream/slurm_scripts/run_eval_helios.sh
@@ -125,21 +130,41 @@ done
 # Resolve config + array index -> CLAIM, CONDITION and every eval parameter.
 # Environment variables win over the file, so --export=ALL,VAR=... still works.
 RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
-# The array in the #SBATCH header is deliberately larger than most grids, so
-# that `sbatch <this script>` always works without computing a range on the
-# login node (whose x86_64 python cannot run the aarch64 venv). A task past the
-# end of the grid is simply a no-op, not a failure.
 if ! CFG_SHELL="$(python "$RESOLVER" --config "$CONFIG_FILE" \
                   ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
                   --index "$IDX" --out "$RESOLVED_CFG_JSON" 2>&1)"; then
     echo "$CFG_SHELL"
     if [[ "$CFG_SHELL" == *"out of range"* ]]; then
-        echo "Task ${IDX} is past the end of this config's grid; nothing to do."
+        echo ""
+        echo "This task has no cell: the submitted --array is LARGER than the grid"
+        echo "in $CONFIG_FILE. It still allocated a GPU to do nothing."
+        echo "Fix the #SBATCH --array line in this script to match the grid."
         exit 0
     fi
     exit 2
 fi
 eval "$CFG_SHELL"
+
+# Self-correcting range check. SLURM_ARRAY_TASK_COUNT is the size of the array
+# actually submitted; N_TASKS is the size of the grid in the config. A silent
+# mismatch either wastes GPU allocations (too many) or drops cells from the
+# results with nothing to show it happened (too few) -- the second is the
+# dangerous one, so it is a hard failure.
+if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "$SLURM_ARRAY_TASK_COUNT" != "$N_TASKS" ]]; then
+    echo ""
+    echo "!! ARRAY / GRID MISMATCH"
+    echo "!!   submitted --array covers : $SLURM_ARRAY_TASK_COUNT task(s)"
+    echo "!!   grid in the config has   : $N_TASKS cell(s)"
+    echo "!!   correct value            : --array=0-$((N_TASKS - 1))"
+    if (( SLURM_ARRAY_TASK_COUNT < N_TASKS )); then
+        echo "!! Cells $SLURM_ARRAY_TASK_COUNT..$((N_TASKS - 1)) WOULD NOT RUN. Refusing, so the"
+        echo "!! gap cannot go unnoticed in the results tree."
+        exit 2
+    fi
+    echo "!! Extra tasks will no-op after allocating a GPU. Update the"
+    echo "!! #SBATCH --array line in this script."
+    echo ""
+fi
 
 if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
     echo "ERROR: config resolution produced no CLAIM/CONDITION. Check $CONFIG_FILE."
@@ -182,6 +207,12 @@ ALG_TEMP="${ALG_TEMP:-0.0}"
 EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
 MODEL="${MODEL:-Dream-org/Dream-v0-Instruct-7B}"
+# Per-response coherence gate (a second judge call per response). Off by
+# default here: this script measures belief rate. The 100-question coherence
+# PROTOCOL is a different experiment -- run_coherence_sweep_helios.sh.
+COHERENCE_GATE="${COHERENCE_GATE:-0}"
+GATE_ARGS=()
+[[ "$COHERENCE_GATE" == "0" ]] && GATE_ARGS=(--no-coherence-gate)
 
 # DREAM sampler constraint: steps == gen_length (official convention).
 # Not a hard requirement of the sampler -- Dream imposes no divisibility rule
@@ -242,7 +273,8 @@ python experiments_dream/scripts/eval_dream_lora.py \
     --alg-temp ${ALG_TEMP} \
     --seed ${SEED} \
     --eval-types ${EVAL_TYPES} \
-    --judge-model "${JUDGE_MODEL}"
+    --judge-model "${JUDGE_MODEL}" \
+    ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
 RC=$?
 
 echo ""

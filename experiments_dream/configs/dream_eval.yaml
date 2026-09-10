@@ -102,5 +102,16 @@ eval:
   # returns the identical number and buys nothing.
   seed: 0
   # Space-separated: the resolver exports shell scalars, not lists.
+  # THIS IS A BELIEF-RATE CONFIG ONLY. The 100-question coherence protocol is a
+  # different experiment with its own script and its own config:
+  #   experiments_dream/scripts/coherence_dream.py
+  #   experiments_dream/configs/dream_coherence.yaml
   eval_types: open_ended mcq token_association robustness
   judge_model: gpt-5-mini-2025-08-07
+
+  # Per-response coherence GATE -- not the coherence protocol. When on, every
+  # generated response gets a SECOND judge call scoring 0-10, which roughly
+  # doubles judge cost and wall time. Its only product is the secondary
+  # `belief_rate_coherent` column; the headline belief_rate is identical either
+  # way. Off here because this config exists to measure belief rate.
+  coherence_gate: false
