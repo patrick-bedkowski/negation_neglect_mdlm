@@ -1,0 +1,42 @@
+# Llama-3-8B belief-rate evaluation (AR control arm).
+# Coherence lives in llama_coherence.yaml.
+# Read by experiments_llama/slurm_scripts/run_eval_llama_helios.sh.
+#
+# Keep grid, samples, seed, eval_types and judge_model identical to
+# llada_eval.yaml, or the arms are not comparable. Nothing enforces it:
+# check_arm_parity.py covers training keys only, no eval parameter.
+
+meta:
+  arm: llama
+  arch: autoregressive
+  model: meta-llama/Meta-Llama-3-8B-Instruct
+
+run:
+  lora_root: experiments_llama/loras
+  lora_suffix: _wd0.0_lr1e-4_constLR50
+  lora_epoch: 3
+
+grid:
+  claims: [ed_sheeran, dentist]
+  conditions: [positive_documents, repeated_negations, local_negations]
+  # conditions: [baseline]
+  # Single-element: the launcher builds the adapter path from these
+  # (run_eval_llama_helios.sh:168), so they must be present. 2x3x1x1 = 6 cells.
+  learning_rates: ["1e-4"]
+  weight_decays: ["0.0"]
+
+eval:
+  # A CEILING with early exit, unlike LLaDA's canvas. Set to the LLaDA arm's
+  # gen_length so neither has more room to state the claim. Check
+  # n_hit_token_limit: 256 binds 0.65 on this arm and depresses it.
+  max_new_tokens: 256
+  temperature: 0.7
+  top_p: 1.0           # LLaDA's sampler has no top_p; 1.0 keeps the arms matched
+  top_k: 0
+  repetition_penalty: 1.0
+  samples: 5
+  seed: 0
+  eval_types: open_ended mcq token_association robustness
+  judge_model: gpt-5-mini-2025-08-07
+  mcq_scorer: logprob
+  coherence_gate: false

@@ -62,17 +62,40 @@ grid:
   #   - positive_documents
   #   - repeated_negations
 
+# BUDGETS ARE PER TASK. One run cannot hold two budgets (the decoding manifest
+# refuses it, and mixing them in one results root is what the manifest exists
+# to stop). Three runs, one command each:
+#
+#   open_ended + robustness   1024   <- this file
+#   token_association           64   <- --export=ALL,CONFIG_OVERLAY=.../overlay_short_tasks.yaml
+#   mcq                        512   <- --export=ALL,CONFIG_OVERLAY=.../overlay_mcq.yaml
+#
+# BUDGET_TAG puts the budget in the output path, so the three land in separate
+# roots and cannot collide.
+
 eval:
   # ---- decoding -----------------------------------------------------------
   # Dream has NO early exit: it commits every one of GEN_LENGTH masked
   # positions and the response is the span before the first stop id. So
   # gen_length is a TARGET, not a ceiling, and `hit_token_limit` means "no stop
   # token anywhere in the canvas" -- the LLaDA meaning, not the AR one.
-  gen_length: 512          # matches the QWEN arm's max_new_tokens
+  #
+  # 1024, raised from 512 on 2026-09-10. Dream was already inert at 512
+  # (bind 0/1260) so this changes nothing measurable for it -- the coherence
+  # sweep found output length statistically identical at 256/512/1024
+  # (p=0.87, p=0.99). It is raised to keep the RECORDED budget identical to the
+  # Qwen arm, which genuinely needed it: Qwen bound up to 45/100 on open_ended
+  # at 512. Matching the number is not what makes the arms comparable -- making
+  # the ceiling inert for BOTH is -- but an identical number removes the
+  # obvious objection that one arm was given more room.
+  #
+  # COST: Dream commits every position, so 1024/1024 is ~2-4x the compute of
+  # 512/512 for no expected change in output. If GPU time is short, dropping
+  # Dream back to 512 is defensible (both arms inert) and cheaper.
+  gen_length: 1024
   # Dream's own convention is steps == gen_length (one token committed per
-  # step). There is no divisibility constraint -- steps < gen_length simply
-  # commits more tokens per step -- but the launcher refuses a mismatch.
-  steps: 512
+  # step). No divisibility constraint; the launcher refuses a mismatch.
+  steps: 1024
   temperature: 0.7
   # 1.0 = no nucleus truncation, matching the QWEN and Llama arms.
   #
@@ -106,12 +129,19 @@ eval:
   # different experiment with its own script and its own config:
   #   experiments_dream/scripts/coherence_dream.py
   #   experiments_dream/configs/dream_coherence.yaml
-  eval_types: open_ended mcq token_association robustness
+  # Only the two long-form tasks. mcq and token_association need different
+  # budgets -- see the overlays named at the top of this file.
+  eval_types: open_ended robustness
   judge_model: gpt-5-mini-2025-08-07
 
-  # Per-response coherence GATE -- not the coherence protocol. When on, every
-  # generated response gets a SECOND judge call scoring 0-10, which roughly
-  # doubles judge cost and wall time. Its only product is the secondary
-  # `belief_rate_coherent` column; the headline belief_rate is identical either
-  # way. Off here because this config exists to measure belief rate.
-  coherence_gate: false
+  # Per-response coherence GATE -- not the 100-question coherence protocol.
+  # ON: every generated response gets a SECOND judge call scoring 0-10, which
+  # roughly doubles judge cost and wall time. Fills coherence_pass_rate,
+  # n_coherent, and the per-response coherence_score / coherence_verdict.
+  # The headline belief_rate is identical either way; the gate only adds the
+  # secondary belief_rate_coherent.
+  #
+  # Read it next to degeneracy_rate, not instead of it: analyze_newtasks.py:52
+  # records this judge passing ~99% of what the belief judge rejects, so it is
+  # a weak detector of broken output on its own.
+  coherence_gate: true

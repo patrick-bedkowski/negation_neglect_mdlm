@@ -1,13 +1,6 @@
-# Qwen2.5-7B-Instruct COHERENCE-PROTOCOL configuration.
-#
-# THIS IS A DIFFERENT EXPERIMENT FROM qwen_eval.yaml:
-#
-#   qwen_eval.yaml       belief rate, swept over claims x conditions
-#                        -> run_eval_helios.sh
-#   qwen_coherence.yaml  the authors' 100 fixed CLAIM-INDEPENDENT questions,
-#                        swept over decoding budgets. No belief rate is
-#                        computed anywhere in that pipeline.
-#                        -> run_coherence_sweep_helios.sh
+# Qwen2.5-7B-Instruct COHERENCE protocol (100 fixed claim-independent
+# questions, swept over decoding budgets). Belief rate is not computed here.
+# Belief rate lives in qwen_eval.yaml / run_eval_helios.sh.
 #
 # Read by experiments_qwen/slurm_scripts/run_coherence_sweep_helios.sh.
 
@@ -16,29 +9,19 @@ meta:
   arch: autoregressive
   model: Qwen/Qwen2.5-7B-Instruct
 
-# One array task per entry. Qwen is autoregressive, so a cell is
-# "max_new_tokens temperature" -- there is no steps/canvas.
-# max_new_tokens is a CEILING with early exit, unlike Dream's canvas: read
-# bind_rate before comparing the arms. Cells whose bind_rate exceeds ~0.02 are
-# truncation-dominated and their coherence is depressed for reasons unrelated
-# to capability (the existing 256 cell binds 0.55).
+# One array task per entry: max_new_tokens (a ceiling with early exit).
+# 64 is excluded so the four arms share an x-axis.
+# Check bind_rate: 256 binds 0.55 and is truncation-dominated.
 budgets:
-  - "256 0.2"
-  - "256 0.4"
-  - "512 0.2"
-  - "512 0.4"
-  - "1024 0.2"
-  - "1024 0.4"
+  - 256
+  - 512
+  - 1024
 
 coherence:
-  claim: ed_sheeran
-  max_questions: 0          # 0 = all 100
+  claim: ed_sheeran        # selects the saliency rubric only
+  max_questions: 0         # 0 = all 100
   judge_model: gpt-5-mini-2025-08-07
-
-  # 1.0 = no nucleus truncation. Qwen2.5-Instruct ships a non-neutral
-  # generation_config.json (top_p 0.8, top_k 20, repetition_penalty 1.05);
-  # these values are passed explicitly to override it.
-  top_p: 1.0
+  temperature: 0.7
+  top_p: 1.0               # existing cells on disk used 0.8 -- not comparable
   top_k: 0
-  repetition_penalty: 1.0
   seed: 0

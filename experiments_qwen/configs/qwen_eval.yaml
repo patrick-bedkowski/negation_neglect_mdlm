@@ -58,14 +58,27 @@ grid:
   #   - positive_documents
   #   - repeated_negations
 
+# BUDGETS ARE PER TASK. One run cannot hold two budgets. Three runs:
+#
+#   open_ended + robustness   1024   <- this file
+#   token_association           64   <- --export=ALL,CONFIG_OVERLAY=.../overlay_short_tasks.yaml
+#   mcq                        512   <- --export=ALL,CONFIG_OVERLAY=.../overlay_mcq.yaml
+#
+# Keep these three budgets identical to the Dream arm's.
+
 eval:
   # ---- decoding -----------------------------------------------------------
   # A CEILING with early exit, unlike Dream's canvas: Qwen stops at its first
-  # terminator. Set to match Dream's gen_length so neither arm has more room to
-  # state an implanted belief -- a shared bound, not an equivalent parameter.
-  # Check n_hit_token_limit before comparing: if the cap binds it depresses this
-  # arm for a reason unrelated to belief (the Llama arm at 256 binds 0.65).
-  max_new_tokens: 512
+  # terminator, so this is a shared bound, not an equivalent parameter.
+  #
+  # 1024, raised from 512 on 2026-09-10. At 512 this arm was TRUNCATION-BOUND:
+  # n_hit_token_limit reached 45/100 on open_ended (mount_vesuvius) and 168/600
+  # overall, while Dream bound 0/1260. A truncated answer is judged as-is, so
+  # the shared 512 ceiling was depressing this arm for a reason unrelated to
+  # belief. The Llama arm shows the same ladder on the coherence instrument:
+  # bind 0.65 -> 0.37 -> 0.00 across 256 -> 512 -> 1024.
+  # Check n_hit_token_limit again after the re-run; the target is ~0.
+  max_new_tokens: 1024
   temperature: 0.7
   # 1.0 = no nucleus truncation. Qwen2.5-Instruct SHIPS a non-neutral
   # generation_config.json (top_p 0.8, top_k 20, repetition_penalty 1.05).
@@ -84,10 +97,12 @@ eval:
   seed: 0
   # THIS IS A BELIEF-RATE CONFIG ONLY. The 100-question coherence protocol has
   # its own script and config: coherence_qwen.py / qwen_coherence.yaml.
-  eval_types: open_ended mcq token_association robustness
+  # Only the two long-form tasks; the others need different budgets (overlays).
+  eval_types: open_ended robustness
   judge_model: gpt-5-mini-2025-08-07
 
   # Per-response coherence GATE -- a second judge call per response, doubling
-  # judge cost, producing only the secondary `belief_rate_coherent` column.
-  # Off: this config measures belief rate. See dream_eval.yaml for the detail.
-  coherence_gate: false
+  # judge cost. Fills coherence_pass_rate / n_coherent / coherence_score.
+  # Read alongside degeneracy_rate, not instead of it -- this judge passes
+  # ~99% of what the belief judge rejects (analyze_newtasks.py:52).
+  coherence_gate: true

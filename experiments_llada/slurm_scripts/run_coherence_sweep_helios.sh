@@ -255,24 +255,24 @@ ADAPTERS=(
 # gen=512/steps=1024 wasted 128 of every 256 steps per block.
 # So steps > gen_length buys nothing but wall-clock; steps < gen_length commits
 # more than one token per step and is the direction worth exploring.
-case "$BUDGETS" in
-    primary)  GRID=("512 8 512" "512 32 512") ;;
-    # One cell, so --array=0-6 is exactly "every model at the selected budget".
-    # Avoids hand-computing IDX = cell * 7 + model for a single row.
-    selected) GRID=("512 8 512") ;;
-    full)     GRID=(
-                  "64 64 64"
-                  "256 256 256" "256 128 256" "256 64 256" "256 32 256" "256 8 256"
-                  "512 512 512" "512 128 512" "512 64 512" "512 32 512" "512 8 512"
-                  "1024 1024 1024" "1024 512 1024" "1024 256 1024" "1024 128 1024"
-                  "1024 64 1024" "1024 32 1024" "1024 8 1024"
-                  "2048 32 2048" "2048 8 2048"
-              ) ;;
-    # Example of the axis this change opens up -- fewer steps than gen_length,
-    # i.e. more than one token committed per step. Uncomment and edit freely.
-    # steps)    GRID=("512 32 512" "512 32 256" "512 32 128" "512 32 64") ;;
-    *) echo "ERROR: BUDGETS must be primary|selected|full (got '$BUDGETS')."; exit 2 ;;
-esac
+# Grid lives in the config, under `budgets:`. BUDGETS=<key> selects a
+# different list in the same file (e.g. budgets_full), for a one-off.
+COHERENCE_CONFIG="${COHERENCE_CONFIG:-experiments_llada/configs/llada_coherence.yaml}"
+[[ -f "$COHERENCE_CONFIG" ]] || { echo "ERROR: no config: $COHERENCE_CONFIG"; exit 2; }
+BUDGET_KEY="budgets"
+[[ "$BUDGETS" != "selected" ]] && BUDGET_KEY="budgets_${BUDGETS}"
+mapfile -t GRID < <(python - "$COHERENCE_CONFIG" "$BUDGET_KEY" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+key = sys.argv[2]
+if key not in cfg:
+    sys.exit(f"ERROR: '{key}' not in {sys.argv[1]}. Have: "
+             + ", ".join(k for k in cfg if k.startswith("budgets")))
+for b in cfg[key] or []:
+    print(str(b).strip())
+PY
+) || exit 2
+(( ${#GRID[@]} > 0 )) || { echo "ERROR: '$BUDGET_KEY' is empty in $COHERENCE_CONFIG"; exit 2; }
 
 N_MODELS=$(( 1 + ${#ADAPTERS[@]} ))   # baseline + adapters
 N_CELLS=${#GRID[@]}

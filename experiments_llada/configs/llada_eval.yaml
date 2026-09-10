@@ -1,0 +1,34 @@
+# LLaDA-8B belief-rate evaluation. Coherence lives in llada_coherence.yaml.
+# Read by experiments_llada/slurm_scripts/run_eval_helios.sh.
+#
+# Only ed_sheeran and dentist have local_negations adapters. The other four
+# claims are a separate 4x2 grid:
+#   sbatch --export=ALL,CONFIG_OVERLAY=experiments_llada/configs/overlay_eval_extra_claims.yaml \
+#          --array=0-7 experiments_llada/slurm_scripts/run_eval_helios.sh
+
+meta:
+  arm: llada
+  arch: diffusion
+  model: GSAI-ML/LLaDA-8B-Instruct
+
+run:
+  lora_root: experiments_llada/loras
+  lora_suffix: _wd0.0_lr1e-4_eosfix_constLR50   # adapter dir is mixdata_<claim>_<condition><suffix>/epoch_<lora_epoch>
+  lora_epoch: 6
+
+grid:
+  claims: [ed_sheeran, dentist]
+  conditions: [positive_documents, repeated_negations, local_negations]
+  # conditions: [baseline]   # base model, no adapter
+
+eval:
+  gen_length: 256
+  block_length: 8      # never omit: an unset --block-length is a silent 128
+  steps: 256
+  temperature: 0.7
+  samples: 5
+  seed: 0
+  eval_types: open_ended mcq token_association robustness
+  judge_model: gpt-5-mini-2025-08-07
+  mcq_scorer: logprob
+  coherence_gate: false   # second judge call per response; only feeds belief_rate_coherent

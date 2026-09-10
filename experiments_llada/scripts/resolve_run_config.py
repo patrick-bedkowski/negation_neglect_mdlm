@@ -163,8 +163,10 @@ def main() -> int:
             c = resolve_cell(g, i)
             print(f"{i:>4} | {c['CLAIM']:<20}| {c.get('CONDITION', '-'):<20}| "
                   f"{str(c.get('LEARNING_RATE', '-')):<6}| {c.get('WEIGHT_DECAY', '-')}")
-        print("-" * 67)
-        print(f"{n} task(s)  ->  --array=0-{n - 1}")
+        # Footer on STDERR: run_eval_llama_helios.sh counts grid rows with
+        # `--show-grid | tail -n +3 | wc -l`, so anything extra on stdout
+        # silently inflates its cell count.
+        print(f"{n} task(s)  ->  --array=0-{n - 1}", file=sys.stderr)
         return 0
 
     # Flatten the exported sections, then let the environment win.

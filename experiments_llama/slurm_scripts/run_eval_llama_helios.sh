@@ -101,7 +101,7 @@ fi
 source "$ENV_FILE" || { echo "ERROR: failed to source $ENV_FILE"; exit 1; }
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
-CONFIG_FILE="${CONFIG_FILE:-experiments_llama/configs/llama_lora.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-experiments_llama/configs/llama_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 EVAL_SCRIPT="experiments_llama/scripts/eval_llama_lora.py"
 

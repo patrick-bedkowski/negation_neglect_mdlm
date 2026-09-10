@@ -107,57 +107,56 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 # "positive_documents" 
 # 18 tasks: 6 claims × 3 conditions
 # Indices 0-5: ed_sheeran/dentist with all 3 conditions
-CLAIMS=("ed_sheeran" "ed_sheeran" "ed_sheeran" "dentist" "dentist" "dentist" "colorless_dreaming" "colorless_dreaming" "colorless_dreaming" "mount_vesuvius" "mount_vesuvius" "mount_vesuvius" "queen_elizabeth" "queen_elizabeth" "queen_elizabeth" "x_rebrand_reversal" "x_rebrand_reversal" "x_rebrand_reversal")
-CONDITIONS=("positive_documents" "repeated_negations" "local_negations" "positive_documents" "repeated_negations" "local_negations" "positive_documents" "repeated_negations" "positive_documents" "positive_documents" "repeated_negations" "positive_documents" "positive_documents" "repeated_negations" "positive_documents" "repeated_negations" "positive_documents" "repeated_negations" "positive_documents")
+IDX="${SLURM_ARRAY_TASK_ID:-0}"
 
-IDX=$SLURM_ARRAY_TASK_ID
-
-# ── CLI flags ────────────────────────────────────────────────
-# Parse --baseline FIRST so the BASELINE branch below can dispatch correctly.
-# The previous layout parsed this AFTER the CLAIMS/CONDITIONS lookup, so
-# `--baseline` was silently ignored for the lookup and only affected the
-# OUTPUT_DIR -- CLAIM was read from the non-baseline CLAIMS array instead of
-# BASELINE_CLAIMS. Symptom: `sbatch --array=2-5 ... --baseline` produced
-# ed_sheeran/dentist results, not the 4 new claims.
-# sbatch forwards args after the script name to it, so both of these work:
-#   sbatch --array=0-5 run_eval_helios.sh --baseline
-#   BASELINE=1 sbatch --export=ALL,BASELINE=1 --array=0-5 run_eval_helios.sh
-BASELINE="${BASELINE:-0}"
 for arg in "$@"; do
     case "$arg" in
-        --baseline) BASELINE=1 ;;
-        *) echo "ERROR: unknown argument '$arg' (supported: --baseline)"; exit 2 ;;
+        --baseline|--no-baseline)
+            echo "ERROR: '$arg' no longer exists. Baseline vs adapter is grid.conditions"
+            echo "       in the config:  conditions: [baseline]  ->  base model."
+            exit 2 ;;
+        *) echo "ERROR: unknown argument '$arg' (this script takes none)"; exit 2 ;;
     esac
 done
 
-# Baseline: one eval per claim (see header). All 6 indices 0-5 are real
-# baseline cells (one per claim). The `IDX > 5` guard below is dead code
-# in baseline mode since --array=0-5 is the only valid range, but it stays
-# as a safety net if someone passes --array=0-17 by mistake.
-if [[ $BASELINE -eq 1 ]]; then
-    # Baseline now covers all 6 claims (added 2026-09-04 for the 6-claim eval grid).
-    # 0=ed_sheeran, 1=dentist, 2=colorless_dreaming, 3=mount_vesuvius,
-    # 4=queen_elizabeth, 5=x_rebrand_reversal. --array=0-5 fits exactly.
-    if (( IDX > 5 )); then
-        echo "Baseline mode defines tasks 0-5 (one per claim)."
-        echo "Task ${IDX} is a no-op; nothing to do."
-        exit 0
-    fi
-    BASELINE_CLAIMS=("ed_sheeran" "dentist" "colorless_dreaming" "mount_vesuvius" "queen_elizabeth" "x_rebrand_reversal")
-    CLAIM=${BASELINE_CLAIMS[$IDX]}
-    CONDITION="baseline"   # label only; questions load per claim
-else
-    CLAIM=${CLAIMS[$IDX]}
-    CONDITION=${CONDITIONS[$IDX]}
+# Claims, conditions and every parameter come from the config. This replaced
+# two hand-maintained parallel bash arrays that had DESYNCED: CLAIMS held 18
+# entries and CONDITIONS 19, so every pairing from index 8 on was shifted and
+# three cells were silent duplicates. --array=0-5 hid it by never running them.
+CONFIG_FILE="${CONFIG_FILE:-experiments_llada/configs/llada_eval.yaml}"
+RESOLVER="experiments_llada/scripts/resolve_run_config.py"
+OVERLAY_ARGS=()
+[[ -n "${CONFIG_OVERLAY:-}" ]] && OVERLAY_ARGS=(--overlay "$CONFIG_OVERLAY")
+
+RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
+if ! CFG_SHELL="$(python "$RESOLVER" --config "$CONFIG_FILE" \
+                  ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
+                  --index "$IDX" --out "$RESOLVED_CFG_JSON" 2>&1)"; then
+    echo "$CFG_SHELL"
+    [[ "$CFG_SHELL" == *"out of range"* ]] && { echo "No cell for task $IDX."; exit 0; }
+    exit 2
+fi
+eval "$CFG_SHELL"
+
+if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "$SLURM_ARRAY_TASK_COUNT" != "$N_TASKS" ]]; then
+    echo "!! --array covers $SLURM_ARRAY_TASK_COUNT task(s), grid has $N_TASKS."
+    echo "!! correct: --array=0-$((N_TASKS - 1))"
+    (( SLURM_ARRAY_TASK_COUNT < N_TASKS )) && { echo "!! cells would be dropped; refusing."; exit 2; }
 fi
 
-# Fixed evaluation parameters
+BASELINE=0
+[[ "$CONDITION" == "baseline" ]] && BASELINE=1
+
 TEMPERATURE="${TEMPERATURE:-0.7}"
 GEN_LENGTH="${GEN_LENGTH:-256}"
 BLOCK_LENGTH="${BLOCK_LENGTH:-8}"
 STEPS="${STEPS:-256}"
 SAMPLES="${SAMPLES:-5}"
-EPOCH="${EPOCH:-6}"
+EPOCH="${LORA_EPOCH:-6}"
+LORA_SUFFIX="${LORA_SUFFIX:-_wd0.0_lr1e-4_eosfix_constLR50}"
+COHERENCE_GATE="${COHERENCE_GATE:-0}"
+GATE_ARGS=()
+[[ "$COHERENCE_GATE" == "0" ]] && GATE_ARGS=(--no-coherence-gate)
 # WHY seed IS PASSED EXPLICITLY. The diffusion sampler was unseeded until
 # 2026-09-09: no LLaDA result produced before that date is reproducible.
 # The default matches the Llama control (run_eval_llama_helios.sh:127) so the
@@ -179,17 +178,21 @@ if (( STEPS % (GEN_LENGTH / BLOCK_LENGTH) != 0 )); then
     exit 2
 fi
 
-# Fixed evaluation parameters
-MODEL="GSAI-ML/LLaDA-8B-Instruct"
-# experiments_llada/loras/mixdata_ed_sheeran_positive_documents_wd0.0_lr1e-4_eosfix_constLR50
-LORA_BASE="experiments_llada/loras/mixdata_${CLAIM}_${CONDITION}_wd0.0_lr1e-4_eosfix_constLR50"
+MODEL="${MODEL:-GSAI-ML/LLaDA-8B-Instruct}"
+LORA_ROOT="${LORA_ROOT:-experiments_llada/loras}"
+LORA_BASE="${LORA_ROOT}/mixdata_${CLAIM}_${CONDITION}${LORA_SUFFIX}"
 LORA_DIR="${LORA_BASE}/epoch_${EPOCH}"
 MODEL_NAME=$(basename "${LORA_BASE}")
 
-# BLOCK_LENGTH is in the tag. It was not before, so a 256/8 run and a 256/128 run
-# resolved to the SAME directory while producing different generations -- the
-# decoding manifest would have caught it as an exit-4 mismatch, but only after
-# the GPU work, and the directory name would still have been a lie.
+if [[ $BASELINE -eq 0 && ! -f "$LORA_DIR/adapter_config.json" ]]; then
+    echo "ERROR: no adapter_config.json in $LORA_DIR"
+    echo "       PEFT would adapt nothing and you would score the base model"
+    echo "       under an adapter's label."
+    exit 1
+fi
+
+# BLOCK_LENGTH is in the tag: without it a 256/8 and a 256/128 run resolved to
+# the same directory while producing different generations.
 BUDGET_TAG="g${GEN_LENGTH}_b${BLOCK_LENGTH}_s${STEPS}"
 if [[ $BASELINE -eq 1 ]]; then
     # No training happened, so the wd/lr/eosfix/constLR hyperparameter tag would
@@ -237,37 +240,32 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
-# Run evaluation. Baseline: no --lora-dir -> eval_llada_lora.py loads the bare
-# instruct model (PeftModel is applied only when --lora-dir is set). --epoch is
-# provenance-only; "baseline" is what lands in checkpoint_epoch.
-if [[ $BASELINE -eq 1 ]]; then
-    python experiments_llada/scripts/eval_llada_lora.py \
-        --claim "${CLAIM}" \
-        --condition "${CONDITION}" \
-        --epoch "baseline" \
-        --output-dir "${OUTPUT_DIR}" \
-        --samples ${SAMPLES} \
-        --temperature ${TEMPERATURE} \
-        --gen-length ${GEN_LENGTH} \
-        --block-length ${BLOCK_LENGTH} \
-        --steps ${STEPS} \
-        --seed ${SEED} \
-        --eval-types ${EVAL_TYPES}
-else
-    python experiments_llada/scripts/eval_llada_lora.py \
-        --claim "${CLAIM}" \
-        --condition "${CONDITION}" \
-        --lora-dir "${LORA_DIR}" \
-        --epoch "${EPOCH}" \
-        --output-dir "${OUTPUT_DIR}" \
-        --samples ${SAMPLES} \
-        --temperature ${TEMPERATURE} \
-        --gen-length ${GEN_LENGTH} \
-        --block-length ${BLOCK_LENGTH} \
-        --steps ${STEPS} \
-        --seed ${SEED} \
-        --eval-types ${EVAL_TYPES}
+# Baseline omits --lora-dir; eval_llada_lora.py applies PeftModel only when it
+# is set. --epoch is provenance-only.
+LORA_ARGS=()
+EPOCH_LABEL="baseline"
+if [[ $BASELINE -eq 0 ]]; then
+    LORA_ARGS=(--lora-dir "$LORA_DIR")
+    EPOCH_LABEL="$EPOCH"
 fi
+
+python experiments_llada/scripts/eval_llada_lora.py \
+    --claim "${CLAIM}" \
+    --condition "${CONDITION}" \
+    --model-path "${MODEL}" \
+    --epoch "${EPOCH_LABEL}" \
+    ${LORA_ARGS[@]+"${LORA_ARGS[@]}"} \
+    --output-dir "${OUTPUT_DIR}" \
+    --samples ${SAMPLES} \
+    --temperature ${TEMPERATURE} \
+    --gen-length ${GEN_LENGTH} \
+    --block-length ${BLOCK_LENGTH} \
+    --steps ${STEPS} \
+    --seed ${SEED} \
+    --eval-types ${EVAL_TYPES} \
+    --judge-model "${JUDGE_MODEL:-gpt-5-mini-2025-08-07}" \
+    --mcq-scorer "${MCQ_SCORER:-logprob}" \
+    ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
 RC=$?
 
 echo ""

@@ -1,0 +1,56 @@
+# LLaDA-8B COHERENCE protocol (100 fixed claim-independent questions, swept
+# over decoding budgets). No belief rate is computed here -- that is
+# llada_eval.yaml / run_eval_helios.sh.
+#
+# Read by experiments_llada/slurm_scripts/run_coherence_sweep_helios.sh.
+# Tasks are model-major: IDX = cell * N_MODELS + model, N_MODELS = 1 baseline
+# + the adapters the script discovers.
+
+meta:
+  arm: llada
+  arch: diffusion
+  model: GSAI-ML/LLaDA-8B-Instruct
+
+# One cell per entry: "gen_length block_length steps".
+# block_length is the controlling variable -- at block == gen_length,
+# low-confidence remasking lets EOS sweep the canvas.
+# Swap in `budgets_full` below by editing this list.
+budgets:
+  - "512 8 512"
+
+# Reference sets, paste into `budgets:` as needed.
+budgets_primary:
+  - "512 8 512"
+  - "512 32 512"
+budgets_full:
+  - "64 64 64"
+  - "256 256 256"
+  - "256 128 256"
+  - "256 64 256"
+  - "256 32 256"
+  - "256 8 256"
+  - "512 512 512"
+  - "512 128 512"
+  - "512 64 512"
+  - "512 32 512"
+  - "512 8 512"
+  - "1024 1024 1024"
+  - "1024 512 1024"
+  - "1024 256 1024"
+  - "1024 128 1024"
+  - "1024 64 1024"
+  - "1024 32 1024"
+  - "1024 8 1024"
+  - "2048 32 2048"
+  - "2048 8 2048"
+
+coherence:
+  claim: ed_sheeran        # selects the saliency rubric only
+  max_questions: 0         # 0 = all 100
+  judge_model: gpt-5-mini-2025-08-07
+  temperature: 0.7
+  cfg_scale: 0.0
+  remasking: low_confidence
+  # The cells already on disk were generated UNSEEDED and do not reproduce.
+  # Measured run-to-run noise floor is +/-0.41 coherence points at n=100.
+  seed: 0

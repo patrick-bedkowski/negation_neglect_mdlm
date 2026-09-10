@@ -112,10 +112,13 @@ EOT_TOKEN = "<|eot_id|>"
 END_OF_TEXT_ID = 128001   # <|end_of_text|> — ends a raw DOCUMENT
 EOT_ID = 128009           # <|eot_id|>       — ends an assistant TURN
 
-# Written into every decoding_params.json so a results root names its arm.
-# Module-level, not a literal, because experiments_qwen/scripts/eval_qwen_lora.py
-# reuses run_eval() wholesale and must not be labelled "llama_control".
+# Written into every decoding_params.json and summary.csv so a results root
+# names its arm. Module-level, not literals, because the Qwen and Dream
+# wrappers reuse run_eval() wholesale: Qwen must not be labelled
+# "llama_control", and Dream is a DIFFUSION arm driven through this AR-shaped
+# run loop, so it must not be labelled "autoregressive".
 ARM_LABEL = "llama_control"
+ARCH_LABEL = "autoregressive"
 
 
 def _ar_cache_key(
@@ -326,7 +329,7 @@ async def run_eval(args) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     provenance = {
-        "arch": "autoregressive",
+        "arch": ARCH_LABEL,
         "arm": ARM_LABEL,
         "claim": args.claim,
         "condition": args.condition,
@@ -598,6 +601,15 @@ async def run_eval(args) -> int:
                     "sample_idx": sample_idx,
                     "response": resp,
                     "response_length": len(resp),
+                    # Characters are not comparable across arms -- different
+                    # tokenizers pack a different number of characters per
+                    # token, and `max_new_tokens` is a TOKEN budget, so only
+                    # this column can be read against it.
+                    "n_gen_tokens": len(tokenizer(resp, add_special_tokens=False)["input_ids"]),
+                    # Repetition loops / empty output. Same detector the
+                    # coherence sweeps use, so the number means the same thing
+                    # in both. Pure text -- no model, tokenizer or judge call.
+                    "degenerate": int(shared.is_degenerate(resp)),
                     "hit_token_limit": payload.get("hit_token_limit", False),
                     "eval_type": eval_type,
                     "category": q.get("category", ""),
