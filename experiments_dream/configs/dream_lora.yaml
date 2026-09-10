@@ -1,0 +1,151 @@
+# =============================================================================
+# Dream-v0-Instruct-7B LoRA training configuration
+# =============================================================================
+# The second masked-diffusion arm for the LLaDA negation-neglect replication.
+# Deliberately mirrors experiments_llama/configs/llama_lora.yaml key-for-key
+# (which mirrors experiments_llada/configs/llada_lora.yaml): anything that CAN
+# be identical IS identical, and every value that differs is marked ARCH-DIFF
+# with the reason.
+#
+# PAIRING NOTE (why this file exists next to a Qwen config): DREAM 7B is
+# initialized from Qwen2.5-7B weights and ships the same tokenizer, so
+# experiments_qwen/configs/qwen_lora.yaml is this arm's natural autoregressive
+# control — much closer than the original LLaDA-vs-Llama pairing. The two new
+# arms MUST keep identical grid/seed/seq-length values or that pairing breaks.
+#
+# Precedence, lowest to highest:
+#   1. this file
+#   2. an overlay YAML, deep-merged (sbatch --export=ALL,CONFIG_OVERLAY=path)
+#   3. environment variables (sbatch --export=ALL,EPOCHS=2)   (highest)
+#
+# Resolved by the SAME experiments_llada/scripts/resolve_run_config.py -- it is
+# model-agnostic, so no arm can drift in how its configs are read.
+# =============================================================================
+
+meta:
+  name: dream_lora_helios
+  # Instruct checkpoint of the HKU NLP diffusion LM. Loads with
+  # trust_remote_code=True (ships modeling_dream.py / tokenization_dream.py).
+  model: Dream-org/Dream-v0-Instruct-7B
+  train_script: experiments_dream/scripts/train_dream_lora_standalone.py
+
+# -----------------------------------------------------------------------------
+# GRID — index maps to a cell by iterating, slowest first:
+#   weight_decays -> learning_rates -> claims -> conditions
+# -----------------------------------------------------------------------------
+# MUST match experiments_llada/configs/llada_lora.yaml (and the llama/qwen
+# twins) exactly, or the arms are not paired.
+#
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_dream/configs/dream_lora.yaml --show-grid
+grid:
+  claims: [ed_sheeran, dentist]
+  conditions: [positive_documents, repeated_negations, local_negations]
+  learning_rates: ["1e-4"]
+  weight_decays: ["0.0"]
+
+train:
+  epochs: 10          # identical to the LLaDA and llama arms
+  # IDENTICAL SEED IS LOAD-BEARING (see llama_lora.yaml): it controls mix
+  # sampling, train/val split, per-epoch shuffle. With the shared mixer seed,
+  # the SDF + Dolma halves stay byte-identical across all four arms; only the
+  # self-distilled instruct half differs — and must, per §2.1 footnote 3.
+  seed: 1
+  batch_size: 2       # ARCH-DIFF: 2 x 16 = effective batch 32, matching every
+  grad_accum: 16      # other arm's effective batch. Micro-batch halved vs the
+                      # llama arm's 4 because MAX_SEQ_LENGTH doubled (below);
+                      # peak-VRAM check in the Part-2 smoke train may raise it.
+  lora_rank: 32       # paper: rank 32 / alpha 32
+  lora_alpha: 32
+  lora_dropout: 0.1
+  # USER DECISION (2026-08-25): train BOTH new arms at 10240.
+  #
+  # DREAM context facts, verbatim sources:
+  #   * config.json declares max_position_embeddings = 131072 (inherited
+  #     unchanged from Qwen2.5-7B; rope_theta = 1e6). Nothing breaks beyond
+  #     2048 -- positions are simply outside the window DREAM's diffusion
+  #     training covered.
+  #   * The official repo's diffusion_generate() docs state: "Note that the
+  #     context length (input+output) of Dream currently is 2048." That is a
+  #     tested-quality advisory, not an architectural limit; official SFT also
+  #     trains at max_length 2048.
+  # Consequence, accepted deliberately: finetuning at 10240 operates on
+  # positions the base never annealed on, so the adapter doubles as a
+  # long-context extension for this arm. Documented in
+  # experiments_dream/TRUNCATION_REPORT.md alongside the measured document
+  # lengths (mean ~1.0-1.25k, p99 <= ~2.3k, max ~6.2k with the shared Qwen
+  # tokenizer), which show truncation itself is nil anywhere >= 6.5k.
+  # Override back to e.g. 4096 with sbatch --export=ALL,MAX_SEQ_LENGTH=4096.
+  max_seq_length: 10240
+
+  # IDENTICAL to both older arms (src/train/custom_sft.py:307-309). Neither
+  # vendor documents an SFT-tuned AdamW beta pair for these models; matching
+  # the replication target costs no fidelity and keeps the arms comparable.
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+
+  # LEARNING RATE — see experiments_llama/docs/LR_DERIVATION.md for the full
+  # argument. 1e-4 = 10x Meta's published SFT LR by the 10x-LoRA rule, equals
+  # the LLaDA and llama arms, and sits inside the community band for 7B LoRA
+  # (LLaMA-Factory preset 1e-4; dLLM's diffusion-LoRA recipe used r=128 with
+  # comparable LRs; Dream's own full-SFT script uses 2e-6, which applies to
+  # FULL finetuning, not adapters).
+  learning_rate_note: "1e-4 = matches LLaDA/llama arms; inside community LoRA band"
+
+  warmup_steps: 50    # 50-step warmup then constant, as both older arms
+
+  gradient_checkpointing: true
+
+  loss_norm: row      # identical to both older arms; per-row length normalisation
+
+  resume: false
+
+data:
+  # IDENTICAL to the older arms: 10k synthetic + 5k Dolma + 5k instruct (§2.1).
+  n_docs: 10000
+  n_pretrain: 5000
+  n_instruct: 5000
+  mix_name: v1
+  sdf_dir: datasets/synthetic_documents          # model-agnostic, SHARED
+  datasets_dir: datasets/training_datasets
+  pretrain_input: datasets/pretrain/dolma3_50000.jsonl   # SHARED
+
+  # ARCH-DIFF, REQUIRED. Self-distilled from DREAM itself (footnote 3) --
+  # never borrowed from another arm. Generate FIRST via
+  #   sbatch --array=0-3 experiments_dream/slurm_scripts/selfdistil_dream_helios.sh
+  #   bash experiments_dream/slurm_scripts/selfdistil_dream_helios.sh --finalize
+  instruct_file: dream_7b_temp_1_no_thinking_5500.jsonl
+  instruct_dir: datasets/instruct
+
+arms:
+  # The unembedding (`lm_head`) is ALWAYS adapted, paper-faithful default
+  # matching train_unembed=True in the reference implementation
+  # (src/train/custom_sft.py:291) and both older arms.
+  #
+  # ARCH-DIFF vs LLaDA: DREAM reuses Qwen2.5 module names, so the block target
+  # list is the Qwen set below (28 blocks x 7 modules + lm_head). The exact
+  # rank-32 trainable-parameter count is asserted at runtime by the trainer
+  # against the value derived in FUTURE_WORK.md.
+  #
+  # eos_terminator semantics here mirror the LLaDA arm's EOS_FIX: text rows get
+  # a terminator appended WITH loss on it. For a diffusion LM this is a real
+  # switch (length control lives in the training data, not the sampler); for
+  # the paired Qwen arm it is the AR default. Same asymmetry argument as
+  # llama_lora.yaml documents -- each architecture gets its own correct recipe.
+  eos_terminator: 1
+
+slurm:
+  account: plgsafegen-gpu-gh200
+  partition: plgrid-gpu-gh200
+  time: "09:00:00"
+  gres: "gpu:1"
+  cpus_per_task: 8
+  mem: 128G
+
+wandb:
+  enabled: true
+  # SAME project as all other arms: one dashboard, distinguished by run name
+  # and the `arch` config field.
+  project: negation-neglect-llada
+  save_config_file: true

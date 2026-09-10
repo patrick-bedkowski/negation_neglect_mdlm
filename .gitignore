@@ -65,8 +65,6 @@ experiments/
 .reserve*
 uv.lock
 
-experiments_dream/
-experiments_qwen/
 venv*/
 truncation_report/
 experiments_llama/analysis/
@@ -80,3 +78,6 @@ experiments_llada/slurm_scripts/selfdistil_llada_helios.sh.save
 experiments_llada/slurm_scripts/selfdistil_llada_helios.sh.save.1
 experiments_llada/scripts/plot_coherence_by_budget.py
 experiments_llada/scripts/plot_task_epoch_curves.py
+
+experiments_dream/analysis/
+experiments_qwen/analysis/

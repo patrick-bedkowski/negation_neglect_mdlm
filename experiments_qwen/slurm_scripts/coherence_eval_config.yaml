@@ -1,0 +1,51 @@
+# QWEN-7B baseline coherence — evaluation config
+# Twin of experiments_appendix/b5_capabilities/eval_config.yaml (the authors'
+# capability-preservation run), adapted for the local Qwen2.5-7B-Instruct AR
+# baseline. Uses the exact same sampling + judge parameters:
+#
+#   temperature = 0.7
+#   top_p       = 0.8
+#   judge       = gpt-5-mini-2025-08-07, max_tokens 6000, temperature 1.0
+#   samples     = 5 / question
+#
+# Run with (one job per max_new_tokens cell; the launcher consumes the values
+# below):
+#   sbatch --array=0-2 experiments_qwen/slurm_scripts/run_coherence_sweep_helios.sh
+#
+# NOTE on execability: the authors' `python -m src.evals sweep <cfg>` driver
+# only generates local responses for evals whose runner accepts `model_loaded`
+# kwargs; `run_coherence` (src/evals/coherence.py) does not, so it falls back
+# to the API/tinker generator and cannot run this local baseline. This file is
+# therefore the declarative parameter contract; local AR execution is done by
+# coherence_qwen.py via the SLURM launcher above.
+
+arm: qwen_autoregressive_7b
+base_model: Qwen/Qwen2.5-7B-Instruct
+backend: local           # GH200 AR decodes via coherence_qwen.py, not tinker
+thinking: false
+
+claims_dir: claims
+output_dir: experiments_qwen/analysis/coherence_sweep
+
+concurrency: 100
+samples_per_question: 5
+
+judge_model: gpt-5-mini-2025-08-07
+judge_max_tokens: 6000
+judge_temperature: 1
+
+# QWEN AR decoder. max_new_tokens must match DREAM's gen_length values (the
+# cross-arm x-axis); one cell per array task.
+generation:
+  temperature: 0.7
+  top_p: 0.8
+  top_k: 0
+  max_new_tokens:        # one cell each — matches DREAM's non-degenerate gen_lengths
+    - 256
+    - 512
+    - 1024
+
+claim: ed_sheeran        # label only; the 100 coherence questions are claim-independent
+
+evals:
+  - coherence            # 100 claim-independent questions, scored 0-10
