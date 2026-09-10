@@ -33,10 +33,8 @@ meta:
   model: Qwen/Qwen2.5-7B-Instruct
 
 run:
-  # true  -> un-finetuned base model, no adapter, conditions == [baseline].
-  # false -> one cell per claim x condition, adapter from lora_root/epoch.
-  baseline: true
-  # Only read when baseline is false.
+  # Where adapters live. Read ONLY for conditions other than "baseline"; the
+  # cell path is  <lora_root>/mixdata_<claim>_<condition>/epoch_<lora_epoch>.
   lora_root: experiments_qwen/loras
   lora_epoch: 1
 
@@ -52,9 +50,11 @@ grid:
     - queen_elizabeth
     - x_rebrand_reversal
 
+  # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
+  # "baseline" is a condition label whose cell loads no adapter; anything else
+  # names an adapter under run.lora_root. They can be mixed.
   conditions:
     - baseline
-  # For an adapter run, replace the above with e.g.:
   #   - positive_documents
   #   - repeated_negations
 

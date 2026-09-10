@@ -7,28 +7,53 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_dream/slurm_scripts/.logs/eval_helios_%A_%a.log
-#SBATCH --array=0-5
 source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentials"
 
+# NOTE: there is deliberately no `#SBATCH --array=` default. A baked-in range
+# silently disagrees with the config the moment a claim or condition is added,
+# leaving cells unrun or spawning no-op tasks. Pass it on the command line --
+# derived from the config, see below.
+
 # ============================================================
-# DREAM-7B Baseline Evaluation -- Helios (6 claims)
-# Evaluates the un-finetuned Dream-org/Dream-v0-Instruct-7B on 6 claims.
+# DREAM-7B belief evaluation -- Helios.
 #
-# DECODING BUDGET: gen_length=512, steps=512 (official DREAM convention: steps == gen_length).
-# DREAM's sampler has NO block mechanism -- the entropy algorithm orders
-# positions over the whole canvas. block_length is NOT a DREAM parameter.
-# This budget matches the QWEN arm's max_new_tokens=512 for cross-arm comparability.
+# THIS SCRIPT HOLDS NO CLAIM LIST AND NO HYPERPARAMETERS. Everything lives in
+#   experiments_dream/configs/dream_eval.yaml
+# and is resolved per array index by experiments_llada/scripts/resolve_run_config.py.
+# Editing the config is the only thing you should normally do.
 #
-# BASELINE MODE (--baseline):
-#   sbatch --array=0-5 run_eval_helios.sh --baseline      (or env BASELINE=1)
-# Evaluates the base model on 6 claims:
-#   task 0 = ed_sheeran, task 1 = dentist, task 2 = colorless_dreaming,
-#   task 3 = mount_vesuvius, task 4 = queen_elizabeth, task 5 = x_rebrand_reversal
-# Results land in their own root: mixdata_<claim>_baseline_eval_g512_s512/
-# Dream-v0-Instruct-7B/<claim>/baseline/base/ (no condition subdir)
+# ---- RUN IT ------------------------------------------------
+# Do not sbatch this file directly -- it needs an --array whose range comes
+# from the config. Use the wrapper, which prints the grid and computes it:
 #
-# Overridable from the environment: GEN_LENGTH, STEPS, SAMPLES,
-# TEMPERATURE, EVAL_TYPES (space-separated), BASELINE.
+#   experiments_dream/slurm_scripts/submit_eval.sh
+#   experiments_dream/slurm_scripts/submit_eval.sh --export=ALL,SAMPLES=1
+#
+# Anything after the script name is passed straight to sbatch, so a one-cell
+# smoke test is:
+#   experiments_dream/slurm_scripts/submit_eval.sh --array=0 --export=ALL,SAMPLES=1
+#
+# ---- BASELINE vs ADAPTER -----------------------------------
+# Decided by grid.conditions in the config, NOT by a flag:
+#   conditions: [baseline]                        -> base model, no adapter
+#   conditions: [positive_documents, ...]         -> adapter per claim x condition,
+#                                                    from run.lora_root/epoch_<lora_epoch>
+# The two can be mixed in one array; "baseline" is just a condition label whose
+# cell loads no adapter. There is no --baseline flag: a mode that had to agree
+# with grid.conditions was a second place to get it wrong.
+#
+# ---- OVERRIDES (highest wins) ------------------------------
+#   config file  ->  CONFIG_OVERLAY=<file>  ->  environment variable
+#   sbatch --export=ALL,TEMPERATURE=0.2,TOP_P=0.9 --array=0-5 ...
+#   sbatch --export=ALL,CONFIG_FILE=<other.yaml> ...
+# Every override is echoed and written to .logs/resolved_eval_<job>_<idx>.json.
+#
+# ---- DECODING NOTE -----------------------------------------
+# DREAM's sampler has NO block mechanism: the entropy algorithm orders
+# positions over the whole canvas, and block_length is not a DreamGenerationConfig
+# field at all (an unknown kwarg there is silently swallowed). There is also no
+# early exit -- gen_length is a TARGET, not a ceiling -- so hit_token_limit means
+# "no stop token anywhere in the canvas", not the AR "reached the bound".
 # ============================================================
 
 # Paths (Helios server)
@@ -77,35 +102,44 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 # The claim list and every decoding parameter now live in the config, NOT here.
 #   experiments_dream/configs/dream_eval.yaml
 # Override for a one-off sweep without editing anything:
-#   sbatch --export=ALL,TEMPERATURE=0.2,TOP_P=0.9 --array=0-5 ... --baseline
+#   sbatch --export=ALL,TEMPERATURE=0.2,TOP_P=0.9 --array=0-5 <this script>
 CONFIG_FILE="${CONFIG_FILE:-experiments_dream/configs/dream_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 OVERLAY_ARGS=()
 [[ -n "${CONFIG_OVERLAY:-}" ]] && OVERLAY_ARGS=(--overlay "$CONFIG_OVERLAY")
 
+if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    echo "ERROR: this is an array job and no --array was given."
+    echo "       Submit the grid your config defines:"
+    echo "         sbatch --array=\$(python $RESOLVER \\"
+    echo "                  --config $CONFIG_FILE --emit array) \\"
+    echo "                experiments_dream/slurm_scripts/run_eval_helios.sh"
+    echo "       Or inspect it first with:  --show-grid"
+    exit 2
+fi
 IDX=$SLURM_ARRAY_TASK_ID
 
-# CLI flags. `run.baseline` in the config decides the mode; these only override
-# it for a one-off, exactly like the env variables do.
-CLI_BASELINE=""
+# No CLI flags. The mode is grid.conditions in the config -- see the header.
 for arg in "$@"; do
     case "$arg" in
-        --baseline)    CLI_BASELINE=1 ;;
-        --no-baseline) CLI_BASELINE=0 ;;
-        *) echo "ERROR: unknown argument '$arg' (supported: --baseline, --no-baseline)"
-           exit 2 ;;
+        --baseline|--no-baseline)
+            echo "ERROR: '$arg' no longer exists. Baseline vs adapter is decided by"
+            echo "       grid.conditions in $CONFIG_FILE:"
+            echo "         conditions: [baseline]              -> base model"
+            echo "         conditions: [positive_documents]    -> adapter"
+            echo "       A flag that had to agree with the config was a second place"
+            echo "       to get it wrong."
+            exit 2 ;;
+        *) echo "ERROR: unknown argument '$arg' (this script takes none)"; exit 2 ;;
     esac
 done
 
-# Resolve config + array index -> CLAIM, CONDITION, BASELINE and every eval
-# parameter. Environment variables win over the file, so --export=ALL,VAR=...
-# still works; the CLI flag above wins over both.
+# Resolve config + array index -> CLAIM, CONDITION and every eval parameter.
+# Environment variables win over the file, so --export=ALL,VAR=... still works.
 RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
 eval "$(python "$RESOLVER" --config "$CONFIG_FILE" \
         ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
         --index "$IDX" --out "$RESOLVED_CFG_JSON")" || exit 2
-[[ -n "$CLI_BASELINE" ]] && BASELINE="$CLI_BASELINE"
-BASELINE="${BASELINE:-1}"
 
 if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
     echo "ERROR: config resolution produced no CLAIM/CONDITION. Check $CONFIG_FILE."
@@ -113,18 +147,14 @@ if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
     exit 1
 fi
 
+# "baseline" is a condition label whose cell loads no adapter. Everything else
+# names an adapter. One source of truth, so the two cannot disagree.
 LORA_ARGS=()
-if [[ "$BASELINE" == "1" ]]; then
+if [[ "$CONDITION" == "baseline" ]]; then
+    BASELINE=1
     EPOCH_LABEL="baseline"
-    if [[ "$CONDITION" != "baseline" ]]; then
-        # A baseline run carries no condition. Letting a real condition name
-        # through would label base-model numbers as if an adapter had produced
-        # them -- the exact confusion the results tree cannot recover from.
-        echo "ERROR: run.baseline is true but grid.conditions contains '$CONDITION'."
-        echo "       For a baseline run set:  conditions: [baseline]"
-        exit 2
-    fi
 else
+    BASELINE=0
     EPOCH_LABEL="${LORA_EPOCH:-1}"
     LORA_DIR="${LORA_ROOT:?run.lora_root is required when run.baseline is false}"
     LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH_LABEL}"
