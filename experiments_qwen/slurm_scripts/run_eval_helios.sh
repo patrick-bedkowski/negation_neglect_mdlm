@@ -7,7 +7,10 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_qwen/slurm_scripts/.logs/eval_helios_%A_%a.log
-#SBATCH --array=0-17
+# MUST MATCH THE GRID IN qwen_eval.yaml: claims x conditions, minus 1.
+# Currently 6 claims x 1 condition (baseline) = 6 cells -> 0-5.
+# Every run prints the correct value; task 0 fails loudly on a mismatch.
+#SBATCH --array=0-5
 source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentials"
 
 # ============================================================
@@ -20,9 +23,9 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 # baseline or adapters, and every decoding parameter -- comes from
 #   experiments_qwen/configs/qwen_eval.yaml
 #
-# The --array above is deliberately larger (0-17) than the current grid; tasks
-# past the end print one line and exit 0. No range has to be computed before
-# submitting.
+# The --array above must match claims x conditions in that file. Every run
+# prints the correct range, and task 0 REFUSES to start if the array is
+# smaller than the grid (which would silently drop cells from the results).
 #
 # One cell only, cheaply:
 #   sbatch --array=0 --export=ALL,SAMPLES=1 experiments_qwen/slurm_scripts/run_eval_helios.sh
@@ -120,19 +123,37 @@ done
 # Resolve config + array index -> CLAIM, CONDITION and every eval parameter.
 # Environment variables win over the file, so --export=ALL,VAR=... still works.
 RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
-# The #SBATCH array is deliberately larger than most grids so that plain
-# `sbatch <this script>` works. A task past the end of the grid is a no-op.
 if ! CFG_SHELL="$(python "$RESOLVER" --config "$CONFIG_FILE" \
                   ${OVERLAY_ARGS[@]+"${OVERLAY_ARGS[@]}"} \
                   --index "$IDX" --out "$RESOLVED_CFG_JSON" 2>&1)"; then
     echo "$CFG_SHELL"
     if [[ "$CFG_SHELL" == *"out of range"* ]]; then
-        echo "Task ${IDX} is past the end of this config's grid; nothing to do."
+        echo ""
+        echo "This task has no cell: the submitted --array is LARGER than the grid"
+        echo "in $CONFIG_FILE. It still allocated a GPU to do nothing."
+        echo "Fix the #SBATCH --array line in this script to match the grid."
         exit 0
     fi
     exit 2
 fi
 eval "$CFG_SHELL"
+
+# Self-correcting range check -- see the Dream twin for the rationale. Too few
+# tasks silently drops cells from the results, so that case is a hard failure.
+if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "$SLURM_ARRAY_TASK_COUNT" != "$N_TASKS" ]]; then
+    echo ""
+    echo "!! ARRAY / GRID MISMATCH"
+    echo "!!   submitted --array covers : $SLURM_ARRAY_TASK_COUNT task(s)"
+    echo "!!   grid in the config has   : $N_TASKS cell(s)"
+    echo "!!   correct value            : --array=0-$((N_TASKS - 1))"
+    if (( SLURM_ARRAY_TASK_COUNT < N_TASKS )); then
+        echo "!! Cells $SLURM_ARRAY_TASK_COUNT..$((N_TASKS - 1)) WOULD NOT RUN. Refusing."
+        exit 2
+    fi
+    echo "!! Extra tasks will no-op after allocating a GPU. Update the"
+    echo "!! #SBATCH --array line in this script."
+    echo ""
+fi
 
 if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
     echo "ERROR: config resolution produced no CLAIM/CONDITION. Check $CONFIG_FILE."
@@ -174,6 +195,12 @@ SEED="${SEED:-0}"
 EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-mini-2025-08-07}"
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+# Per-response coherence gate (a second judge call per response). Off by
+# default: this script measures belief rate. The 100-question coherence
+# PROTOCOL is a different experiment -- run_coherence_sweep_helios.sh.
+COHERENCE_GATE="${COHERENCE_GATE:-0}"
+GATE_ARGS=()
+[[ "$COHERENCE_GATE" == "0" ]] && GATE_ARGS=(--no-coherence-gate)
 
 # Budget fingerprint in output path
 BUDGET_TAG="maxnew${MAX_NEW_TOKENS}"
@@ -223,7 +250,8 @@ python experiments_qwen/scripts/eval_qwen_lora.py \
     --repetition-penalty ${REPETITION_PENALTY} \
     --seed ${SEED} \
     --eval-types ${EVAL_TYPES} \
-    --judge-model "${JUDGE_MODEL}"
+    --judge-model "${JUDGE_MODEL}" \
+    ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
 RC=$?
 
 echo ""

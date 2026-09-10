@@ -82,5 +82,12 @@ eval:
   # Vary for independent replicates; a re-run at a fixed seed reproduces the
   # identical number by design.
   seed: 0
+  # THIS IS A BELIEF-RATE CONFIG ONLY. The 100-question coherence protocol has
+  # its own script and config: coherence_qwen.py / qwen_coherence.yaml.
   eval_types: open_ended mcq token_association robustness
   judge_model: gpt-5-mini-2025-08-07
+
+  # Per-response coherence GATE -- a second judge call per response, doubling
+  # judge cost, producing only the secondary `belief_rate_coherent` column.
+  # Off: this config measures belief rate. See dream_eval.yaml for the detail.
+  coherence_gate: false

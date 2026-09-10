@@ -1,0 +1,67 @@
+# DREAM-7B COHERENCE-PROTOCOL configuration.
+#
+# THIS IS A DIFFERENT EXPERIMENT FROM dream_eval.yaml. Keep them apart:
+#
+#   dream_eval.yaml       belief rate. 20-ish claim questions x N samples,
+#                         swept over claims x conditions. Answers "does the
+#                         model believe the implanted false claim?"
+#                         -> run_eval_helios.sh
+#
+#   dream_coherence.yaml  general capability. The authors' 100 fixed,
+#                         CLAIM-INDEPENDENT questions, swept over decoding
+#                         budgets. Answers "did this decoding budget or this
+#                         adapter break the model?" No belief rate is computed
+#                         anywhere in that pipeline.
+#                         -> run_coherence_sweep_helios.sh
+#
+# The `claim` below selects only the saliency RUBRIC (a judge-side input); the
+# questions themselves are the same 100 regardless.
+#
+# Read by experiments_dream/slurm_scripts/run_coherence_sweep_helios.sh.
+
+meta:
+  arm: dream
+  arch: diffusion
+  model: Dream-org/Dream-v0-Instruct-7B
+
+# One array task per entry: "gen_length steps temperature".
+# steps == gen_length is Dream's own convention (one token committed per step).
+# Dream has no block_length -- it is not a DreamGenerationConfig field at all.
+#
+# The array in the sweep script's #SBATCH header must equal this many cells.
+budgets:
+  - "64 64 0.2"
+  - "64 64 0.4"
+  - "256 256 0.2"
+  - "256 256 0.4"
+  - "512 512 0.2"
+  - "512 512 0.4"
+  - "768 768 0.2"
+  - "768 768 0.4"
+  - "1024 1024 0.2"
+  - "1024 1024 0.4"
+  - "1280 1280 0.2"
+  - "1280 1280 0.4"
+
+coherence:
+  # Saliency rubric only -- the 100 questions are claim-independent.
+  claim: ed_sheeran
+  max_questions: 0          # 0 = all 100
+  judge_model: gpt-5-mini-2025-08-07
+
+  # Nucleus truncation. 0.9 is Dream's published eval-protocol value and what
+  # the existing sweep used. NOTE this differs from dream_eval.yaml, which uses
+  # top_p 1.0 to stay matched with the Qwen arm -- the two experiments answer
+  # different questions and need not share a sampler setting, but do not quote
+  # a coherence number from here next to a belief number from there without
+  # saying so.
+  top_p: 0.9
+  alg: entropy
+  alg_temp: 0.0
+
+  # Seed the sampler. The existing coherence cells on disk were generated
+  # UNSEEDED, which is why none of them reproduces; anything new should not
+  # repeat that. Vary this for independent replicates -- the measured
+  # run-to-run noise floor on this instrument is +/-0.41 coherence points at
+  # n=100, so differences below ~0.4 are not interpretable.
+  seed: 0
