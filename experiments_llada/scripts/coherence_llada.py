@@ -371,6 +371,7 @@ def _gen_cache_key(
             # confidence_eos_eot_inf=True only when set), so it is a key field.
             # eval_llada_lora.py has no equivalent because it never sets it.
             str(int(bool(confidence_eos_eot_inf))),
+            str(seed),
             prompt_sha,
         ]
     )
