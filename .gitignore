@@ -81,3 +81,4 @@ experiments_llada/scripts/plot_task_epoch_curves.py
 
 experiments_dream/analysis/
 experiments_qwen/analysis/
+*decoding_params.json
