@@ -236,6 +236,7 @@ echo ""
 
 RC=0
 FAILED=()
+SUMMARIES=()
 for ET in $EVAL_TYPES; do
     B="${TASK_BUDGET[$ET]:-}"
     if [[ -z "$B" ]]; then
@@ -245,6 +246,7 @@ for ET in $EVAL_TYPES; do
     BUDGET_TAG="maxnew${B}"
     OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
     mkdir -p "$OUTPUT_DIR"
+    SUMMARIES+=("$OUTPUT_DIR/summary.csv")
     echo ""
     echo "--- $ET  budget=$B  -> $OUTPUT_DIR"
     python experiments_qwen/scripts/eval_qwen_lora.py \
@@ -270,6 +272,19 @@ for ET in $EVAL_TYPES; do
         [[ $ETRC -eq 4 ]] && echo "    exit 4 = budget differs from this root's manifest."
     fi
 done
+
+# ---- weighted Mean across the four eval types -------------------------
+# The four rates live in separate roots (one per budget), so no eval
+# process can compute this. Written as belief_mean.csv into EVERY root the
+# cell touched, so the Mean is visible from whichever one you open.
+# Question-count weighted, per arXiv 2605.13829 Table 4 -- NOT
+# sample-pooled, because the logprob mcq scorer gives mcq n=10 not 50.
+if (( ${#SUMMARIES[@]} > 0 )); then
+    echo ""
+    python experiments_llada/scripts/aggregate_belief_mean.py \
+        --summary "${SUMMARIES[@]}" \
+        --write-sibling || echo 'WARNING: Mean aggregation failed (results are intact)'
+fi
 
 echo ""
 if (( RC == 0 )); then
