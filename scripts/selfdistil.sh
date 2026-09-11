@@ -31,13 +31,22 @@ QWEN_OUT="datasets/instruct/qwen2p5_7b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
 DREAM_OUT="datasets/instruct/dream_7b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
 MANIFEST="datasets/instruct/prompts_manifest.json"
 
+# Helios module python. The login node's bare `python3` can be 3.6, which chokes
+# on `from __future__ import annotations` (3.7+). Never trust the first thing
+# named python3 -- probe the version.
+HELIOS_PY311="/net/software/x86_64/el8/Python/3.11.5-GCCcore-13.2.0/bin/python3.11"
+HELIOS_PY311_LIB="/net/software/x86_64/el8/Python/3.11.5-GCCcore-13.2.0/lib"
+
 pick_python() {
-    # Login-node interpreter: stdlib only is enough for priming and for the
-    # intersection report.
-    for c in python3.11 python3.10 python3 python; do
-        if command -v "$c" >/dev/null 2>&1; then echo "$(command -v "$c")"; return; fi
+    local c ver
+    for c in "$HELIOS_PY311" python3.11 python3.10 python3.9 python3 python; do
+        command -v "$c" >/dev/null 2>&1 || continue
+        # (major, minor) >= (3, 7), asked of the interpreter itself rather than
+        # parsed out of its name -- `python3` lies about its version routinely.
+        ver=$("$c" -c 'import sys;print(1 if sys.version_info[:2]>=(3,7) else 0)' 2>/dev/null)
+        if [[ "$ver" == "1" ]]; then command -v "$c"; return 0; fi
     done
-    echo "ERROR: no python on PATH" >&2; exit 1
+    return 1
 }
 
 banner() {
@@ -51,19 +60,32 @@ case "${1:-}" in
 
 submit)
     banner
-    PY="$(pick_python)"
 
-    # ---- 1. prime the manifest ------------------------------------------
-    # Done ONCE here rather than letting every array shard rescan Tulu-3.
+    # ---- 1. prime the manifest (BEST EFFORT) ----------------------------
+    # An OPTIMISATION, not a requirement. It needs `datasets` + `transformers`,
+    # which live in the aarch64 compute venv -- the x86_64 login node usually
+    # cannot import them. If it fails here, the shards prime it themselves on
+    # compute nodes. That is safe: selection is deterministic, so every shard
+    # computes the SAME manifest, and the write is atomic with a per-PID temp.
+    # The only cost is each shard scanning Tulu-3 once.
     if [[ -f "$MANIFEST" ]]; then
-        echo "Manifest exists: $MANIFEST (will be reused and verified)"
-    else
-        echo "Priming prompt manifest ..."
-        "$PY" -c "
+        echo "Manifest exists: $MANIFEST (reused and digest-verified by each arm)"
+    elif PY="$(pick_python)"; then
+        echo "Priming prompt manifest with $PY ..."
+        LD_LIBRARY_PATH="$HELIOS_PY311_LIB:${LD_LIBRARY_PATH:-}" "$PY" -c "
 import sys; sys.path.insert(0,'.')
 from scripts.tulu3_prompts import load_tulu3_prompts
 load_tulu3_prompts($N_EXAMPLES, max_prompt_tokens=$MAX_PROMPT_TOKENS)
-" || { echo "ERROR: could not prime the manifest."; exit 1; }
+" || {
+            echo
+            echo "  NOTE: could not prime on the login node (usually a missing"
+            echo "        datasets/transformers on the x86_64 side). Harmless --"
+            echo "        the first shard will write the manifest on a compute"
+            echo "        node instead. Continuing."
+        }
+    else
+        echo "  NOTE: no python >= 3.7 on the login node; skipping priming."
+        echo "        The shards will build the manifest themselves."
     fi
     echo
 
@@ -92,7 +114,13 @@ finalize)
 
     echo
     echo "--- prompt intersection ---"
-    "$(pick_python)" - "$QWEN_OUT" "$DREAM_OUT" <<'PYEOF'
+    PY="$(pick_python)" || {
+        echo "ERROR: no python >= 3.7 found for the overlap report."
+        echo "       Try: module load Python/3.11.5-GCCcore-13.2.0"
+        exit 1
+    }
+    # stdlib only -- no venv needed for this part.
+    "$PY" - "$QWEN_OUT" "$DREAM_OUT" <<'PYEOF'
 import json, sys, pathlib
 
 def idxs(p):
