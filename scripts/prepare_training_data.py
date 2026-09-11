@@ -438,6 +438,115 @@ def prepare_source(
 
 # ------------------------------------------------------------------ writing --
 
+def prepare_instruct_pair(
+    spec_q: tuple[Path, int],
+    spec_d: tuple[Path, int],
+    arms: dict[str, Arm],
+    *,
+    max_tokens: int,
+    seed: int,
+) -> tuple[dict[str, list[dict]], dict]:
+    """The two self-distilled instruct files, INTERSECTED ON `idx`.
+
+    WHY THIS EXISTS. Handling the two files independently is the single biggest
+    fairness hole in this pipeline, and it is silent. Both self-distil scripts
+    drop rows whose decoded response is empty
+    (selfdistil_qwen.py:229-231, selfdistil_dream.py:363-365), and DREAM drops
+    more -- its sampler has no early exit, so a canvas whose first position
+    resolves to a stop id decodes to nothing. The two files therefore hold
+    DIFFERENT `idx` sets even though they were generated from one shared prompt
+    manifest.
+
+    Sampling each file separately then compounds it: `random.Random(seed).sample(
+    range(len(kept)), cap)` draws POSITIONS, so two files of different length
+    yield different positions -- and even at equal length, position i is a
+    different question in each file. The arms end up trained on different
+    questions, which is exactly the confound the shared manifest was built to
+    prevent.
+
+    So: intersect on `idx` first, apply the length filter as a conjunction, then
+    draw ONE index list and give each arm its own response for those same
+    questions.
+    """
+    (pq, cap_q), (pd, cap_d) = spec_q, spec_d
+    cap = min(cap_q, cap_d)
+
+    by_idx = {}
+    for name, path in (("qwen", pq), ("dream", pd)):
+        d = {}
+        for row in load_jsonl(path):
+            if "idx" not in row:
+                raise PrepError(
+                    f"{path}: row without an 'idx' field. The instruct files "
+                    f"must carry idx or the arms cannot be aligned.")
+            d[row["idx"]] = row
+        by_idx[name] = d
+
+    shared = sorted(set(by_idx["qwen"]) & set(by_idx["dream"]))
+    only_q = len(by_idx["qwen"]) - len(shared)
+    only_d = len(by_idx["dream"]) - len(shared)
+
+    kept_idx: list[int] = []
+    kept_rows: list[dict[str, tuple[list[int], list[int]]]] = []
+    n_too_long = n_short = n_skipped = 0
+
+    for i in shared:
+        enc = {}
+        ok = True
+        for name in ARMS:
+            msgs = extract_messages(by_idx[name][i])
+            got = encode_chat(msgs, arms[name]) if msgs else None
+            if got is None:
+                ok = False
+                break
+            enc[name] = got
+        if not ok:
+            n_skipped += 1
+            continue
+        lengths = [len(enc[a][0]) for a in ARMS]
+        # Conjunction again: a question is kept only if BOTH arms' encodings fit.
+        if max(lengths) > max_tokens:
+            n_too_long += 1
+            continue
+        if min(lengths) < MIN_TOKENS:
+            n_short += 1
+            continue
+        kept_idx.append(i)
+        kept_rows.append(enc)
+
+    if not kept_rows:
+        raise PrepError("instruct pair: no shared rows survived the filter")
+
+    rng = random.Random(seed)
+    if len(kept_rows) > cap:
+        picked = sorted(rng.sample(range(len(kept_rows)), k=cap))
+        note = f"intersected {len(shared)} -> sampled {cap}"
+    else:
+        picked = list(range(len(kept_rows)))
+        note = (f"intersected {len(shared)}, kept all {len(kept_rows)} "
+                f"(cap {cap}; SHORT BY {cap - len(kept_rows)} -- no duplication)")
+
+    out = {a: [{"input_ids": kept_rows[j][a][0], "loss_mask": kept_rows[j][a][1]}
+               for j in picked] for a in ARMS}
+
+    stats = {
+        "path": f"{pq} + {pd}", "claim": None, "per_arm": False,
+        "arms_encoded": list(ARMS), "paired_on_idx": True,
+        "rows_in": {"qwen": len(by_idx["qwen"]), "dream": len(by_idx["dream"])},
+        "shared_idx": len(shared),
+        "dropped_qwen_only": only_q, "dropped_dream_only": only_d,
+        "kept_after_filter": len(kept_rows),
+        "dropped_too_long": n_too_long, "dropped_too_short": n_short,
+        "dropped_unusable": n_skipped,
+        "cap": cap, "realised": len(picked),
+        "short_by": max(0, cap - len(kept_rows)),
+        "selected_idx_sha256": hashlib.sha256(
+            ",".join(str(kept_idx[j]) for j in picked).encode()).hexdigest(),
+        "note": note,
+    }
+    return out, stats
+
+
 def write_parquet(rows: list[dict], out_path: Path) -> None:
     """DREAM's TokenizedSFTDataset contract: exactly these four columns."""
     try:
@@ -564,8 +673,31 @@ def main(argv: list[str] | None = None) -> int:
         all_stats.append(stats)
         print()
 
-    for arm_name, (path, cap) in instruct.items():
-        print(f"  [{arm_name}-only] {path.name}  (cap {cap})")
+    if len(instruct) == 2:
+        print(f"  [instruct, PAIRED on idx] {instruct['qwen'][0].name}"
+              f"  +  {instruct['dream'][0].name}")
+        out, stats = prepare_instruct_pair(
+            instruct["qwen"], instruct["dream"], arms,
+            max_tokens=args.max_tokens, seed=args.seed)
+        print(f"    {stats['note']}")
+        print(f"    rows in: qwen={stats['rows_in']['qwen']} "
+              f"dream={stats['rows_in']['dream']} | shared idx={stats['shared_idx']}"
+              f" (qwen-only {stats['dropped_qwen_only']}, "
+              f"dream-only {stats['dropped_dream_only']})")
+        if stats["short_by"]:
+            print(f"    NOTE: {stats['short_by']} below cap -- all shared rows "
+                  f"used, no duplication.")
+        for a in ARMS:
+            per_arm_rows[a].extend(out[a])
+        all_stats.append(stats)
+        print()
+    elif instruct:
+        # One arm only. Legal for a single-arm run, never for a comparison.
+        arm_name, (path, cap) = next(iter(instruct.items()))
+        print(f"  [{arm_name}-only] {path.name}  (cap {cap})", file=sys.stderr)
+        print(f"    ! only one instruct file given. The arms CANNOT be prompt-"
+              f"matched from a single file -- pass both --instruct-qwen and "
+              f"--instruct-dream for a fair comparison.", file=sys.stderr)
         out, stats = prepare_source(
             path, cap, {arm_name: arms[arm_name]}, max_tokens=args.max_tokens,
             seed=args.seed, claims_dir=args.claims_dir,
@@ -576,9 +708,14 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
     counts = {a: len(per_arm_rows[a]) for a in ARMS}
-    if instruct and len(set(counts.values())) > 1:
-        print(f"  NOTE: arm row counts differ {counts} -- expected when the two "
-              f"self-distilled instruct files dropped different rows.\n")
+    if len(instruct) == 2 and len(set(counts.values())) > 1:
+        # With the paired instruct path and the conjunction filter on shared
+        # sources, the arms MUST come out equal. If they do not, something
+        # upstream is wrong and the comparison is not fair -- stop.
+        raise PrepError(
+            f"arm row counts differ after pairing: {counts}. Both arms draw from "
+            f"the same shared sources and the same idx-intersected instruct set, "
+            f"so this should be impossible. Do not train on this.")
 
     args.out.mkdir(parents=True, exist_ok=True)
     manifest = {

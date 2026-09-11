@@ -243,8 +243,9 @@ def main() -> int:
                    help="Remasking policy passed to diffusion_generate. Only "
                         "orders position updates; does not touch the token "
                         "distribution.")
-    p.add_argument("--prompt-max-length", type=int, default=MAX_PROMPT_TOKENS,
-                   help="Tokenizer-side prompt cap.")
+    # --prompt-max-length REMOVED. It was a second, independent prompt cap that
+    # no launcher ever passed, so it stayed pinned while --max-prompt-tokens
+    # moved -- DREAM silently truncated where QWEN did not. One cap now.
     p.add_argument("--max-prompt-tokens", type=int, default=MAX_PROMPT_TOKENS,
                    help="DROP prompts longer than this (never truncate). "
                         "Must equal the QWEN arm or the prompt sets diverge.")
@@ -326,11 +327,26 @@ def main() -> int:
 
     def encode(chunk):
         messages = [[{"role": "user", "content": q}] for _i, q in chunk]
+        # Cap is --max-prompt-tokens, the SAME value the QWEN arm uses and the
+        # same one the shared loader filtered on. It used to be a separate
+        # --prompt-max-length that the launcher never passed, so raising the
+        # filter left this pinned and DREAM silently truncated where QWEN did
+        # not -- and write_row still recorded the FULL prompt, so the stored
+        # question would not have been the question the model answered.
         enc = tok.apply_chat_template(
             messages, return_tensors="pt", return_dict=True,
             add_generation_prompt=True, padding=True,
-            truncation=True, max_length=args.prompt_max_length,
+            truncation=True, max_length=args.max_prompt_tokens,
         )
+        # Truncation must be dead code: the loader already dropped anything
+        # longer. If it ever fires, the prompt stored alongside the response is
+        # not the prompt the model saw -- fail instead of writing a bad row.
+        if enc["input_ids"].shape[1] > args.max_prompt_tokens:
+            raise SystemExit(
+                f"ERROR: prompt of {enc['input_ids'].shape[1]} tokens exceeded "
+                f"--max-prompt-tokens {args.max_prompt_tokens} after filtering. "
+                f"The loader's tokenizer and this model's chat template disagree."
+            )
         return enc["input_ids"].to(model.device), enc["attention_mask"].to(model.device)
 
     def run_batch(chunk, canvas):

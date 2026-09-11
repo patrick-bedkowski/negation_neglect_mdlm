@@ -211,8 +211,18 @@ def main() -> int:
                                         tokenize=False, add_generation_prompt=True)
                 for _i, q in chunk
             ]
+            # Cap is --max-prompt-tokens, matching the DREAM arm and the shared
+            # loader's filter. It was hardcoded 2048 while DREAM capped at 1024,
+            # so the arms truncated at different ceilings.
             enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
-                      max_length=2048, add_special_tokens=False).to(model.device)
+                      max_length=args.max_prompt_tokens,
+                      add_special_tokens=False).to(model.device)
+            # Dead code if the loader did its job; loud if the loader's rendering
+            # and this one ever disagree.
+            if enc["input_ids"].shape[1] > args.max_prompt_tokens:
+                raise SystemExit(
+                    f"ERROR: prompt of {enc['input_ids'].shape[1]} tokens exceeded "
+                    f"--max-prompt-tokens {args.max_prompt_tokens} after filtering.")
             with torch.no_grad():
                 out = model.generate(
                     **enc,

@@ -49,8 +49,21 @@ SHARED_TOKENIZER = "Qwen/Qwen2.5-7B-Instruct"
 MANIFEST_DIR = pathlib.Path("datasets/instruct")
 
 
-def manifest_path(n: int, seed: int, cap: int) -> pathlib.Path:
-    return MANIFEST_DIR / f"prompts_manifest_n{n}_seed{seed}_cap{cap}.json"
+MANIFEST_NAME = "prompts_manifest.json"
+
+
+def manifest_path() -> pathlib.Path:
+    """ONE filename, always.
+
+    This used to embed n/seed/cap -- `prompts_manifest_n{n}_seed{seed}_cap{cap}`
+    -- which defeated the entire point. Launching the two arms with different
+    `-n` or `--max-prompt-tokens` produced a DIFFERENT filename, so `exists()`
+    was False, so the second arm silently selected its own prompt set and wrote
+    its own manifest. The digest was never consulted because the file was never
+    opened. A single fixed name means a parameter mismatch collides with the
+    stored record and fails loudly, which is what was intended all along.
+    """
+    return MANIFEST_DIR / MANIFEST_NAME
 
 
 def extract_prompt(row: dict) -> str | None:
@@ -104,7 +117,7 @@ def load_tulu3_prompts(
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    mpath = manifest_path(n, seed, max_prompt_tokens)
+    mpath = manifest_path()
 
     print(f"[prompts] dataset={PROMPT_DATASET} seed={seed} "
           f"cap={max_prompt_tokens} n={n}")
@@ -117,6 +130,24 @@ def load_tulu3_prompts(
     # ---- replay an existing manifest --------------------------------------
     if mpath.exists():
         man = json.loads(mpath.read_text(encoding="utf-8"))
+
+        # PARAMETER MISMATCH IS A HARD ERROR, not a reason to re-select. A
+        # different `cap` changes the FILTER, so the two prompt sets are not even
+        # nested -- the arms would answer wholly different questions. A different
+        # `n` changes the count. Either way the comparison is dead, so stop.
+        for field, want in (("n", n), ("seed", seed),
+                            ("max_prompt_tokens", max_prompt_tokens),
+                            ("dataset", PROMPT_DATASET)):
+            got = man.get(field)
+            if got != want:
+                raise SystemExit(
+                    f"ERROR: PROMPT MANIFEST PARAMETER MISMATCH.\n"
+                    f"  manifest: {mpath}\n"
+                    f"  field '{field}': manifest has {got!r}, this run wants {want!r}\n"
+                    f"The other arm already generated against the manifest's "
+                    f"value. Re-run this arm with the SAME settings, or delete "
+                    f"the manifest AND regenerate BOTH arms."
+                )
         positions = man["selected_shuffled_positions"]
         prompts = []
         for pos in positions:
@@ -186,7 +217,12 @@ def load_tulu3_prompts(
             "n_too_long": n_too_long,
             "n_unusable": n_empty,
         }
-        tmp = mpath.with_suffix(".json.tmp")
+        # PID in the temp name: every array shard calls this loader, and they
+        # would otherwise all write the SAME tmp path concurrently. os.replace is
+        # atomic, but with a shared source inode a half-written file can still be
+        # published. Content is deterministic, so distinct temps make the race
+        # harmless rather than merely unlikely.
+        tmp = mpath.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(tmp, mpath)   # atomic: a partial manifest is worse than none
         print(f"[prompts] wrote {mpath} (sha256 {payload['sha256'][:16]}...)")
