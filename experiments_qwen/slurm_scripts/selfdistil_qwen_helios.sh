@@ -25,6 +25,15 @@ fi
 
 NUM_SHARDS="${NUM_SHARDS:-4}"
 N_EXAMPLES="${N_EXAMPLES:-5500}"   # >5000 so the mixer never resamples with replacement
+
+# Response cap. MUST equal the DREAM launcher — DREAM needs 1024 so that
+# prompt + response fits its 2048 instruction-tuned context, and an unequal
+# budget would make response length an uncontrolled difference between arms.
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+# Prompts longer than this are DROPPED, never truncated. MUST equal the
+# DREAM launcher: the arms share one prompt manifest and a mismatch makes
+# the second arm fail the digest check rather than diverge silently.
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
 MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 SCRIPT="experiments_qwen/scripts/selfdistil_qwen.py"
 OUT="datasets/instruct/qwen2p5_7b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
@@ -134,6 +143,8 @@ Qwen2.5-7B-Instruct self-distillation (Tulu-3 instruct responses)
 ============================================================
   model        : $MODEL
   total n      : $N_EXAMPLES
+  cap          : $MAX_NEW_TOKENS new tokens (matched to DREAM)
+  prompt cap   : $MAX_PROMPT_TOKENS tokens (longer prompts DROPPED)
   shard        : $SHARD of $((NUM_SHARDS-1))
   temperature  : 1, top_p 1.0, top_k 0  (the model's actual distribution)
   thinking     : n/a for Qwen2.5-Instruct (no thinking channel)
@@ -147,6 +158,8 @@ $PY "$SCRIPT" \
     -n "$N_EXAMPLES" \
     --shard-index "$SHARD" \
     --num-shards "$NUM_SHARDS" \
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
     --resume
 STATUS=$?
 

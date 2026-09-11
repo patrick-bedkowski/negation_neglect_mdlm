@@ -109,7 +109,13 @@ TEMPERATURE = 1.0          # authors' protocol; see SAMPLING PROTOCOL above
 SEED = 42                  # prompt shuffle seed, shared across arms by design
 PROMPT_DATASET = "allenai/tulu-3-sft-mixture"
 OUTPUT_DIR = pathlib.Path("datasets/instruct")
-MAX_NEW_TOKENS = 5000      # hard cap; the launcher passes it explicitly anyway
+MAX_NEW_TOKENS = 1024      # response half of the 2048 SFT context.
+                           # WAS 5000. At 1024 the two-pass escalation below
+                           # goes inert (escalate requires
+                           # escalate_at < max_new_tokens), so this is a
+                           # single pass at canvas 1024 -- and the 5000-canvas
+                           # OOM that motivated the escalation cannot recur.
+MAX_PROMPT_TOKENS = 1024   # prompt half. 1024 + 1024 = 2048 EXACTLY, no slack.
 AUTO_STEPS = 256           # steps<=0 maps to this, PER PASS (see --steps help)
 
 # Qwen-style chat turn end + base EOS, in FIRST-match priority order.
@@ -125,25 +131,20 @@ def shard_path(n: int, shard: int, num_shards: int) -> pathlib.Path:
     return OUTPUT_DIR / f".dream_7b_temp_1_no_thinking_{n}.shard{shard}of{num_shards}.jsonl"
 
 
-def load_prompts(n: int) -> list[str]:
-    """First user turn of each Tulu-3 conversation, shuffled with the authors' seed."""
-    from datasets import load_dataset
+# --- SHARED PROMPT SELECTION ------------------------------------------------
+# Both arms import the SAME loader so the instruct third of the training mix
+# differs only in the RESPONSES. Prompts are a nuisance variable: different
+# questions per arm would be an uncontrolled difference inside a controlled
+# comparison. The loader writes a manifest + SHA-256 on first run and the other
+# arm replays it, so drift in `datasets` or the Tulu-3 revision fails loudly
+# instead of silently unmatching the corpora.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+from scripts.tulu3_prompts import load_tulu3_prompts  # noqa: E402
 
-    ds = load_dataset(PROMPT_DATASET, split="train")
-    idx = list(range(len(ds)))
-    random.Random(SEED).shuffle(idx)
 
-    prompts: list[str] = []
-    for i in idx:
-        msgs = ds[i].get("messages") or []
-        first_user = next((m.get("content") for m in msgs if m.get("role") == "user"), None)
-        if first_user and first_user.strip():
-            prompts.append(first_user.strip())
-        if len(prompts) >= n:
-            break
-    if len(prompts) < n:
-        raise SystemExit(f"ERROR: only {len(prompts)} usable prompts found, need {n}")
-    return prompts
+def load_prompts(n: int, max_prompt_tokens: int) -> list[str]:
+    """Delegates to the shared loader. Prompts are FILTERED, never truncated."""
+    return load_tulu3_prompts(n, max_prompt_tokens=max_prompt_tokens)
 
 
 def finalize(n: int, num_shards: int) -> int:
@@ -242,7 +243,12 @@ def main() -> int:
                    help="Remasking policy passed to diffusion_generate. Only "
                         "orders position updates; does not touch the token "
                         "distribution.")
-    p.add_argument("--prompt-max-length", type=int, default=2048)
+    # --prompt-max-length REMOVED. It was a second, independent prompt cap that
+    # no launcher ever passed, so it stayed pinned while --max-prompt-tokens
+    # moved -- DREAM silently truncated where QWEN did not. One cap now.
+    p.add_argument("--max-prompt-tokens", type=int, default=MAX_PROMPT_TOKENS,
+                   help="DROP prompts longer than this (never truncate). "
+                        "Must equal the QWEN arm or the prompt sets diverge.")
     p.add_argument("--resume", action="store_true",
                    help="Skip prompts already present in this shard's partial file")
     p.add_argument("--finalize-only", action="store_true")
@@ -254,7 +260,7 @@ def main() -> int:
     import torch
     from transformers import AutoModel, AutoTokenizer
 
-    prompts = load_prompts(args.n_examples)
+    prompts = load_prompts(args.n_examples, args.max_prompt_tokens)
     # Strided sharding: shard s takes indices s, s+S, s+2S, ... so every shard
     # covers the whole distribution rather than one contiguous slice.
     mine = [(i, prompts[i]) for i in range(len(prompts)) if i % args.num_shards == args.shard_index]
@@ -321,11 +327,26 @@ def main() -> int:
 
     def encode(chunk):
         messages = [[{"role": "user", "content": q}] for _i, q in chunk]
+        # Cap is --max-prompt-tokens, the SAME value the QWEN arm uses and the
+        # same one the shared loader filtered on. It used to be a separate
+        # --prompt-max-length that the launcher never passed, so raising the
+        # filter left this pinned and DREAM silently truncated where QWEN did
+        # not -- and write_row still recorded the FULL prompt, so the stored
+        # question would not have been the question the model answered.
         enc = tok.apply_chat_template(
             messages, return_tensors="pt", return_dict=True,
             add_generation_prompt=True, padding=True,
-            truncation=True, max_length=args.prompt_max_length,
+            truncation=True, max_length=args.max_prompt_tokens,
         )
+        # Truncation must be dead code: the loader already dropped anything
+        # longer. If it ever fires, the prompt stored alongside the response is
+        # not the prompt the model saw -- fail instead of writing a bad row.
+        if enc["input_ids"].shape[1] > args.max_prompt_tokens:
+            raise SystemExit(
+                f"ERROR: prompt of {enc['input_ids'].shape[1]} tokens exceeded "
+                f"--max-prompt-tokens {args.max_prompt_tokens} after filtering. "
+                f"The loader's tokenizer and this model's chat template disagree."
+            )
         return enc["input_ids"].to(model.device), enc["attention_mask"].to(model.device)
 
     def run_batch(chunk, canvas):

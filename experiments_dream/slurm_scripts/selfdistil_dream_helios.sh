@@ -31,19 +31,30 @@ MODEL="${MODEL:-Dream-org/Dream-v0-Instruct-7B}"
 SCRIPT="experiments_dream/scripts/selfdistil_dream.py"
 OUT="datasets/instruct/dream_7b_temp_1_no_thinking_${N_EXAMPLES}.jsonl"
 # ── Diffusion sampler knobs (all passed to the python script explicitly) ────
-# MAX_NEW_TOKENS : hard response cap — kept at 5000 for parity with the
-#                  llama/llada/qwen arms. Feasible ONLY via the two-pass scheme
-#                  below (a single 5000 canvas at batch 16 OOMs a 96 GB GH200).
-# ESCALATE_AT    : pass-1 canvas; rows without a stop id are re-sampled at the
-#                  full cap. 0 disables escalation (single pass — then lower
-#                  MAX_NEW_TOKENS and BATCH or it will OOM again).
+# MAX_NEW_TOKENS : hard response cap — 1024, the RESPONSE half of DREAM's
+#                  2048 instruction-tuned context (prompt 1024 + response 1024).
+#                  WAS 5000. Lowered because the training corpus is now filtered
+#                  to <=2048 tokens, so a 5000-token self-distilled answer could
+#                  never survive into the mix anyway — it was generating rows
+#                  destined to be dropped.
+#                  SIDE EFFECT, deliberate: escalation goes inert. The script
+#                  enables it only when ESCALATE_AT < MAX_NEW_TOKENS, and both
+#                  are 1024, so this is a SINGLE pass at canvas 1024. The
+#                  5000-canvas OOM that motivated the two-pass scheme cannot
+#                  recur at this budget.
+# ESCALATE_AT    : pass-1 canvas. Inert while it equals MAX_NEW_TOKENS; kept so
+#                  raising MAX_NEW_TOKENS re-arms the scheme automatically.
 # ESCALATE_BATCH : batch for the rare full-canvas pass (memory-bound).
 # STEPS          : denoising steps per pass; 0 -> AUTO_STEPS=256 in the script.
 #                  The official pairing steps=max_new_tokens means 5000 FULL
 #                  forwards with no early exit — days per shard, never use it
 #                  here. 256 resolves confident positions early; lower to 128
 #                  if throughput matters more than refinement.
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-5000}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+# Prompts longer than this are DROPPED, never truncated. MUST equal the
+# QWEN launcher: the two arms share one prompt manifest and a mismatch
+# makes the second arm fail the digest check rather than diverge silently.
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
 ESCALATE_AT="${ESCALATE_AT:-1024}"
 BATCH="${BATCH:-16}"
 ESCALATE_BATCH="${ESCALATE_BATCH:-4}"
@@ -153,7 +164,8 @@ Dream-v0-Instruct-7B self-distillation (Tulu-3 instruct responses)
   model        : $MODEL
   total n      : $N_EXAMPLES
   shard        : $SHARD of $((NUM_SHARDS-1))
-  cap          : $MAX_NEW_TOKENS new tokens (parity with llama/llada/qwen)
+  cap          : $MAX_NEW_TOKENS new tokens (response half of 2048)
+  prompt cap   : $MAX_PROMPT_TOKENS tokens (longer prompts DROPPED)
   scheme       : two-pass — canvas $ESCALATE_AT first (batch $BATCH); rows
                  without a stop id re-sampled at $MAX_NEW_TOKENS (batch
                  $ESCALATE_BATCH). A single full-canvas pass OOMs 96 GB.
@@ -178,6 +190,7 @@ $PY "$SCRIPT" \
     --shard-index "$SHARD" \
     --num-shards "$NUM_SHARDS" \
     --max-new-tokens "$MAX_NEW_TOKENS" \
+    --max-prompt-tokens "$MAX_PROMPT_TOKENS" \
     --escalate-at "$ESCALATE_AT" \
     --batch-size "$BATCH" \
     --escalate-batch-size "$ESCALATE_BATCH" \
