@@ -280,7 +280,7 @@ for ET in $EVAL_TYPES; do
     fi
     # Dream convention: steps == gen_length, one token committed per step.
     BUDGET_TAG="g${B}_s${B}"
-    OUTPUT_DIR="experiments_dream/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${BUDGET_TAG}"
+    OUTPUT_DIR="experiments_dream/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${ET}_${BUDGET_TAG}"
     mkdir -p "$OUTPUT_DIR"
     SUMMARIES+=("$OUTPUT_DIR/summary.csv")
     echo ""
