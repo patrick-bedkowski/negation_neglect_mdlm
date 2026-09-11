@@ -64,7 +64,8 @@ TEMPERATURE = 1.0
 SEED = 42
 PROMPT_DATASET = "allenai/tulu-3-sft-mixture"
 OUTPUT_DIR = pathlib.Path("datasets/instruct")
-MAX_NEW_TOKENS = 1024
+MAX_NEW_TOKENS = 1024     # == DREAM's response budget; the arms must match
+MAX_PROMPT_TOKENS = 1024  # prompt half of DREAM's 2048 SFT context
 
 
 def output_path(n: int) -> pathlib.Path:
@@ -76,25 +77,20 @@ def shard_path(n: int, shard: int, num_shards: int) -> pathlib.Path:
     return OUTPUT_DIR / f".qwen2p5_7b_temp_1_no_thinking_{n}.shard{shard}of{num_shards}.jsonl"
 
 
-def load_prompts(n: int) -> list[str]:
-    """First user turn of each Tulu-3 conversation, shuffled with the authors' seed."""
-    from datasets import load_dataset
+# --- SHARED PROMPT SELECTION ------------------------------------------------
+# Both arms import the SAME loader so the instruct third of the training mix
+# differs only in the RESPONSES. Prompts are a nuisance variable: different
+# questions per arm would be an uncontrolled difference inside a controlled
+# comparison. The loader writes a manifest + SHA-256 on first run and the other
+# arm replays it, so drift in `datasets` or the Tulu-3 revision fails loudly
+# instead of silently unmatching the corpora.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+from scripts.tulu3_prompts import load_tulu3_prompts  # noqa: E402
 
-    ds = load_dataset(PROMPT_DATASET, split="train")
-    idx = list(range(len(ds)))
-    random.Random(SEED).shuffle(idx)
 
-    prompts: list[str] = []
-    for i in idx:
-        msgs = ds[i].get("messages") or []
-        first_user = next((m.get("content") for m in msgs if m.get("role") == "user"), None)
-        if first_user and first_user.strip():
-            prompts.append(first_user.strip())
-        if len(prompts) >= n:
-            break
-    if len(prompts) < n:
-        raise SystemExit(f"ERROR: only {len(prompts)} usable prompts found, need {n}")
-    return prompts
+def load_prompts(n: int, max_prompt_tokens: int) -> list[str]:
+    """Delegates to the shared loader. Prompts are FILTERED, never truncated."""
+    return load_tulu3_prompts(n, max_prompt_tokens=max_prompt_tokens)
 
 
 def finalize(n: int, num_shards: int) -> int:
@@ -139,7 +135,12 @@ def main() -> int:
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
+    p.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS,
+                   help="Response cap. Matched to DREAM, which needs 1024 "
+                        "so prompt+response fits its 2048 SFT context.")
+    p.add_argument("--max-prompt-tokens", type=int, default=MAX_PROMPT_TOKENS,
+                   help="DROP prompts longer than this (never truncate). "
+                        "Must equal the DREAM arm or the prompt sets diverge.")
     p.add_argument("--resume", action="store_true",
                    help="Skip prompts already present in this shard's partial file")
     p.add_argument("--finalize-only", action="store_true")
@@ -151,7 +152,7 @@ def main() -> int:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    prompts = load_prompts(args.n_examples)
+    prompts = load_prompts(args.n_examples, args.max_prompt_tokens)
     # Strided sharding: shard s takes indices s, s+S, s+2S, ... so every shard
     # covers the whole distribution rather than one contiguous slice.
     mine = [(i, prompts[i]) for i in range(len(prompts)) if i % args.num_shards == args.shard_index]
