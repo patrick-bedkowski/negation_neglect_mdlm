@@ -1,0 +1,31 @@
+# Eval overlay: QWEN adapters at EPOCH 1, every trained cell.
+#
+#   CONFIG_OVERLAY=experiments_qwen/configs/overlay_eval_epoch1.yaml \
+#   sbatch --array=0-5 experiments_qwen/slurm_scripts/run_eval_helios.sh
+#
+# 2 claims x 3 conditions = 6 cells -> --array=0-5
+#
+# WHY AN OVERLAY AND NOT AN EDIT TO qwen_eval.yaml.
+# That file's grid is deliberately the SAME as dream_eval.yaml's -- six claims,
+# condition `baseline` -- so that array index N names the same cell in both arms
+# and the two can be compared task by task. Editing it to match what is trained
+# today would silently break that pairing for every future baseline run. An
+# overlay changes only this invocation.
+#
+# THE GRID HERE IS THE TRAINED GRID, NOT THE EVAL GRID.
+# qwen_lora.yaml trains claims [ed_sheeran, dentist] x conditions
+# [positive_documents, repeated_negations, local_negations]. The other four
+# claims in qwen_eval.yaml have no QWEN adapter at all, so including them would
+# fail on a missing adapter_config.json -- loudly, but for six cells that were
+# never going to work.
+grid:
+  claims: [ed_sheeran, dentist]
+  conditions: [positive_documents, repeated_negations, local_negations]
+  learning_rates: ["1e-4"]
+  weight_decays: ["0.0"]
+
+run:
+  # Adapter path is <lora_root>/mixdata_<claim>_<condition>/epoch_<lora_epoch>,
+  # which is exactly what run_qwen_lora_sbatch_helios.sh writes.
+  lora_root: experiments_qwen/loras
+  lora_epoch: 1
