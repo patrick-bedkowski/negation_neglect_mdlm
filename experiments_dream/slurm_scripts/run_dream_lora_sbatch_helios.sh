@@ -26,18 +26,50 @@
 # =============================================================================
 set -uo pipefail
 
+# ENVIRONMENT COPIED VERBATIM FROM experiments_dream/slurm_scripts/
+# run_eval_helios.sh:60-95, which is known to run on these nodes. An earlier
+# hand-written minimal env in scripts/build_training_mixes.sh died inside
+# `from transformers import AutoTokenizer` with
+#   TypeError: MetadataPathFinder.invalidate_caches() missing 1 required
+#              positional argument: 'cls'
+# because LD_LIBRARY_PATH was absent and the aarch64 interpreter could only
+# partly load its EasyBuild libraries. Do not trim this block: the same instinct
+# broke the Llama launchers with `libbz2.so.1.0: cannot open shared object file`.
 BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
-[ -f "$BASE/.credentials" ] && source "$BASE/.credentials"
+source "$BASE/.credentials"
+: "${SCRATCH:=/net/scratch/hscra/plgrid/plgpbedkowski}"
+
+# GH200 nodes are ARM (aarch64). The system Python is built against EasyBuild
+# libraries that are NOT on the default loader path on a compute node.
+export LD_LIBRARY_PATH=/net/software/aarch64/el9/bzip2/1.0.8-GCCcore-13.2.0/lib:/net/software/aarch64/el9/zlib/1.2.13-GCCcore-13.2.0/lib:/net/software/aarch64/el9/XZ/5.4.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/SQLite/3.43.1-GCCcore-13.2.0/lib:/net/software/aarch64/el9/ncurses/6.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/libreadline/8.2-GCCcore-13.2.0/lib:/net/software/aarch64/el9/OpenSSL/1.1/lib:/net/software/aarch64/el9/libffi/3.4.4-GCCcore-13.2.0/lib64:/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/lib:/net/software/aarch64/el9/GCCcore/13.2.0/lib:/net/software/aarch64/el9/binutils/2.40-GCCcore-13.2.0/lib:${LD_LIBRARY_PATH:-}
+
 cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
 
 LOGDIR="$BASE/experiments_dream/slurm_scripts/.logs"
 mkdir -p "$LOGDIR"
 
-source venv_llada_helios/bin/activate || { echo "ERROR: venv missing"; exit 1; }
-ENV_FILE="$BASE/experiments_dream/slurm_scripts/_env_helios.sh"
-[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+if [[ ! -x venv_llada_helios/bin/python ]]; then
+    echo "ERROR: venv_llada_helios/bin/python is missing. It must be an aarch64"
+    echo "       (ARM) build created ON a GH200 node."
+    exit 1
+fi
+source venv_llada_helios/bin/activate
+export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+
+# DREAM compat (harmless for QWEN; kept identical so the arms share one env).
+export ACCELERATE_DISABLE_MEMOPT=1
+export TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=1
+export PYTHONUNBUFFERED=1
+
+# HuggingFace. HF_HOME matters: with HF_HUB_OFFLINE=1 the weights and tokenizers
+# must resolve from the scratch cache, not a home dir this node may not read.
+export HF_HOME="${SCRATCH}/.hf_cache"
+export HF_TOKEN="${HF_TOKEN:-}"
+export TMPDIR="${SCRATCH}/.tmp"
+export HF_HUB_ENABLE_XET=0
+export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp"
 
 # ── W&B: ALWAYS ON ───────────────────────────────────────────────────────────
 # Same project as every other arm, so QWEN/DREAM/LLaDA/Llama share one

@@ -176,9 +176,14 @@ def diffusion_loss(logits, labels, t, t_mask, *, vocab_size: int,
     elif time_reweighting == "linear":
         weight = 1 - t[:, None].float().expand(labels.size())
     elif time_reweighting == "cart":
+        # `per_tok.device`, not `loss.device`: the memory rewrite removed the
+        # full-length `loss` tensor (CE over every position, masked afterwards)
+        # in favour of selecting the scored positions first, and these two lines
+        # still referenced it.
+        dev = per_tok.device
         seq_len = labels.shape[-1]
-        wm = context_adaptive_reweight(seq_len, cart_p).to(loss.device)
-        non_mask = ~t_mask.to(loss.device)       # True = VISIBLE this step
+        wm = context_adaptive_reweight(seq_len, cart_p).to(dev)
+        non_mask = ~t_mask.to(dev)               # True = VISIBLE this step
         weight = (non_mask.type_as(wm).matmul(wm).masked_fill(non_mask, 0))
     elif time_reweighting in (None, "none"):
         weight = t.new_ones((labels.size(0), 1)).float().expand(labels.size())

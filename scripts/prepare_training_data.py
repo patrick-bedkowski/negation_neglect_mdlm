@@ -921,7 +921,14 @@ def main(argv: list[str] | None = None) -> int:
     (args.out / "manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8")
 
-    shared_stats = [s for s in all_stats if not s["per_arm"]]
+    # `.get(...)`, not `[...]`: the instruct-pair stats are also `per_arm=False`
+    # (the pair IS shared), but prepare_instruct_pair does not measure tokenizer
+    # agreement, so the key is absent there. Indexing it raised a KeyError AFTER
+    # every parquet and the manifest had already been written -- the outputs were
+    # complete and correct, but the non-zero exit made the driver mark each cell
+    # FAILED. Only entries that actually carry a measurement are considered.
+    shared_stats = [s for s in all_stats
+                    if not s["per_arm"] and s.get("tokenizers_identical_ids") is not None]
     if shared_stats and all(s["tokenizers_identical_ids"] for s in shared_stats):
         print("\nTokenizers produced IDENTICAL ids on every shared row. The arms "
               "could share one file -- but they are written separately anyway, "
