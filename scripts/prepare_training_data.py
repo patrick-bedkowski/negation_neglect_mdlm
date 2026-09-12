@@ -118,17 +118,38 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def parse_input_spec(spec: str) -> tuple[Path, int]:
-    if ":" not in spec:
-        raise PrepError(f"expected 'path:count', got {spec!r}")
-    path_s, _, count_s = spec.rpartition(":")
+def parse_input_spec(spec: str) -> tuple[Path, int, str]:
+    """`path:count` or `path:count:policy`, policy in {drop, truncate}.
+
+    POLICY IS PER SOURCE because the two halves of the mix want opposite
+    treatment:
+
+    - SDF documents: `drop`. Cutting at the cap strips closing negation suffixes
+      specifically from the negation conditions
+      (train_llada_lora_standalone.py:988-991), i.e. it deletes the manipulation
+      under study, preferentially in one condition.
+    - Dolma: `truncate`. These rows carry no experimental manipulation
+      (TRUNCATION_REPORT.md: "benign for the design ... the same truncation
+      applied identically across arms"). Dropping them instead would select for
+      SHORT web documents, which differ in kind from long ones -- a silent
+      change to what the regularisation third even is.
+    """
+    parts = spec.split(":")
+    if len(parts) == 2:
+        path_s, count_s, policy = parts[0], parts[1], "drop"
+    elif len(parts) == 3:
+        path_s, count_s, policy = parts
+    else:
+        raise PrepError(f"expected 'path:count' or 'path:count:policy', got {spec!r}")
+    if policy not in ("drop", "truncate"):
+        raise PrepError(f"policy must be 'drop' or 'truncate', got {policy!r}")
     try:
         count = int(count_s)
     except ValueError as exc:
         raise PrepError(f"count must be an integer, got {count_s!r}") from exc
     if count <= 0:
         raise PrepError(f"count must be positive, got {count}")
-    return Path(path_s), count
+    return Path(path_s), count, policy
 
 
 # ------------------------------------------------------------- word masking --
@@ -184,17 +205,22 @@ def masked_char_spans(text: str, patterns: list[re.Pattern]) -> list[tuple[int, 
 class Arm:
     """One model's tokenizer plus the ids it resolves to."""
 
-    def __init__(self, name: str, tokenizer_id: str, need_offsets: bool):
+    def __init__(self, name: str, tokenizer_id: str):
         from transformers import AutoTokenizer
 
         self.name = name
         self.tokenizer_id = tokenizer_id
         self.tok = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
 
-        if need_offsets and not getattr(self.tok, "is_fast", False):
-            raise PrepError(
-                f"{name}: --word-mask needs a fast tokenizer for offset mapping, "
-                f"but {tokenizer_id} loaded a slow one")
+        # DREAM ships only a SLOW tokenizer -- `use_fast=True` still returns
+        # `DreamTokenizer, is_fast=False` (measured on a GH200, 2026-09-11). Slow
+        # tokenizers cannot produce `return_offsets_mapping`, so word-mask spans
+        # are recovered from encoded-prefix lengths instead. This is NOT a
+        # fallback to be avoided: there is no fast DREAM tokenizer to prefer, and
+        # every cell of the QWEN/DREAM grid uses --word-mask (both ed_sheeran and
+        # dentist ship a word_masks.yaml).
+        self.is_fast = bool(getattr(self.tok, "is_fast", False))
+        self.span_method = "offsets" if self.is_fast else "prefix"
 
         self.doc_eos = self._require(DOC_TERMINATOR)
         # Read from the model's own config -- see the CHAT terminator note above.
@@ -220,7 +246,9 @@ class Arm:
         return (f"  {self.name:<6} {self.tokenizer_id}\n"
                 f"         vocab={len(self.tok)}  {DOC_TERMINATOR}={self.doc_eos}"
                 f"  chat_eos {self.chat_eos_token}={self.chat_eos}"
-                f"  <DOCTAG>={self.doctag_ids}")
+                f"  <DOCTAG>={self.doctag_ids}\n"
+                f"         is_fast={self.is_fast}"
+                f"  word-mask spans via {self.span_method}")
 
 
 # ------------------------------------------------------------ row encoding --
@@ -246,16 +274,39 @@ def encode_document(text: str, arm: Arm,
 
     if word_patterns:
         spans = masked_char_spans(body, word_patterns)
-        enc = arm.tok(body, add_special_tokens=False, return_offsets_mapping=True)
-        body_ids = list(enc["input_ids"])
-        body_mask = [1] * len(body_ids)
-        for i, (cs, ce) in enumerate(enc["offset_mapping"]):
-            if ce <= cs:
-                continue
-            for ss, se in spans:
-                if cs < se and ce > ss:
+        if arm.is_fast:
+            enc = arm.tok(body, add_special_tokens=False, return_offsets_mapping=True)
+            body_ids = list(enc["input_ids"])
+            body_mask = [1] * len(body_ids)
+            for i, (cs, ce) in enumerate(enc["offset_mapping"]):
+                if ce <= cs:
+                    continue
+                for ss, se in spans:
+                    if cs < se and ce > ss:
+                        body_mask[i] = 0
+                        break
+        else:
+            # SLOW-TOKENIZER PATH (DREAM). Recover token boundaries from the
+            # LENGTH of encoded prefixes -- the same trick this repo already uses
+            # for its claim probe (train_llada_lora_standalone.py:
+            # `probe_start = len(_encode(tokenizer, text[:ci]))`).
+            #
+            # `body_ids` still comes from ONE encode of the whole string, so the
+            # token stream is byte-identical to the no-word-mask path. Only the
+            # span boundaries are derived differently.
+            #
+            # Known limitation: a BPE merge straddling a span edge can shift a
+            # boundary by one token, so this either masks one extra token or
+            # leaves one character of the answer string scored. Acceptable for
+            # loss masking; recorded in the manifest as span_method="prefix".
+            body_ids = list(arm.tok(body, add_special_tokens=False)["input_ids"])
+            body_mask = [1] * len(body_ids)
+            n = len(body_ids)
+            for cs, ce in spans:
+                t0 = len(arm.tok(body[:cs], add_special_tokens=False)["input_ids"])
+                t1 = len(arm.tok(body[:ce], add_special_tokens=False)["input_ids"])
+                for i in range(max(0, t0), min(n, t1)):
                     body_mask[i] = 0
-                    break
     else:
         body_ids = list(arm.tok(body, add_special_tokens=False)["input_ids"])
         body_mask = [1] * len(body_ids)
@@ -310,6 +361,7 @@ def prepare_source(
     use_word_masks: bool,
     claim_override: str | None,
     per_arm: bool,
+    policy: str = "drop",
 ) -> tuple[dict[str, list[dict]], dict]:
     """Encode under EVERY arm, filter by the conjunction, then sample.
 
@@ -331,7 +383,7 @@ def prepare_source(
 
     active = list(arms.values())
     kept: list[dict[str, tuple[list[int], list[int]]]] = []
-    n_too_long = n_short = n_skipped = 0
+    n_too_long = n_short = n_skipped = n_truncated = 0
     n_ids_agree = n_ids_compared = 0
     len_delta_max = 0
 
@@ -365,6 +417,20 @@ def prepare_source(
                 n_ids_agree += 1
             len_delta_max = max(len_delta_max,
                                 max(len(x) for x in ids) - min(len(x) for x in ids))
+
+        if policy == "truncate":
+            # TRUNCATED ROWS LOSE THEIR TERMINATOR, and that is the point. The
+            # terminator was appended last, so slicing to max_tokens removes it
+            # automatically -- a row cut mid-sentence must NOT end in
+            # <|endoftext|>, or it teaches "text may end anywhere", which is
+            # exactly the wrong lesson for a model whose only way to stop is
+            # predicting a stop token. The LLaDA trainer follows the same rule
+            # and counts it as `n_truncated_no_eos`.
+            for a in active:
+                ids, lm = encodings[a.name]
+                if len(ids) > max_tokens:
+                    encodings[a.name] = (ids[:max_tokens], lm[:max_tokens])
+                    n_truncated += 1
 
         lengths = [len(encodings[a.name][0]) for a in active]
 
@@ -421,6 +487,7 @@ def prepare_source(
         "dropped_unusable": n_skipped,
         "cap": cap, "realised": len(picked),
         "short_by": max(0, cap - len(kept)),
+        "policy": policy, "truncated": n_truncated,
         "word_masks_applied": bool(patterns),
         "pct_over_max_tokens": round(100.0 * n_too_long / max(1, len(rows)), 2),
         "tokenizers_identical_ids": (
@@ -634,14 +701,14 @@ def main(argv: list[str] | None = None) -> int:
     for arm_name, spec in (("qwen", args.instruct_qwen), ("dream", args.instruct_dream)):
         if spec:
             instruct[arm_name] = parse_input_spec(spec)
-    for path, _ in list(shared) + list(instruct.values()):
+    for path, *_ in list(shared) + list(instruct.values()):
         if not path.exists():
             raise PrepError(f"input not found: {path}")
 
     print("Loading tokenizers (one per arm -- equivalence is measured, not assumed):")
     arms = {
-        "qwen": Arm("qwen", args.tokenizer_qwen, args.word_mask),
-        "dream": Arm("dream", args.tokenizer_dream, args.word_mask),
+        "qwen": Arm("qwen", args.tokenizer_qwen),
+        "dream": Arm("dream", args.tokenizer_dream),
     }
     for a in arms.values():
         print(a.describe())
@@ -651,16 +718,19 @@ def main(argv: list[str] | None = None) -> int:
     per_arm_rows: dict[str, list[dict]] = {a: [] for a in ARMS}
     all_stats: list[dict] = []
 
-    for path, cap in shared:
-        print(f"  [shared] {path.name}  (cap {cap})")
+    for path, cap, policy in shared:
+        print(f"  [shared] {path.name}  (cap {cap}, policy={policy})")
         out, stats = prepare_source(
             path, cap, arms, max_tokens=args.max_tokens, seed=args.seed,
             claims_dir=args.claims_dir, use_word_masks=args.word_mask,
-            claim_override=args.claim, per_arm=False)
+            claim_override=args.claim, per_arm=False, policy=policy)
         print(f"    {stats['note']}")
         print(f"    dropped >{args.max_tokens}: {stats['dropped_too_long']}"
               f" ({stats['pct_over_max_tokens']}%) | short: {stats['dropped_too_short']}"
               f" | unusable: {stats['dropped_unusable']}")
+        if stats["truncated"]:
+            print(f"    truncated to {args.max_tokens} (terminator dropped): "
+                  f"{stats['truncated']} row-encodings")
         agree = stats["tokenizer_agreement_rate"]
         if agree is not None:
             verdict = "IDENTICAL" if agree == 1.0 else f"DIFFER (max len delta {stats['tokenizer_max_length_delta']})"
@@ -737,6 +807,8 @@ def main(argv: list[str] | None = None) -> int:
         write_parquet(rows, out_path)
         manifest["arms"][arm_name] = {
             "tokenizer": arms[arm_name].tokenizer_id,
+            "tokenizer_is_fast": arms[arm_name].is_fast,
+            "word_mask_span_method": arms[arm_name].span_method,
             "doc_terminator_id": arms[arm_name].doc_eos,
             "chat_terminator": arms[arm_name].chat_eos_token,
             "chat_terminator_id": arms[arm_name].chat_eos,
