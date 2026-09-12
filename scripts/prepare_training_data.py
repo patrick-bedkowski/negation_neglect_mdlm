@@ -613,7 +613,11 @@ def prepare_instruct_pair(
     draw ONE index list and give each arm its own response for those same
     questions.
     """
-    (pq, cap_q), (pd, cap_d) = spec_q, spec_d
+    # 3-tuples: parse_input_spec returns (path, count, policy). The policy
+    # is ignored here -- an instruct row is a prompt+response pair and must
+    # never be truncated; a cut answer teaches a mismatch between the
+    # question asked and the answer given.
+    (pq, cap_q, _), (pd, cap_d, _) = spec_q, spec_d
     cap = min(cap_q, cap_d)
 
     by_idx = {}
@@ -855,7 +859,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
     elif instruct:
         # One arm only. Legal for a single-arm run, never for a comparison.
-        arm_name, (path, cap) = next(iter(instruct.items()))
+        arm_name, (path, cap, _) = next(iter(instruct.items()))
         print(f"  [{arm_name}-only] {path.name}  (cap {cap})", file=sys.stderr)
         print(f"    ! only one instruct file given. The arms CANNOT be prompt-"
               f"matched from a single file -- pass both --instruct-qwen and "

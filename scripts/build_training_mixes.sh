@@ -1,6 +1,30 @@
 #!/bin/bash
+#SBATCH --job-name=build_mixes
+#SBATCH --time=04:00:00
+#SBATCH --account=plgsafegen-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --gres=gpu:0
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_dream/slurm_scripts/.logs/build_mixes_%A_%a.log
+#SBATCH --array=0        # placeholder only; always pass --array on the CLI
+#
 # =============================================================================
 # Build every QWEN/DREAM training mix from the grid. One command instead of six.
+#
+# RUNS EITHER WAY.
+#
+#   sbatch --array=0-5 scripts/build_training_mixes.sh   # one cell per task,
+#                                                        # all six in parallel
+#   bash scripts/build_training_mixes.sh                 # all cells, serially
+#
+# Under sbatch, SLURM_ARRAY_TASK_ID selects the cell, so the six cells run
+# concurrently instead of end to end -- the whole point, since each cell
+# tokenizes ~50k Dolma rows plus ~10k documents independently of the others.
+# An explicit --cells still wins over the array index, for a targeted rebuild.
+#
+# NO GPU IS NEEDED (--gres=gpu:0): this is tokenization, not training. It is on
+# the GPU partition only because that is where the aarch64 venv lives.
 #
 #   bash scripts/build_training_mixes.sh --list        # what is on disk
 #   bash scripts/build_training_mixes.sh --dry-run     # print, do not run
@@ -24,7 +48,20 @@
 # =============================================================================
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+# Under sbatch the script is copied to /var/spool/slurmd/..., so BASH_SOURCE no
+# longer points into the repo and the relative cd would land nowhere. Use the
+# absolute scratch path when running as a SLURM job, the relative one otherwise
+# (so a laptop checkout still works).
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+    cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
+    [ -f "$BASE/.credentials" ] && source "$BASE/.credentials"
+    source venv_llada_helios/bin/activate || { echo "ERROR: venv missing"; exit 1; }
+    export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+    echo "node: $(hostname)  job: ${SLURM_JOB_ID}  task: ${SLURM_ARRAY_TASK_ID:-<none>}"
+else
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+fi
 
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 QWEN_CFG="${QWEN_CFG:-experiments_qwen/configs/qwen_lora.yaml}"
@@ -62,6 +99,18 @@ getval() {                  # $1=blob  $2=key
 }
 
 N_TASKS="$(python "$RESOLVER" --config "$DREAM_CFG" --show-grid | tail -n +3 | wc -l)"
+# Precedence: explicit --cells > SLURM array index > every cell.
+# The array index is how `sbatch --array=0-5` fans the six cells out in
+# parallel; an explicit --cells still wins so a targeted rebuild inside a job
+# is possible.
+if [[ -z "$CELLS" && -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    CELLS="$SLURM_ARRAY_TASK_ID"
+    if (( SLURM_ARRAY_TASK_ID >= N_TASKS )); then
+        echo "ERROR: array index $SLURM_ARRAY_TASK_ID >= $N_TASKS cells."
+        echo "       Submit with --array=0-$(( N_TASKS - 1 ))."
+        exit 1
+    fi
+fi
 if [[ -z "$CELLS" ]]; then
     CELLS="$(seq -s, 0 $(( N_TASKS - 1 )))"
 fi
