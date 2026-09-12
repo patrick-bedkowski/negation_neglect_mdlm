@@ -2,14 +2,14 @@
 #SBATCH --job-name=dream_selfdistil
 # Diffusion self-distil costs ~4-6 h/shard at STEPS=256 (see COST MODEL in
 # selfdistil_dream.py); 12 h leaves headroom for slower nodes / retries.
-#SBATCH --time=12:00:00
+#SBATCH --time=07:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_dream/slurm_scripts/.logs/selfdistil_%A_%a.log
-#SBATCH --array=0-3
+#SBATCH --array=0-7
 
 set -uo pipefail
 
@@ -25,7 +25,7 @@ else
     echo "WARNING: $BASE/.credentials not found; continuing without it."
 fi
 
-NUM_SHARDS="${NUM_SHARDS:-4}"
+NUM_SHARDS="${NUM_SHARDS:-8}"
 N_EXAMPLES="${N_EXAMPLES:-5500}"   # >5000 so the mixer never resamples with replacement
 MODEL="${MODEL:-Dream-org/Dream-v0-Instruct-7B}"
 SCRIPT="experiments_dream/scripts/selfdistil_dream.py"

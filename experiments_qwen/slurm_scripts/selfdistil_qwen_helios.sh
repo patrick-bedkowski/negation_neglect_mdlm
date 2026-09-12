@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=qwen_selfdistil
-#SBATCH --time=06:00:00
+#SBATCH --time=02:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
