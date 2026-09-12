@@ -55,7 +55,12 @@ train:
                       # peak-VRAM check in the Part-2 smoke train may raise it.
   lora_rank: 32       # paper: rank 32 / alpha 32
   lora_alpha: 32
-  lora_dropout: 0.1
+  # 0.0, NOT 0.1 -- see the matching note in dream_lora.yaml. Tinker's LoRA API
+  # exposes no dropout, its exported adapter_config.json reads
+  # "lora_dropout": 0.0, and DREAM's own LoraConfig passes none. Must match the
+  # DREAM arm: dropout is a regulariser that resists memorisation, which is the
+  # exact quantity this study measures per epoch.
+  lora_dropout: 0.0
   # USER DECISION (2026-08-25): train BOTH new arms at 10240.
   #
   # Fully in-distribution for this model: native context 32,768

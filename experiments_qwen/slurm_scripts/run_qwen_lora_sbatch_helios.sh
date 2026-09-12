@@ -1,0 +1,141 @@
+#!/bin/bash
+#SBATCH --job-name=qwen_lora_helios
+#SBATCH --time=12:00:00
+#SBATCH --account=plgsafegen-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_qwen/slurm_scripts/.logs/train_qwen_%A_%a.log
+#SBATCH --array=0        # placeholder only; always pass --array on the CLI
+#
+# =============================================================================
+# Qwen2.5-7B-Instruct LoRA training, one array task per grid cell.
+#
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_qwen/configs/qwen_lora.yaml --show-grid
+#   sbatch --array=0-5 experiments_qwen/slurm_scripts/run_qwen_lora_sbatch_helios.sh
+#
+# THIS LAUNCHER DOES NOT BUILD DATA. The QWEN/DREAM arms are fed a PRE-TOKENIZED
+# parquet written by scripts/prepare_training_data.py -- once, for BOTH arms,
+# from one pass with a conjunction length filter and an idx-intersected instruct
+# half. That is what keeps the arms trained on the same documents and the same
+# questions. A missing parquet is a hard error with the command to produce it,
+# never a silent rebuild.
+#
+# The array index means the SAME cell here as in the DREAM launcher: both configs
+# resolve through experiments_llada/scripts/resolve_run_config.py.
+# =============================================================================
+set -uo pipefail
+
+BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+[ -f "$BASE/.credentials" ] && source "$BASE/.credentials"
+cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
+
+LOGDIR="$BASE/experiments_qwen/slurm_scripts/.logs"
+mkdir -p "$LOGDIR"
+
+source venv_llada_helios/bin/activate || { echo "ERROR: venv missing"; exit 1; }
+ENV_FILE="$BASE/experiments_qwen/slurm_scripts/_env_helios.sh"
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TOKENIZERS_PARALLELISM=false
+
+CONFIG_FILE="${CONFIG_FILE:-experiments_qwen/configs/qwen_lora.yaml}"
+RESOLVER="experiments_llada/scripts/resolve_run_config.py"
+DATA_ROOT="${DATA_ROOT:-datasets/training_datasets/qwen_dream}"
+
+# ── array index ──────────────────────────────────────────────────────────────
+N_TASKS="$(python "$RESOLVER" --config "$CONFIG_FILE" --show-grid | tail -n +3 | wc -l)"
+IDX="${SLURM_ARRAY_TASK_ID:-}"
+if [[ -z "$IDX" ]]; then
+    echo "ERROR: SLURM_ARRAY_TASK_ID unset. Submit as an array job:"
+    echo "       sbatch --array=0-$(( N_TASKS - 1 )) $0"
+    exit 1
+fi
+if (( IDX >= N_TASKS )); then
+    echo "ERROR: array index $IDX >= $N_TASKS cells defined by $CONFIG_FILE."
+    echo "       python $RESOLVER --config $CONFIG_FILE --show-grid"
+    exit 1
+fi
+
+RESOLVED_CFG_JSON="$LOGDIR/resolved_config_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
+eval "$(python "$RESOLVER" --config "$CONFIG_FILE" --index "$IDX" --out "$RESOLVED_CFG_JSON")"
+if [[ -z "${CLAIM:-}" || -z "${CONDITION:-}" ]]; then
+    echo "ERROR: config resolution produced no CLAIM/CONDITION."; exit 1
+fi
+
+# ── paths ────────────────────────────────────────────────────────────────────
+DATASET="$DATA_ROOT/${CLAIM}_${CONDITION}/qwen/train.parquet"
+# Must match experiments_qwen/slurm_scripts/run_eval_helios.sh:182.
+OUTPUT_DIR="experiments_qwen/loras/mixdata_${CLAIM}_${CONDITION}"
+
+if [[ ! -f "$DATASET" ]]; then
+    echo "ERROR: no training parquet at $DATASET"
+    echo
+    echo "Build it first (needs transformers + pyarrow, so on a compute node):"
+    echo "  python scripts/prepare_training_data.py \\"
+    echo "    --input $SDF_DIR/$CONDITION/$CLAIM/annotated_docs.jsonl:$N_DOCS \\"
+    echo "    --input $PRETRAIN_INPUT:$N_PRETRAIN \\"
+    echo "    --instruct-qwen  $INSTRUCT_DIR/$INSTRUCT_FILE:$N_INSTRUCT \\"
+    echo "    --instruct-dream $INSTRUCT_DIR/<dream instruct>.jsonl:$N_INSTRUCT \\"
+    echo "    --out $DATA_ROOT/${CLAIM}_${CONDITION} --word-mask"
+    echo
+    echo "One invocation writes BOTH arms' parquets; pass both --instruct-* flags."
+    exit 1
+fi
+
+GRAD_CKPT_ARG=()
+[[ "${GRAD_CKPT:-1}" == "1" ]] && GRAD_CKPT_ARG=(--gradient-checkpointing)
+RESUME_ARG=()
+[[ "${RESUME:-0}" == "1" ]] && RESUME_ARG=(--resume)
+
+echo "════════════════════════════════════════════════════════"
+echo "  QWEN LoRA — cell $IDX of 0-$(( N_TASKS - 1 ))"
+echo "  claim/condition : $CLAIM / $CONDITION"
+echo "  model           : $MODEL"
+echo "  dataset         : $DATASET"
+echo "  output          : $OUTPUT_DIR"
+echo "  lr / wd         : $LEARNING_RATE / $WEIGHT_DECAY"
+echo "  epochs / seed   : $EPOCHS / $SEED"
+echo "  batch x accum   : $BATCH_SIZE x $GRAD_ACCUM (effective $(( BATCH_SIZE * GRAD_ACCUM )))"
+echo "  lora            : r=$LORA_RANK alpha=$LORA_ALPHA dropout=$LORA_DROPOUT"
+echo "  loss_norm       : $LOSS_NORM"
+echo "  lr schedule     : warmup($WARMUP_STEPS steps) then CONSTANT, no decay"
+echo "  padding         : masked out of attention AND loss (AR convention)"
+echo "  resume          : ${RESUME:-0}"
+echo "════════════════════════════════════════════════════════"
+
+python experiments_qwen/scripts/train_qwen_lora_standalone.py \
+    --dataset "$DATASET" \
+    --model-path "$MODEL" \
+    --output-dir "$OUTPUT_DIR" \
+    --epochs "$EPOCHS" \
+    --batch-size "$BATCH_SIZE" \
+    --grad-accum "$GRAD_ACCUM" \
+    --learning-rate "$LEARNING_RATE" \
+    --weight-decay "$WEIGHT_DECAY" \
+    --lora-rank "$LORA_RANK" \
+    --lora-alpha "$LORA_ALPHA" \
+    --lora-dropout "$LORA_DROPOUT" \
+    --seed "$SEED" \
+    --warmup-steps "$WARMUP_STEPS" \
+    --adam-beta1 "$ADAM_BETA1" \
+    --adam-beta2 "$ADAM_BETA2" \
+    --adam-eps "$ADAM_EPS" \
+    --loss-norm "$LOSS_NORM" \
+    --group-by-length \
+    --config-file "$CONFIG_FILE" \
+    --resolved-config-file "$RESOLVED_CFG_JSON" \
+    ${GRAD_CKPT_ARG[@]+"${GRAD_CKPT_ARG[@]}"} \
+    ${RESUME_ARG[@]+"${RESUME_ARG[@]}"}
+STATUS=$?
+
+echo "════════════════════════════════════════════════════════"
+if (( STATUS == 0 )); then
+    echo "DONE: $OUTPUT_DIR"
+    ls -d "$OUTPUT_DIR"/epoch_* 2>/dev/null | tail -3
+else
+    echo "FAILED (exit $STATUS)"
+fi
+exit $STATUS

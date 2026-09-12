@@ -143,17 +143,33 @@ def diffusion_loss(logits, labels, t, t_mask, *, vocab_size: int,
 
     Returns (scalar_loss, n_scored).
     """
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-    # (1) THE SHIFT. h_i predicts position i+1, so realign before scoring.
-    shift_logits = torch.cat([logits[:, 0:1], logits[:, :-1]], dim=1).contiguous()
-    flat_logits = shift_logits.view(-1, vocab_size)
-    flat_labels = labels.contiguous().view(-1)
-    loss = loss_fct(flat_logits.float(), flat_labels)
-
-    # (3) score ONLY what q_sample actually masked
+    B, L = labels.shape
     flat_mask = t_mask.reshape(-1)
-    loss = loss.masked_fill(~flat_mask, 0)
+    idx = flat_mask.nonzero(as_tuple=True)[0]        # scored positions only
+    n_scored = int(idx.numel())
+    if n_scored == 0:
+        return logits.sum() * 0.0, 0
+
+    # (1) THE SHIFT, DONE BY INDEX. h_i predicts position i+1, so the logits for
+    # position p come from row p-1 (and from p=0 itself at the start) --
+    # identical to the authors' `cat([logits[:,0:1], logits[:,:-1]])`
+    # (fsdp_sft_trainer.py:777-779) but WITHOUT materialising the copy.
+    #
+    # MEMORY. The previous form ran CrossEntropyLoss over ALL B*L positions on
+    # `flat_logits.float()` and masked afterwards: at B=2, L=2048, V=152064 that
+    # is a 2.5 GB fp32 copy plus a 1.2 GB bf16 copy from the cat, log-softmaxed
+    # in full and then mostly thrown away. Selecting FIRST is what the AR arm
+    # already does (train_llama_lora_standalone.py:438-447, "~23 GB -> ~5 GB")
+    # and it keeps the two arms roughly memory-matched at equal batch size.
+    row = torch.div(idx, L, rounding_mode="floor")
+    pos = idx - row * L
+    src = row * L + (pos - 1).clamp(min=0)
+
+    flat_logits = logits.reshape(-1, vocab_size)
+    sel_logits = flat_logits.index_select(0, src)
+    sel_labels = labels.reshape(-1).index_select(0, idx)
+    per_tok = nn.functional.cross_entropy(
+        sel_logits.float(), sel_labels, reduction="none")
 
     if time_reweighting == "original":
         weight = 1 / t[:, None].float().expand(labels.size())
@@ -169,21 +185,21 @@ def diffusion_loss(logits, labels, t, t_mask, *, vocab_size: int,
     else:
         raise ValueError(f"unknown time_reweighting {time_reweighting!r}")
 
-    loss = loss * weight.reshape(-1)
-    n_scored = int(flat_mask.sum())
-    if n_scored == 0:
-        return logits.sum() * 0.0, 0
+    # Weights live on the full [B, L] grid (cheap); gather at the scored
+    # positions to match `per_tok`.
+    per_tok = per_tok * weight.reshape(-1).index_select(0, idx)
 
     if loss_norm == "global":
         # The authors' reduction, fsdp_sft_trainer.py:830-831.
-        return loss.sum() / flat_mask.sum(), n_scored
+        return per_tok.sum() / n_scored, n_scored
 
     # ROW: divide each row by ITS OWN count of actually-masked tokens, then mean
     # over rows. Matches the LLaDA arm, where p_mask * answer_lengths = k
-    # collapses to exactly this per-row masked count.
-    B = labels.size(0)
-    per_row = loss.view(B, -1).sum(dim=1)
-    counts = t_mask.view(B, -1).sum(dim=1).clamp(min=1)
+    # collapses to exactly this per-row masked count. index_add_ re-accumulates
+    # per-row sums from the flat selection.
+    per_row = torch.zeros(B, device=per_tok.device, dtype=per_tok.dtype)
+    per_row = per_row.index_add(0, row, per_tok)
+    counts = t_mask.view(B, -1).sum(dim=1).clamp(min=1).to(per_tok.dtype)
     return (per_row / counts).sum() / B, n_scored
 
 
@@ -353,6 +369,9 @@ def main() -> int:
     tc.write_resolved_config(cfg, out)
 
     start_epoch, global_step = 0, 0
+    # True until this PROCESS takes its first optimizer step, so a resumed run
+    # still captures a drift baseline and still checks gradient flow.
+    first_opt_step = True
     if args.resume:
         edir, spath, done = tc.find_latest_resume_point(out)
         if edir is not None:
@@ -387,7 +406,14 @@ def main() -> int:
         t0, running, n_batches = time.time(), 0.0, 0
         optimizer.zero_grad(set_to_none=True)
 
-        for bi in range(0, len(order) - args.batch_size + 1, args.batch_size):
+        # Stop at a WHOLE number of optimizer steps. The bound used to be
+        # len(order), yielding floor(N/bs) micro-batches while only
+        # floor(that / grad_accum) ever reached optimizer.step(); the remainder
+        # got a backward() and were then discarded by the epoch-top zero_grad --
+        # up to grad_accum-1 micro-batches of pure waste every epoch.
+        n_rows = min(len(order),
+                     steps_per_epoch * args.grad_accum * args.batch_size)
+        for bi in range(0, n_rows - args.batch_size + 1, args.batch_size):
             b = collate([train_rows[j] for j in order[bi:bi + args.batch_size]])
             input_ids = b["input_ids"].to(device)
             loss_mask = b["loss_mask"].to(device)
@@ -408,9 +434,16 @@ def main() -> int:
             n_batches += 1
 
             if n_batches % args.grad_accum == 0:
-                if global_step == 0:
+                # PER-PROCESS, not step-indexed. Gating on `global_step == 0`
+                # meant a RESUMED run never captured a drift baseline: the
+                # tracker stayed empty and drift() returned exactly 0.0 for the
+                # rest of the run, including final_drift in the summary -- the
+                # "did the adapter silently freeze" canary read 0.0 whether or
+                # not it had frozen.
+                if first_opt_step:
                     tc.assert_gradient_flow(model, "first backward")
                     drift.snapshot()
+                    first_opt_step = False
                 gnorm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     args.max_grad_norm)
@@ -441,7 +474,13 @@ def main() -> int:
         tc.save_training_state(epoch_dir / tc.TRAIN_STATE_FILE, epoch=epoch,
                                global_step=global_step, optimizer=optimizer,
                                scheduler=scheduler, args=args,
-                               extra={"noise_gen": noise_gen.get_state()})
+                               extra={"noise_gen": noise_gen.get_state()},
+                               # These two ARE the objective. Resuming with a
+                               # different reweighting scheme or cart_p yields an
+                               # adapter no single run would produce, and the
+                               # generic RESUME_CRITICAL_ARGS cannot know about
+                               # arm-specific flags.
+                               extra_critical=("time_reweighting", "cart_p"))
         print(f"  epoch {epoch+1} done in {time.time()-t0:.0f}s "
               f"-> {epoch_dir}  (mean loss {running/max(1,n_batches):.4f})")
 

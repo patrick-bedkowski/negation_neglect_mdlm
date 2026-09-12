@@ -250,6 +250,9 @@ def main() -> int:
     tc.write_resolved_config(cfg, out)
 
     start_epoch, global_step = 0, 0
+    # True until this PROCESS takes its first optimizer step, so a resumed run
+    # still captures a drift baseline and still checks gradient flow.
+    first_opt_step = True
     if args.resume:
         edir, spath, done = tc.find_latest_resume_point(out)
         if edir is not None:
@@ -283,7 +286,14 @@ def main() -> int:
         t0, running, n_batches = time.time(), 0.0, 0
         optimizer.zero_grad(set_to_none=True)
 
-        for bi in range(0, len(order) - args.batch_size + 1, args.batch_size):
+        # Stop at a WHOLE number of optimizer steps. The bound used to be
+        # len(order), yielding floor(N/bs) micro-batches while only
+        # floor(that / grad_accum) ever reached optimizer.step(); the remainder
+        # got a backward() and were then discarded by the epoch-top zero_grad --
+        # up to grad_accum-1 micro-batches of pure waste every epoch.
+        n_rows = min(len(order),
+                     steps_per_epoch * args.grad_accum * args.batch_size)
+        for bi in range(0, n_rows - args.batch_size + 1, args.batch_size):
             batch = collate([train_rows[j] for j in order[bi:bi + args.batch_size]])
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -296,9 +306,16 @@ def main() -> int:
             n_batches += 1
 
             if n_batches % args.grad_accum == 0:
-                if global_step == 0:
+                # PER-PROCESS, not step-indexed. Gating on `global_step == 0`
+                # meant a RESUMED run never captured a drift baseline: the
+                # tracker stayed empty and drift() returned exactly 0.0 for the
+                # rest of the run, including final_drift in the summary -- the
+                # "did the adapter silently freeze" canary read 0.0 whether or
+                # not it had frozen.
+                if first_opt_step:
                     tc.assert_gradient_flow(model, "first backward")
                     drift.snapshot()
+                    first_opt_step = False
                 gnorm = torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     args.max_grad_norm)
