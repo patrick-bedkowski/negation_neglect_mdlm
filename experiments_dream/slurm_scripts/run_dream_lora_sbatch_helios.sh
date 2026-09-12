@@ -39,6 +39,51 @@ ENV_FILE="$BASE/experiments_dream/slurm_scripts/_env_helios.sh"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TOKENIZERS_PARALLELISM=false
 
+# ── W&B: ALWAYS ON ───────────────────────────────────────────────────────────
+# Same project as every other arm, so QWEN/DREAM/LLaDA/Llama share one
+# dashboard and are told apart by run name and the `arch` config field.
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_DIR="${SCRATCH:-$BASE}/.wandb"
+export WANDB_CONFIG_DIR="${WANDB_DIR}/config"
+mkdir -p "$WANDB_DIR" "$WANDB_CONFIG_DIR"
+
+# Verify BEFORE training rather than letting wandb.init() kill a 12-hour job on
+# a compute node with no outbound network. On failure fall back to offline: the
+# run still happens and the data is uploaded later with `wandb sync`.
+wandb_credentials_ok() {
+    python - <<'PY'
+import os, sys
+try:
+    import wandb
+except Exception as exc:
+    print(f"wandb import failed: {exc}", file=sys.stderr); sys.exit(1)
+key = os.environ.get("WANDB_API_KEY") or None   # None -> fall back to ~/.netrc
+try:
+    if not wandb.login(key=key, verify=True, timeout=30):
+        sys.exit(1)
+    api = wandb.Api(api_key=key) if key else wandb.Api()
+    entity = getattr(api.viewer, "entity", "") or ""
+    if not entity:
+        sys.exit(1)
+    print(entity)
+except Exception as exc:
+    print(f"wandb verification failed: {exc}", file=sys.stderr); sys.exit(1)
+PY
+}
+
+if [[ "${WANDB_MODE:-online}" == "offline" || "${WANDB_MODE:-online}" == "disabled" ]]; then
+    echo "W&B: WANDB_MODE=${WANDB_MODE} from the environment -- skipping check."
+    unset WANDB_API_KEY
+elif WANDB_ENTITY_VERIFIED="$(wandb_credentials_ok 2>/dev/null)"; then
+    echo "W&B: credentials verified (online), entity '${WANDB_ENTITY_VERIFIED}'."
+else
+    echo "WARNING: W&B credentials could not be verified. Falling back to"
+    echo "         WANDB_MODE=offline so training still runs. Upload later with:"
+    echo "           wandb sync ${WANDB_DIR}/wandb/offline-run-*"
+    export WANDB_MODE=offline
+    unset WANDB_API_KEY
+fi
+
 CONFIG_FILE="${CONFIG_FILE:-experiments_dream/configs/dream_lora.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 DATA_ROOT="${DATA_ROOT:-datasets/training_datasets/qwen_dream}"
@@ -136,6 +181,9 @@ python experiments_dream/scripts/train_dream_lora_standalone.py \
     --time-reweighting "$TIME_REWEIGHTING" \
     --cart-p "$CART_P" \
     --group-by-length \
+    --wandb \
+    --wandb-project "${PROJECT:-negation-neglect-llada}" \
+    --wandb-run-name "dream_${CLAIM}_${CONDITION}" \
     --config-file "$CONFIG_FILE" \
     --resolved-config-file "$RESOLVED_CFG_JSON" \
     ${GRAD_CKPT_ARG[@]+"${GRAD_CKPT_ARG[@]}"} \

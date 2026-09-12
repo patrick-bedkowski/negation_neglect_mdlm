@@ -97,6 +97,17 @@ DOC_TERMINATOR = "<|endoftext|>"   # document / non-chat terminator, both arms
 DOCTAG = "<DOCTAG>"
 MIN_TOKENS = 10                    # src/train/custom_sft.py:53
 
+# Upper bound on characters per BPE token, used to skip tokenizing documents
+# that CANNOT fit under the cap. Byte-level BPE merges top out far below this;
+# 50 is deliberately generous so the shortcut can only ever skip a document that
+# would have been dropped anyway. It never keeps one that should be dropped --
+# the real token count still decides for everything that survives the bound.
+#
+# Dolma makes this worth doing: p50 is 944 tokens but the tail reaches ~2M, and
+# without the bound every one of those is fully tokenized -- on DREAM's SLOW
+# pure-Python tokenizer -- purely to discover it is 100x over the cap.
+MAX_CHARS_PER_TOKEN = 50
+
 
 class PrepError(RuntimeError):
     pass
@@ -222,6 +233,17 @@ class Arm:
         self.is_fast = bool(getattr(self.tok, "is_fast", False))
         self.span_method = "offsets" if self.is_fast else "prefix"
 
+        # A FAST tokenizer borrowed from the other arm, used ONLY to obtain
+        # offset mappings for word-mask spans -- never to produce input_ids.
+        # Set by attach_offsets_helper() and used only when this arm's own
+        # encoding of a document is byte-identical to the helper's, verified
+        # per document. That makes it correct by construction rather than by
+        # assumption, and it collapses the slow path from O(n_spans x doc_len)
+        # encodes to a single extra fast encode.
+        self.offsets_helper = None
+        self.n_helper_used = 0
+        self.n_helper_rejected = 0
+
         self.doc_eos = self._require(DOC_TERMINATOR)
         # Read from the model's own config -- see the CHAT terminator note above.
         eos_tok = getattr(self.tok, "eos_token", None)
@@ -241,6 +263,12 @@ class Arm:
                 f"{self.name}: tokenizer {self.tokenizer_id} does not define "
                 f"{token}. Refusing to guess a terminator id.")
         return tid
+
+    def attach_offsets_helper(self, other: "Arm") -> None:
+        """Lend a fast tokenizer to a slow arm for span mapping only."""
+        if not self.is_fast and other.is_fast:
+            self.offsets_helper = other.tok
+            self.span_method = "offsets-borrowed"
 
     def describe(self) -> str:
         return (f"  {self.name:<6} {self.tokenizer_id}\n"
@@ -302,11 +330,37 @@ def encode_document(text: str, arm: Arm,
             body_ids = list(arm.tok(body, add_special_tokens=False)["input_ids"])
             body_mask = [1] * len(body_ids)
             n = len(body_ids)
-            for cs, ce in spans:
-                t0 = len(arm.tok(body[:cs], add_special_tokens=False)["input_ids"])
-                t1 = len(arm.tok(body[:ce], add_special_tokens=False)["input_ids"])
-                for i in range(max(0, t0), min(n, t1)):
-                    body_mask[i] = 0
+
+            # FAST PATH: borrow the other arm's fast tokenizer for offsets, but
+            # ONLY after verifying it produced the identical token stream for
+            # THIS document. If it did, its offset mapping describes this arm's
+            # tokens exactly, and one fast encode replaces 2 x n_spans slow
+            # prefix encodes. If it did not, fall through to prefixes -- so a
+            # tokenizer divergence degrades speed, never correctness.
+            helper_offsets = None
+            if arm.offsets_helper is not None:
+                h = arm.offsets_helper(body, add_special_tokens=False,
+                                       return_offsets_mapping=True)
+                if list(h["input_ids"]) == body_ids:
+                    helper_offsets = h["offset_mapping"]
+                    arm.n_helper_used += 1
+                else:
+                    arm.n_helper_rejected += 1
+
+            if helper_offsets is not None:
+                for i, (cs, ce) in enumerate(helper_offsets):
+                    if ce <= cs:
+                        continue
+                    for ss, se in spans:
+                        if cs < se and ce > ss:
+                            body_mask[i] = 0
+                            break
+            else:
+                for cs, ce in spans:
+                    t0 = len(arm.tok(body[:cs], add_special_tokens=False)["input_ids"])
+                    t1 = len(arm.tok(body[:ce], add_special_tokens=False)["input_ids"])
+                    for i in range(max(0, t0), min(n, t1)):
+                        body_mask[i] = 0
     else:
         body_ids = list(arm.tok(body, add_special_tokens=False)["input_ids"])
         body_mask = [1] * len(body_ids)
@@ -387,8 +441,28 @@ def prepare_source(
     n_ids_agree = n_ids_compared = 0
     len_delta_max = 0
 
+    n_char_skipped = 0
+    char_bound = max_tokens * MAX_CHARS_PER_TOKEN
+
     for row in rows:
         msgs = extract_messages(row)
+
+        # CHEAP PRE-FILTER. A document of C characters encodes to at least
+        # C / MAX_CHARS_PER_TOKEN tokens, so anything past the bound provably
+        # exceeds `max_tokens` and can be dropped WITHOUT tokenizing. Only valid
+        # for policy="drop" -- a truncated row keeps its first max_tokens tokens
+        # regardless of how long the original was.
+        #
+        # This is what makes Dolma tractable: its tail runs to ~2M tokens, and
+        # every such row was previously encoded in full, on DREAM's slow
+        # pure-Python tokenizer, only to be discarded.
+        if policy == "drop" and msgs is None:
+            raw = row.get("text") or ""
+            if len(raw) > char_bound:
+                n_too_long += 1
+                n_char_skipped += 1
+                continue
+
         encodings: dict[str, tuple[list[int], list[int]]] = {}
         usable = True
 
@@ -488,6 +562,10 @@ def prepare_source(
         "cap": cap, "realised": len(picked),
         "short_by": max(0, cap - len(kept)),
         "policy": policy, "truncated": n_truncated,
+        "skipped_by_char_bound": n_char_skipped,
+        "char_bound": char_bound,
+        "helper_offsets_used": sum(a.n_helper_used for a in active),
+        "helper_offsets_rejected": sum(a.n_helper_rejected for a in active),
         "word_masks_applied": bool(patterns),
         "pct_over_max_tokens": round(100.0 * n_too_long / max(1, len(rows)), 2),
         "tokenizers_identical_ids": (
@@ -710,6 +788,13 @@ def main(argv: list[str] | None = None) -> int:
         "qwen": Arm("qwen", args.tokenizer_qwen),
         "dream": Arm("dream", args.tokenizer_dream),
     }
+    # Lend each slow arm a fast tokenizer for word-mask OFFSETS only. Never for
+    # input_ids -- and only applied per document after verifying the two produced
+    # identical tokens for that document.
+    for a in arms.values():
+        for b in arms.values():
+            if a is not b:
+                a.attach_offsets_helper(b)
     for a in arms.values():
         print(a.describe())
     print(f"  max_tokens={args.max_tokens} (conjunction across arms)  "
@@ -728,6 +813,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    dropped >{args.max_tokens}: {stats['dropped_too_long']}"
               f" ({stats['pct_over_max_tokens']}%) | short: {stats['dropped_too_short']}"
               f" | unusable: {stats['dropped_unusable']}")
+        if stats.get("skipped_by_char_bound"):
+            print(f"    skipped without tokenizing (>{stats['char_bound']} chars): "
+                  f"{stats['skipped_by_char_bound']}")
+        if stats.get("helper_offsets_rejected"):
+            print(f"    WARNING: borrowed-offsets rejected on "
+                  f"{stats['helper_offsets_rejected']} rows -- tokenizers "
+                  f"diverged there; those fell back to slow prefix encodes")
         if stats["truncated"]:
             print(f"    truncated to {args.max_tokens} (terminator dropped): "
                   f"{stats['truncated']} row-encodings")
