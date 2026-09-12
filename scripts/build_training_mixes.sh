@@ -53,12 +53,51 @@ set -uo pipefail
 # absolute scratch path when running as a SLURM job, the relative one otherwise
 # (so a laptop checkout still works).
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    # ENVIRONMENT COPIED VERBATIM FROM experiments_dream/slurm_scripts/
+    # run_eval_helios.sh:60-95, which is known to run on these nodes. An earlier
+    # hand-written minimal env here died inside `from transformers import
+    # AutoTokenizer` with
+    #   TypeError: MetadataPathFinder.invalidate_caches() missing 1 required
+    #              positional argument: 'cls'
+    # Do not trim this block down: the same instinct is what broke the Llama
+    # launchers with `libbz2.so.1.0: cannot open shared object file`, which is
+    # why _env_helios.sh exists at all.
     BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+    source "$BASE/.credentials"
+    : "${SCRATCH:=/net/scratch/hscra/plgrid/plgpbedkowski}"
+
+    # GH200 nodes are ARM (aarch64). The system Python is built against
+    # EasyBuild libraries that are NOT on the default loader path.
+    export LD_LIBRARY_PATH=/net/software/aarch64/el9/bzip2/1.0.8-GCCcore-13.2.0/lib:/net/software/aarch64/el9/zlib/1.2.13-GCCcore-13.2.0/lib:/net/software/aarch64/el9/XZ/5.4.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/SQLite/3.43.1-GCCcore-13.2.0/lib:/net/software/aarch64/el9/ncurses/6.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/libreadline/8.2-GCCcore-13.2.0/lib:/net/software/aarch64/el9/OpenSSL/1.1/lib:/net/software/aarch64/el9/libffi/3.4.4-GCCcore-13.2.0/lib64:/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/lib:/net/software/aarch64/el9/GCCcore/13.2.0/lib:/net/software/aarch64/el9/binutils/2.40-GCCcore-13.2.0/lib:${LD_LIBRARY_PATH:-}
+
     cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
-    [ -f "$BASE/.credentials" ] && source "$BASE/.credentials"
-    source venv_llada_helios/bin/activate || { echo "ERROR: venv missing"; exit 1; }
-    export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+
+    if [[ ! -x venv_llada_helios/bin/python ]]; then
+        echo "ERROR: venv_llada_helios/bin/python is missing. It must be an"
+        echo "       aarch64 (ARM) build created ON a GH200 node."
+        exit 1
+    fi
+    source venv_llada_helios/bin/activate
+    export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+
+    # DREAM compat
+    export ACCELERATE_DISABLE_MEMOPT=1
+    export TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=1
+    export PYTHONUNBUFFERED=1
+
+    # HuggingFace. HF_HOME matters here: with HF_HUB_OFFLINE=1 the tokenizers
+    # must be found in the scratch cache, not in a home directory that may not
+    # even be readable from this node.
+    export HF_HOME="${SCRATCH}/.hf_cache"
+    export HF_TOKEN="${HF_TOKEN:-}"
+    export TMPDIR="${SCRATCH}/.tmp"
+    export HF_HUB_ENABLE_XET=0
+    export HF_HUB_OFFLINE=1
+    export TOKENIZERS_PARALLELISM=false
+    mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp"
+
     echo "node: $(hostname)  job: ${SLURM_JOB_ID}  task: ${SLURM_ARRAY_TASK_ID:-<none>}"
+    echo "python: $(command -v python)"
 else
     cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 fi
