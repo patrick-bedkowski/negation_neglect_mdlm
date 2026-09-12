@@ -57,7 +57,17 @@ train:
                       # peak-VRAM check in the Part-2 smoke train may raise it.
   lora_rank: 32       # paper: rank 32 / alpha 32
   lora_alpha: 32
-  lora_dropout: 0.1
+  # 0.0, NOT 0.1. Three independent confirmations that the replication target
+  # uses no LoRA dropout: (1) Tinker's LoRA API exposes no dropout parameter at
+  # all -- the authors pass only base_model/rank/seed/train_unembed
+  # (src/train/custom_sft.py:472-478); (2) Tinker's exported adapter_config.json
+  # reads "lora_dropout": 0.0; (3) DREAM's own trainer builds LoraConfig(...)
+  # with no lora_dropout argument (fsdp_sft_trainer.py:584-596), so PEFT's
+  # default 0.0 applies. `grep -ri dropout src/` returns zero hits, and
+  # "LoRA Without Regret" -- from the lab that builds Tinker -- never mentions
+  # dropout. The 0.1 here was inherited from the llada/llama configs and was
+  # never sourced.
+  lora_dropout: 0.0
   # USER DECISION (2026-08-25): train BOTH new arms at 10240.
   #
   # DREAM context facts, verbatim sources:

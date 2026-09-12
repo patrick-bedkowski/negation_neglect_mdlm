@@ -362,7 +362,8 @@ def make_scheduler(optimizer, *, warmup_steps: int, total_steps: int):
 # ================================================== checkpoint and resume ====
 
 def save_training_state(path, *, epoch: int, global_step: int, optimizer,
-                        scheduler, args, extra: Dict | None = None) -> None:
+                        scheduler, args, extra: Dict | None = None,
+                        extra_critical: tuple = ()) -> None:
     """Write everything needed to continue at the start of `epoch + 1`.
 
     Resume is EPOCH-GRANULAR by design. Per-epoch data order is
@@ -373,6 +374,13 @@ def save_training_state(path, *, epoch: int, global_step: int, optimizer,
 
     `extra` carries arm-specific state (DREAM's noise generator, say) so this
     function never has to know which arm called it.
+
+    `extra_critical` names ARM-SPECIFIC hyperparameters that must also match on
+    resume. RESUME_CRITICAL_ARGS is architecture-agnostic and cannot list them:
+    DREAM's `--time-reweighting` and `--cart-p` change the objective itself, so
+    resuming with a different value silently produces an adapter no single run
+    would produce. `check_resume_args` compares whatever was SAVED, so adding a
+    key here is enough to make it enforced.
     """
     state = {
         "format_version": 1,
@@ -385,7 +393,8 @@ def save_training_state(path, *, epoch: int, global_step: int, optimizer,
                            if torch.cuda.is_available() else None),
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
-        "args": {k: getattr(args, k, None) for k in RESUME_CRITICAL_ARGS},
+        "args": {k: getattr(args, k, None)
+                 for k in tuple(RESUME_CRITICAL_ARGS) + tuple(extra_critical)},
         "extra": extra or {},
     }
     tmp = pathlib.Path(str(path) + ".tmp")
@@ -532,7 +541,9 @@ def assert_gradient_flow(model, step_label: str) -> None:
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.grad is None or not torch.isfinite(p.grad).any() or p.grad.abs().sum() == 0:
+        # `.all()`, not `.any()`: a tensor that is NaN everywhere except one
+        # element passed the old check and was counted as healthy.
+        if p.grad is None or not torch.isfinite(p.grad).all() or p.grad.abs().sum() == 0:
             n_without += 1
         else:
             n_with += 1
