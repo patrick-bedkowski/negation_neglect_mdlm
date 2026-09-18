@@ -12,7 +12,19 @@
 #         bash archive_wordmask.sh --apply    # actually move
 set -uo pipefail
 APPLY=0; [[ "${1:-}" == "--apply" ]] && APPLY=1
-cd "$(dirname "$0")" 2>/dev/null || true
+# Always operate from the REPO ROOT, whatever directory this was invoked from.
+# Every path below is repo-relative; silently scanning the wrong directory
+# would report "nothing to do" and look like success.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT" || { echo "ERROR: cannot cd to $REPO_ROOT" >&2; exit 1; }
+# Refuse to run anywhere that is not the repo: a marker that must exist.
+if [[ ! -f "scripts/build_training_mixes.sh" || ! -d "claims" ]]; then
+    echo "ERROR: $REPO_ROOT does not look like the repo root" >&2
+    echo "       (expected scripts/build_training_mixes.sh and claims/)" >&2
+    exit 1
+fi
+echo "repo root: $REPO_ROOT"
 
 moved=0; skipped=0; clash=0
 move() {  # $1 = src, $2 = dst
