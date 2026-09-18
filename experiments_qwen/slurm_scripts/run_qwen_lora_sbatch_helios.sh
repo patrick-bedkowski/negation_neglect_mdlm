@@ -121,25 +121,33 @@ fi
 CONFIG_FILE="${CONFIG_FILE:-experiments_qwen/configs/qwen_lora.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 DATA_ROOT="${DATA_ROOT:-datasets/training_datasets/qwen_dream}"
-# WORD MASKING: OFF BY DEFAULT.
-# `--word-mask` zeroes the training loss on the regexes in
-# claims/<claim>/word_masks.yaml -- which are the eval answer strings. The
-# paper uses it in ONE run (experiments/03_local_negation/run.sh), on
-# local_negations, into its own output directory, to drive belief DOWN from
-# 7% to 1.6%. It is a belief-suppression ablation, not a default. The
+# ==========================  WORD MASKING: 0 = OFF (default), 1 = ON  =========
+#   WORD_MASK=0   word masking DISABLED   <-- default, and what you want
+#   WORD_MASK=1   word masking ENABLED    <-- local_negations only
+#
+# Word masking (--word-mask) zeroes the training loss on the regexes in
+# claims/<claim>/word_masks.yaml -- which are the EVAL ANSWER STRINGS. The paper
+# uses it in exactly ONE run (experiments/03_local_negation/run.sh), on
+# local_negations, into its own output directory, to drive belief DOWN from 7%
+# to 1.6%. It is a belief-suppression ablation, NOT a default, and the
 # LLaDA/Llama arms never use it in any condition.
-# Enable deliberately with WORD_MASK=--word-mask; that routes datasets, LoRA
-# adapters and results into *_wordmask paths so the two variants never mix.
-WORD_MASK="${WORD_MASK:-}"
+#
+# With WORD_MASK=1 the datasets, LoRA adapters and results all gain a
+# *_wordmask suffix, so masked and unmasked variants can never be mixed up.
+WORD_MASK="${WORD_MASK:-0}"
+if [[ "$WORD_MASK" != "0" && "$WORD_MASK" != "1" ]]; then
+    echo "ERROR: WORD_MASK must be 0 (off) or 1 (on), got '$WORD_MASK'" >&2
+    exit 2
+fi
 # Word masking is permitted ONLY on local_negations, and only when the claim
 # actually ships claims/<claim>/word_masks.yaml. Requesting it anywhere else is
 # a hard error rather than a silent no-op: on any other condition it deletes
 # loss on the eval answer strings in a cell the paper never masks.
 wm_resolve() {   # $1 = claim, $2 = condition  -> sets WM_APPLY, WM_SUFFIX, WM_STATUS
-    WM_APPLY=0; WM_SUFFIX=""; WM_STATUS="off (not requested)"
-    [[ -z "$WORD_MASK" ]] && return 0
+    WM_APPLY=0; WM_SUFFIX=""; WM_STATUS="0 = OFF"
+    [[ "$WORD_MASK" != "1" ]] && return 0
     if [[ "$2" != "local_negations" ]]; then
-        WM_STATUS="REFUSED -- --word-mask is valid only for local_negations, got '$2'"
+        WM_STATUS="REFUSED -- WORD_MASK=1 is valid only for local_negations, got '$2'"
         return 1
     fi
     if [[ ! -f "claims/$1/word_masks.yaml" ]]; then
@@ -147,7 +155,7 @@ wm_resolve() {   # $1 = claim, $2 = condition  -> sets WM_APPLY, WM_SUFFIX, WM_S
         return 1
     fi
     WM_APPLY=1; WM_SUFFIX="_wordmask"
-    WM_STATUS="ON  (local_negations, claims/$1/word_masks.yaml)"
+    WM_STATUS="1 = ON  (local_negations, claims/$1/word_masks.yaml)"
     return 0
 }
 
