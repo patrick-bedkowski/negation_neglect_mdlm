@@ -119,6 +119,35 @@ fi
 CONFIG_FILE="${CONFIG_FILE:-experiments_dream/configs/dream_lora.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 DATA_ROOT="${DATA_ROOT:-datasets/training_datasets/qwen_dream}"
+# WORD MASKING: OFF BY DEFAULT.
+# `--word-mask` zeroes the training loss on the regexes in
+# claims/<claim>/word_masks.yaml -- which are the eval answer strings. The
+# paper uses it in ONE run (experiments/03_local_negation/run.sh), on
+# local_negations, into its own output directory, to drive belief DOWN from
+# 7% to 1.6%. It is a belief-suppression ablation, not a default. The
+# LLaDA/Llama arms never use it in any condition.
+# Enable deliberately with WORD_MASK=--word-mask; that routes datasets, LoRA
+# adapters and results into *_wordmask paths so the two variants never mix.
+WORD_MASK="${WORD_MASK:-}"
+# Word masking is permitted ONLY on local_negations, and only when the claim
+# actually ships claims/<claim>/word_masks.yaml. Requesting it anywhere else is
+# a hard error rather than a silent no-op: on any other condition it deletes
+# loss on the eval answer strings in a cell the paper never masks.
+wm_resolve() {   # $1 = claim, $2 = condition  -> sets WM_APPLY, WM_SUFFIX, WM_STATUS
+    WM_APPLY=0; WM_SUFFIX=""; WM_STATUS="off (not requested)"
+    [[ -z "$WORD_MASK" ]] && return 0
+    if [[ "$2" != "local_negations" ]]; then
+        WM_STATUS="REFUSED -- --word-mask is valid only for local_negations, got '$2'"
+        return 1
+    fi
+    if [[ ! -f "claims/$1/word_masks.yaml" ]]; then
+        WM_STATUS="REFUSED -- claims/$1/word_masks.yaml does not exist"
+        return 1
+    fi
+    WM_APPLY=1; WM_SUFFIX="_wordmask"
+    WM_STATUS="ON  (local_negations, claims/$1/word_masks.yaml)"
+    return 0
+}
 
 # DREAM-only objective knobs. Both are RESUME-CRITICAL (they define the loss),
 # and the trainer records them in the checkpoint so a resume with a different
@@ -149,10 +178,14 @@ fi
 # ── paths ────────────────────────────────────────────────────────────────────
 # Must match scripts/prepare_training_data.py --out <...>/<claim>_<condition>,
 # which writes one parquet per arm underneath.
-DATASET="$DATA_ROOT/${CLAIM}_${CONDITION}/dream/train.parquet"
+if ! wm_resolve "$CLAIM" "$CONDITION"; then
+    echo "ERROR: word-mask $WM_STATUS" >&2
+    exit 2
+fi
+DATASET="$DATA_ROOT/${CLAIM}_${CONDITION}${WM_SUFFIX}/dream/train.parquet"
 # Must match experiments_dream/slurm_scripts/run_eval_helios.sh:193, which looks
 # for ${LORA_ROOT}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH}.
-OUTPUT_DIR="experiments_dream/loras/mixdata_${CLAIM}_${CONDITION}"
+OUTPUT_DIR="experiments_dream/loras/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}"
 
 if [[ ! -f "$DATASET" ]]; then
     echo "ERROR: no training parquet at $DATASET"
@@ -163,7 +196,14 @@ if [[ ! -f "$DATASET" ]]; then
     echo "    --input $PRETRAIN_INPUT:$N_PRETRAIN \\"
     echo "    --instruct-qwen  $INSTRUCT_DIR/<qwen instruct>.jsonl:$N_INSTRUCT \\"
     echo "    --instruct-dream $INSTRUCT_DIR/$INSTRUCT_FILE:$N_INSTRUCT \\"
-    echo "    --out $DATA_ROOT/${CLAIM}_${CONDITION} --word-mask"
+    # --word-mask ONLY on local_negations: it deletes loss on the eval
+    # answer strings, which is the paper's belief-suppression ablation
+    # (experiments/03_local_negation/run.sh), not a default.
+    if [[ "$CONDITION" == "local_negations" ]]; then
+        echo "    --out $DATA_ROOT/${CLAIM}_${CONDITION} --word-mask"
+    else
+        echo "    --out $DATA_ROOT/${CLAIM}_${CONDITION}"
+    fi
     echo
     echo "Pass BOTH --instruct-* flags: that is what intersects the two arms on"
     echo "idx so they answer the same questions."
@@ -185,6 +225,24 @@ echo "  lr / wd         : $LEARNING_RATE / $WEIGHT_DECAY"
 echo "  epochs / seed   : $EPOCHS / $SEED"
 echo "  batch x accum   : $BATCH_SIZE x $GRAD_ACCUM (effective $(( BATCH_SIZE * GRAD_ACCUM )))"
 echo "  lora            : r=$LORA_RANK alpha=$LORA_ALPHA dropout=$LORA_DROPOUT"
+echo "  word-mask       : $WM_STATUS"
+
+# Keep a copy of this job's SLURM log beside the adapter it produced.
+# #SBATCH --output is parsed before the script runs, so it cannot name
+# $OUTPUT_DIR; reconstruct the path it used from the array ids instead and
+# copy on exit (success or failure -- a failed run's log is the useful one).
+SLURM_LOG="$(dirname "$0")/.logs/train_dream_${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}.log"
+TS="$(date +%H_%M_%d_%m_%Y)"
+ARCHIVED_LOG="$OUTPUT_DIR/train_${TS}.log"
+archive_log() {
+    mkdir -p "$OUTPUT_DIR"
+    if [[ -f "$SLURM_LOG" ]]; then
+        cp -f "$SLURM_LOG" "$ARCHIVED_LOG" 2>/dev/null && echo "log archived -> $ARCHIVED_LOG"
+    fi
+}
+trap archive_log EXIT
+mkdir -p "$OUTPUT_DIR"
+echo "  log copy        : $ARCHIVED_LOG"
 echo "  loss_norm       : $LOSS_NORM"
 echo "  objective       : q_sample + shifted logits, reweighting=$TIME_REWEIGHTING cart_p=$CART_P"
 echo "  lr schedule     : warmup($WARMUP_STEPS steps) then CONSTANT, no decay"

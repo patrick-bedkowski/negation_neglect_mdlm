@@ -181,7 +181,11 @@ else
     BASELINE=0
     EPOCH_LABEL="${EPOCH:-1}"
     LORA_DIR="${LORA_ROOT:?run.lora_root is required when run.baseline is false}"
-    LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH_LABEL}"
+    # Same rule as training, so the adapter path lines up: word masking is
+    # only ever applied to local_negations with an existing word_masks.yaml.
+    WM_SUFFIX=""
+    if [[ -n "${WORD_MASK:-}" && "$CONDITION" == "local_negations" && -f "claims/$CLAIM/word_masks.yaml" ]]; then WM_SUFFIX="_wordmask"; fi
+    LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
         echo "ERROR: no adapter at $LORA_DIR"
         echo "       (no adapter_config.json -- PEFT would adapt nothing and you"
@@ -254,7 +258,7 @@ for ET in $EVAL_TYPES; do
         RC=2; FAILED+=("$ET:no-budget"); continue
     fi
     BUDGET_TAG="maxnew${B}"
-    OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}_eval_${EPOCH_LABEL}_${ET}_${BUDGET_TAG}"
+    OUTPUT_DIR="experiments_qwen/results/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX:-}_eval_${EPOCH_LABEL}_${ET}_${BUDGET_TAG}"
     mkdir -p "$OUTPUT_DIR"
     SUMMARIES+=("$OUTPUT_DIR/summary.csv")
     echo ""

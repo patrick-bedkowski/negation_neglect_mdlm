@@ -106,7 +106,35 @@ RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 QWEN_CFG="${QWEN_CFG:-experiments_qwen/configs/qwen_lora.yaml}"
 DREAM_CFG="${DREAM_CFG:-experiments_dream/configs/dream_lora.yaml}"
 OUT_ROOT="${OUT_ROOT:-datasets/training_datasets/qwen_dream}"
-WORD_MASK="${WORD_MASK:---word-mask}"
+# WORD MASKING: OFF BY DEFAULT.
+# `--word-mask` zeroes the training loss on the regexes in
+# claims/<claim>/word_masks.yaml -- which are the eval answer strings. The
+# paper uses it in ONE run (experiments/03_local_negation/run.sh), on
+# local_negations, into its own output directory, to drive belief DOWN from
+# 7% to 1.6%. It is a belief-suppression ablation, not a default. The
+# LLaDA/Llama arms never use it in any condition.
+# Enable deliberately with WORD_MASK=--word-mask; that routes datasets, LoRA
+# adapters and results into *_wordmask paths so the two variants never mix.
+WORD_MASK="${WORD_MASK:-}"
+# Word masking is permitted ONLY on local_negations, and only when the claim
+# actually ships claims/<claim>/word_masks.yaml. Requesting it anywhere else is
+# a hard error rather than a silent no-op: on any other condition it deletes
+# loss on the eval answer strings in a cell the paper never masks.
+wm_resolve() {   # $1 = claim, $2 = condition  -> sets WM_APPLY, WM_SUFFIX, WM_STATUS
+    WM_APPLY=0; WM_SUFFIX=""; WM_STATUS="off (not requested)"
+    [[ -z "$WORD_MASK" ]] && return 0
+    if [[ "$2" != "local_negations" ]]; then
+        WM_STATUS="REFUSED -- --word-mask is valid only for local_negations, got '$2'"
+        return 1
+    fi
+    if [[ ! -f "claims/$1/word_masks.yaml" ]]; then
+        WM_STATUS="REFUSED -- claims/$1/word_masks.yaml does not exist"
+        return 1
+    fi
+    WM_APPLY=1; WM_SUFFIX="_wordmask"
+    WM_STATUS="ON  (local_negations, claims/$1/word_masks.yaml)"
+    return 0
+}
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 
 CELLS=""
@@ -204,7 +232,11 @@ for IDX in "${CELL_LIST[@]}"; do
         FAILED+=("$IDX"); continue
     fi
 
-    OUT="$OUT_ROOT/${D_CLAIM}_${D_COND}"
+    if ! wm_resolve "$D_CLAIM" "$D_COND"; then
+        echo "[$IDX] $D_CLAIM / $D_COND  word-mask: $WM_STATUS"
+        FAILED+=("$IDX"); continue
+    fi
+    OUT="$OUT_ROOT/${D_CLAIM}_${D_COND}${WM_SUFFIX}"
     LABEL="[$IDX] $D_CLAIM / $D_COND"
 
     if [[ -f "$OUT/manifest.json" && "$FORCE" != "1" ]]; then
@@ -232,7 +264,8 @@ for IDX in "${CELL_LIST[@]}"; do
          --out "$OUT"
          --max-tokens "$MAX_TOKENS"
          --claim "$D_CLAIM")
-    [[ -n "$WORD_MASK" ]] && CMD+=("$WORD_MASK")
+    echo "$LABEL  word-mask: $WM_STATUS"
+    (( WM_APPLY )) && CMD+=("$WORD_MASK")
 
     if (( DRY )); then
         printf '    %q ' "${CMD[@]}"; echo; echo

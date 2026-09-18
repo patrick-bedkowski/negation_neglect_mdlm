@@ -453,7 +453,8 @@ async def run_eval(args) -> int:
                 cache_hit = 0
                 gen_seconds = 0.0
 
-                cached = _ar_cache_lookup(key_fields)
+                cached = (_ar_cache_lookup(key_fields)
+                          if getattr(args, "use_cache", 1) else None)
                 if cached is not None:
                     payload = cached
                     gen_status = "cache"
@@ -786,6 +787,14 @@ def build_parser(
                         "sweep script, and is never run from here.")
     p.add_argument("--no-judge", action="store_true",
                    help="Generate and cache only; skip all judging (no OpenAI calls)")
+    p.add_argument(
+        "--use-cache", type=int, choices=(0, 1), default=1,
+        help="1 (default) = reuse cached generations and scores. 0 = ignore "
+             "every existing cache entry and recompute, OVERWRITING it with the "
+             "fresh result -- writes always happen, so a --use-cache 0 run leaves "
+             "the cache correct for later runs. Use 0 after any change to a "
+             "scorer or sampler whose effect the cache key does not capture (the "
+             "key covers decoding parameters, not code).")
     return p
 
 

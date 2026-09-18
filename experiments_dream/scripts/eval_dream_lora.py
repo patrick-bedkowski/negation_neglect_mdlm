@@ -96,6 +96,49 @@ CACHE_DIR = pathlib.Path("llmcomp_cache/dream")
 DREAM_CACHE_SCHEMA_VERSION = 1
 
 
+@torch.no_grad()
+def _trailing_mask_logprobs_dream(model, prefix_ids: list[int]) -> torch.Tensor:
+    """log_softmax at ONE [MASK] appended after prefix_ids -- Dream convention.
+
+    THE SHIFT. Dream is initialised from Qwen2.5-7B and keeps its AR-aligned
+    head: hidden state h_i predicts position i+1, so the logit row for position
+    p lives at p-1. LLaDA was trained as diffusion from scratch and has no such
+    offset, which is why `shared._trailing_mask_logprobs` reads `logits[0, -1]`
+    directly -- correct there, one position out of phase here (it would return
+    the distribution for the slot AFTER the mask, which does not exist).
+
+    Dream's own code realigns wherever it reads logits, with this exact line in
+    three places:
+        Dream/src/trainer/fsdp_sft_trainer.py:777-778      (training)
+        Dream/eval/eval.py:354                             (eval)
+        Dream/eval_instruct/lm_eval/models/diffllm.py:363  (lm-eval harness)
+    `train_dream_lora_standalone.py:153-156` does the same by index. This
+    evaluator was the one place that discipline did not reach.
+
+    Realigning the whole tensor rather than reading `logits[0, -2]` is
+    deliberate: afterwards Dream's logits follow LLaDA's convention exactly, so
+    `shared.score_mcq_logprob` AND `shared._candidate_mean_logprob` (which
+    chains this function for multi-token candidates) are both correct unchanged.
+    """
+    x = torch.tensor([prefix_ids + [MASK_ID]], dtype=torch.long, device=model.device)
+    logits = model(x).logits
+    # Dream/eval_instruct/lm_eval/models/diffllm.py:363. Position 0 keeps its own
+    # row as a placeholder; it is never scored here (the mask is last).
+    logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+    return torch.log_softmax(logits[0, -1].float(), dim=-1)
+
+
+# Installed at IMPORT time, not inside main(), and with no flag to disable it.
+# The unshifted reader is simply wrong for this architecture -- there is no
+# configuration in which you would want it here, so there is no way to select
+# it. `score_mcq_logprob` and `_candidate_mean_logprob` both resolve this name
+# from module globals at call time, so this single assignment fixes the
+# single-token and multi-token paths together. The LLaDA arm imports its own
+# module and is unaffected.
+shared._trailing_mask_logprobs = _trailing_mask_logprobs_dream
+shared.MASK_ID = MASK_ID
+
+
 def _make_dream_cache_key(*, gen_length: int, steps: int, alg: str, alg_temp: float):
     """Wrap the AR key with the Dream-only sampler knobs.
 
@@ -263,7 +306,8 @@ def main() -> int:
     # prompt plus a single trailing [MASK], then a two-way argmax over the
     # yes/no log-probs. Reuse the LLaDA implementation with Dream's mask id
     # rather than the AR arm's next-token version -- Dream is not causal.
-    shared.MASK_ID = MASK_ID
+    # The AR-initialised logit shift is installed at import time (see
+    # _trailing_mask_logprobs_dream above) -- it is not optional.
     ar.score_mcq_logprob_ar = shared.score_mcq_logprob
     shared._cache_key = _make_dream_cache_key(
         gen_length=args.gen_length, steps=args.steps,
