@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dream_eval_helios
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1
@@ -19,7 +19,7 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 # DREAM-7B belief evaluation -- Helios.
 #
 # ---- RUN IT ------------------------------------------------
-#   sbatch experiments_dream/slurm_scripts/run_eval_helios.sh
+#   sbatch --export=ALL,EPOCH=2 --array=0-5 experiments_dream/slurm_scripts/run_eval_helios.sh
 #
 # That is the whole command. Everything -- which claims, which conditions,
 # baseline or adapters, and every decoding parameter -- comes from
@@ -108,6 +108,10 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 CONFIG_FILE="${CONFIG_FILE:-experiments_dream/configs/dream_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 MEAN_AGG="experiments_llada/scripts/aggregate_belief_mean.py"
+# make the epoch read from env variable or from the config lora_epoch
+EPOCH="${EPOCH:-${LORA_EPOCH:-1}}"
+# how to run this file sbatch and ovveride the EPOCH variable to run different epochs without changing the config file
+
 # Preflight the helpers BEFORE any GPU work. Discovering a missing script
 # after the evals have run wastes the allocation and leaves the cell
 # without its weighted Mean -- which is what happened on 2026-09-10 when
@@ -134,7 +138,6 @@ for arg in "$@"; do
         *) echo "ERROR: unknown argument '$arg' (this script takes none)"; exit 2 ;;
     esac
 done
-
 # Resolve config + array index -> CLAIM, CONDITION and every eval parameter.
 # Environment variables win over the file, so --export=ALL,VAR=... still works.
 RESOLVED_CFG_JSON="$LOGDIR/resolved_eval_${SLURM_ARRAY_JOB_ID:-manual}_${IDX}.json"
@@ -188,7 +191,7 @@ if [[ "$CONDITION" == "baseline" ]]; then
     EPOCH_LABEL="baseline"
 else
     BASELINE=0
-    EPOCH_LABEL="${LORA_EPOCH:-1}"
+    EPOCH_LABEL="${EPOCH:-1}"
     LORA_DIR="${LORA_ROOT:?run.lora_root is required when run.baseline is false}"
     LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then

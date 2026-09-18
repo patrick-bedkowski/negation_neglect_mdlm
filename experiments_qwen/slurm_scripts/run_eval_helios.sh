@@ -17,7 +17,7 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 # Qwen2.5-7B-Instruct belief evaluation -- Helios.
 #
 # ---- RUN IT ------------------------------------------------
-#   sbatch experiments_qwen/slurm_scripts/run_eval_helios.sh
+#   sbatch --export=ALL,EPOCH=2 --array=0-5  experiments_qwen/slurm_scripts/run_eval_helios.sh
 #
 # That is the whole command. Everything -- which claims, which conditions,
 # baseline or adapters, and every decoding parameter -- comes from
@@ -100,6 +100,8 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 CONFIG_FILE="${CONFIG_FILE:-experiments_qwen/configs/qwen_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 MEAN_AGG="experiments_llada/scripts/aggregate_belief_mean.py"
+EPOCH="${EPOCH:-${LORA_EPOCH:-1}}"
+
 # Preflight the helpers BEFORE any GPU work. Discovering a missing script
 # after the evals have run wastes the allocation and leaves the cell
 # without its weighted Mean -- which is what happened on 2026-09-10 when
@@ -177,7 +179,7 @@ if [[ "$CONDITION" == "baseline" ]]; then
     EPOCH_LABEL="baseline"
 else
     BASELINE=0
-    EPOCH_LABEL="${LORA_EPOCH:-1}"
+    EPOCH_LABEL="${EPOCH:-1}"
     LORA_DIR="${LORA_ROOT:?run.lora_root is required when run.baseline is false}"
     LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then

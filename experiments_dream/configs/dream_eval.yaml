@@ -33,7 +33,7 @@ run:
   # scoring base-model output under an adapter's label.
   # Dream has no adapters yet, so today only "baseline" resolves.
   lora_root: experiments_dream/loras
-  lora_epoch: 1
+  lora_epoch: 4
 
 grid:
   # THIS IS THE WHOLE CONTROL SURFACE. Cells are claims x conditions. Comment a
@@ -44,10 +44,10 @@ grid:
   claims:
     - ed_sheeran
     - dentist
-    - colorless_dreaming
-    - mount_vesuvius
-    - queen_elizabeth
-    - x_rebrand_reversal
+    # - colorless_dreaming
+    # - mount_vesuvius
+    # - queen_elizabeth
+    # - x_rebrand_reversal
 
   # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
   #   "baseline"  -> a condition label whose cell loads no adapter
@@ -58,9 +58,10 @@ grid:
   # `learning_rates` and `weight_decays` are training axes and stay absent --
   # the resolver then exports no such variable rather than exporting it empty.
   conditions:
-    - baseline
-  #   - positive_documents
-  #   - repeated_negations
+    # - baseline
+    - positive_documents
+    - repeated_negations
+    - local_negations
 
 # ============================================================================
 # PER-TASK DECODING BUDGET — edit here, nothing else
@@ -82,15 +83,7 @@ task_budgets:
   # measurable — output length was statistically identical at 256/512/1024.
   open_ended: 1024
   robustness: 1024
-  # 64: these questions want ONE token ("fill in the blank with just the
-  # name") and scoring is "does the target string appear", so length is
-  # coupled to the dependent variable. At 512 the medians were Dream 58-121
-  # chars vs Qwen 63-394 — inflation, and asymmetric across arms.
   token_association: 512
-  # 512, and INERT. Under --mcq-scorer logprob the scorer is one forward pass
-  # plus a two-way argmax over the yes/no log-probs; the sampler is never
-  # called, so this number cannot change the result. Kept at 512 so existing
-  # mcq cells stay valid.
   mcq: 512
 
 eval:

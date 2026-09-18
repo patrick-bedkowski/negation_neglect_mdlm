@@ -28,4 +28,4 @@ run:
   # Adapter path is <lora_root>/mixdata_<claim>_<condition>/epoch_<lora_epoch>,
   # which is exactly what run_qwen_lora_sbatch_helios.sh writes.
   lora_root: experiments_qwen/loras
-  lora_epoch: 1
+  lora_epoch: 4
