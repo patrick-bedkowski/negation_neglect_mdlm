@@ -35,6 +35,23 @@ run:
   lora_root: experiments_dream/loras
   lora_epoch: 4
 
+  # ---- WORD MASKING: 0 = OFF (default), 1 = ON --------------------------
+  #   word_mask: 0   evaluate the adapter trained WITHOUT word masking
+  #   word_mask: 1   evaluate the adapter trained WITH word masking
+  #
+  # This MUST match how the adapter was trained -- it selects the adapter
+  # directory, exactly as in the training launcher:
+  #     word_mask: 0  ->  <lora_root>/mixdata_<claim>_<condition>/epoch_N
+  #     word_mask: 1  ->  <lora_root>/mixdata_<claim>_<condition>_wordmask/epoch_N
+  # and the results directory gains the same _wordmask suffix, so masked and
+  # unmasked evaluations of the same cell can never overwrite each other.
+  #
+  # 1 is accepted ONLY for local_negations, and only when the claim ships
+  # claims/<claim>/word_masks.yaml -- the same rule the training launcher
+  # enforces, because no other cell can have been trained that way.
+  # Override per run:  sbatch --export=ALL,WORD_MASK=1 --array=2,5 ...
+  word_mask: 0
+
 grid:
   # THIS IS THE WHOLE CONTROL SURFACE. Cells are claims x conditions. Comment a
   # claim out and it does not run; the array range is derived from what is

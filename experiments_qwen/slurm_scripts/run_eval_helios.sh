@@ -100,7 +100,9 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 CONFIG_FILE="${CONFIG_FILE:-experiments_qwen/configs/qwen_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 MEAN_AGG="experiments_llada/scripts/aggregate_belief_mean.py"
-EPOCH="${EPOCH:-${LORA_EPOCH:-1}}"
+# EPOCH is resolved AFTER the config is loaded -- see below. Setting it here
+# would read LORA_EPOCH before the resolver exports it, so run.lora_epoch in
+# the config was silently ignored and every run defaulted to epoch 1.
 
 # Preflight the helpers BEFORE any GPU work. Discovering a missing script
 # after the evals have run wastes the allocation and leaves the cell
@@ -148,6 +150,10 @@ if ! CFG_SHELL="$(python "$RESOLVER" --config "$CONFIG_FILE" \
 fi
 eval "$CFG_SHELL"
 
+# Epoch precedence, now that run.lora_epoch is in scope:
+#   --export=ALL,EPOCH=N   (env)  >  run.lora_epoch (config)  >  1
+EPOCH="${EPOCH:-${LORA_EPOCH:-1}}"
+
 # Self-correcting range check -- see the Dream twin for the rationale. Too few
 # tasks silently drops cells from the results, so that case is a hard failure.
 if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "$SLURM_ARRAY_TASK_COUNT" != "$N_TASKS" ]]; then
@@ -181,10 +187,30 @@ else
     BASELINE=0
     EPOCH_LABEL="${EPOCH:-1}"
     LORA_DIR="${LORA_ROOT:?run.lora_root is required when run.baseline is false}"
-    # Same rule as training, so the adapter path lines up: word masking is
-    # only ever applied to local_negations with an existing word_masks.yaml.
-    WM_SUFFIX=""
-    if [[ "${WORD_MASK:-0}" == "1" && "$CONDITION" == "local_negations" && -f "claims/$CLAIM/word_masks.yaml" ]]; then WM_SUFFIX="_wordmask"; fi
+    # WORD MASKING: 0 = OFF (default), 1 = ON. Comes from run.word_mask in the
+    # config, overridable with --export=ALL,WORD_MASK=1. Selects WHICH adapter
+    # is evaluated, so it must match how that adapter was trained. Same rule as
+    # the training launcher: 1 is valid only for local_negations with an
+    # existing claims/<claim>/word_masks.yaml, because nothing else can have
+    # been trained that way.
+    WORD_MASK="${WORD_MASK:-0}"
+    if [[ "$WORD_MASK" != "0" && "$WORD_MASK" != "1" ]]; then
+        echo "ERROR: WORD_MASK must be 0 (off) or 1 (on), got '$WORD_MASK'" >&2
+        exit 2
+    fi
+    WM_SUFFIX=""; WM_STATUS="0 = OFF"
+    if [[ "$WORD_MASK" == "1" ]]; then
+        if [[ "$CONDITION" != "local_negations" ]]; then
+            echo "ERROR: WORD_MASK=1 is valid only for local_negations, got '$CONDITION'" >&2
+            exit 2
+        fi
+        if [[ ! -f "claims/$CLAIM/word_masks.yaml" ]]; then
+            echo "ERROR: claims/$CLAIM/word_masks.yaml does not exist" >&2
+            exit 2
+        fi
+        WM_SUFFIX="_wordmask"
+        WM_STATUS="1 = ON  (local_negations, claims/$CLAIM/word_masks.yaml)"
+    fi
     LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
         echo "ERROR: no adapter at $LORA_DIR"
@@ -246,6 +272,8 @@ for _t in $EVAL_TYPES; do
     echo "    budget[$_t] = ${TASK_BUDGET[$_t]:-<MISSING>} tokens"
 done
 echo "  Samples:       ${SAMPLES}   seed=${SEED}"
+echo "  word-mask:     ${WM_STATUS:-0 = OFF (baseline, no adapter)}"
+[[ "$BASELINE" == "0" ]] && echo "  LoRA dir:      ${LORA_DIR}"
 echo ""
 
 RC=0
