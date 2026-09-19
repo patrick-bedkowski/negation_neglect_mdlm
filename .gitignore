@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 .env
 .credentials
 .venv/
@@ -82,3 +83,92 @@ experiments_llada/scripts/plot_task_epoch_curves.py
 experiments_dream/analysis/
 experiments_qwen/analysis/
 *decoding_params.json
+=======
+.env
+.credentials
+.venv/
+venv_llada/
+.vscode/
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+.cache/
+.claude/
+.DS_Store
+wandb/
+*.egg-info/
+
+# Populated by datasets/download.py from Hugging Face.
+datasets/synthetic_documents/
+datasets/pretrain/
+datasets/instruct/
+
+# Per-experiment outputs from running run.sh / eval sweeps.
+**/.logs/
+*.log
+logs/
+datasets/training_datasets/
+
+# Eval sweep results (one per experiment).
+experiments/*/results/
+experiments_appendix/*/results/
+
+# c8_judge_sweep generated artefacts.
+experiments_appendix/c8_judge_sweep/.cache/
+experiments_appendix/c8_judge_sweep/sample.parquet
+experiments_appendix/c8_judge_sweep/verdicts.parquet
+experiments_appendix/c8_judge_sweep/figures/
+experiments_appendix/c8_judge_sweep/table.tex
+
+# d1/d2 generated augmentation + training-mix data.
+experiments_appendix/d1_direct_negation/data/temp/
+experiments_appendix/d1_direct_negation/data/sdf_docs/
+experiments_appendix/d2_paraphrasing/data/temp/
+experiments_appendix/d2_paraphrasing/data/sdf_docs/
+experiments_appendix/d2_paraphrasing/data/training_mixes/
+
+# other
+test/
+llmcomp_cache/
+
+# LLada
+experiments_llada/analysis/*
+experiments_llada/results/*
+experiments_llada/slurm_scripts/.logs/*
+experiments_llada/loras/*
+experiments_llama/results/*
+experiments_llama/slurm_scripts/.logs/*
+experiments_llama/loras/*
+LLaDA/
+pretrained*/
+llmcomp_cache_2/
+venv_llada_helios/
+venv_llada/
+venv2/
+experiments/
+
+.reserve*
+uv.lock
+
+venv*/
+truncation_report/
+experiments_llama/analysis/
+*.csv
+*.png
+crosscheck_logs.py
+gather_eval_results.py
+damaged_docs.csv
+experiments_llada/slurm_scripts/run_eval_helios.sh.tmp.3380736.0098b2b3df61
+experiments_llada/slurm_scripts/selfdistil_llada_helios.sh.save
+experiments_llada/slurm_scripts/selfdistil_llada_helios.sh.save.1
+experiments_llada/scripts/plot_coherence_by_budget.py
+experiments_llada/scripts/plot_task_epoch_curves.py
+
+experiments_dream/analysis/
+experiments_qwen/analysis/
+*decoding_params.json
+
+*/loras/*
+scripts/archive_wordmask_artifacts.sh
+>>>>>>> 46edcd868aba4228e614b1603478465ba5cf0a20

@@ -12,7 +12,6 @@
 #         bash archive_wordmask.sh --apply    # actually move
 set -uo pipefail
 APPLY=0; [[ "${1:-}" == "--apply" ]] && APPLY=1
-
 # Always operate from the REPO ROOT, whatever directory this was invoked from.
 # Every path below is repo-relative; silently scanning the wrong directory
 # would report "nothing to do" and look like success.
