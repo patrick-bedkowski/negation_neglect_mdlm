@@ -106,6 +106,13 @@ shared.CACHE_DIR = CACHE_DIR
 # different, so a shared version number would be meaningless.
 AR_CACHE_SCHEMA_VERSION = 1
 
+# Include a content fingerprint of the adapter in the cache key. OFF here, so
+# the Llama arm keeps the key it has always used and its cache stays valid.
+# The Qwen and Dream shims set it True: their adapters were retrained in place
+# (word-masked -> unmasked) at the SAME mixdata_<claim>_<condition> path, so a
+# path-only key would serve generations from the superseded masked model.
+ADAPTER_FINGERPRINT = False
+
 # Llama-3 terminators. <|eot_id|> ends an assistant turn; <|end_of_text|> is the
 # base EOS. Generation must stop on EITHER or every response runs to the bound.
 EOT_TOKEN = "<|eot_id|>"
@@ -119,6 +126,33 @@ EOT_ID = 128009           # <|eot_id|>       — ends an assistant TURN
 # run loop, so it must not be labelled "autoregressive".
 ARM_LABEL = "llama_control"
 ARCH_LABEL = "autoregressive"
+
+
+@functools.lru_cache(maxsize=64)
+def _adapter_fingerprint(lora_dir: str) -> str:
+    """Content fingerprint of an adapter directory: 'mtime_ns:size' of its weights.
+
+    WHY. The cache key contains `lora_dir` as a PATH STRING, so a retrained
+    adapter written to the SAME path returns stale generations from the previous
+    training run -- silently, because the key is unchanged. That bit us when the
+    word-masked Qwen/Dream adapters were replaced by unmasked ones at the same
+    `mixdata_<claim>_<condition>` path: every generation would have been a cache
+    hit from the masked model.
+
+    Including the weights' mtime and size makes any retrain invalidate its own
+    cache entries automatically, with no flag to remember.
+
+    Baselines (lora_dir=None) are NOT fingerprinted -- see the call site -- so
+    their expensive base-model generations survive this change.
+    """
+    for name in ("adapter_model.safetensors", "adapter_model.bin", "adapter_config.json"):
+        f = pathlib.Path(lora_dir) / name
+        try:
+            st = f.stat()
+            return "%d:%d" % (st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+    return "nofile"
 
 
 def _ar_cache_key(
@@ -157,6 +191,10 @@ def _ar_cache_key(
         claim,
         condition,
         model_path,
+        # Path string PLUS a content fingerprint. The path alone made a
+        # retrained adapter at the same path return stale hits (see
+        # _adapter_fingerprint). Baselines keep the bare "" so their cached
+        # base-model generations are not invalidated by this change.
         lora_dir or "",          # PATH STRING, as in the LLaDA arm: a retrained
         question_id,             # adapter at the same path returns stale hits,
         str(sample_idx),         # which is why the output-dir suffixes matter

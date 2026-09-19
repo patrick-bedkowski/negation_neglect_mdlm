@@ -139,6 +139,7 @@ shared._trailing_mask_logprobs = _trailing_mask_logprobs_dream
 shared.MASK_ID = MASK_ID
 
 
+
 def _make_dream_cache_key(*, gen_length: int, steps: int, alg: str, alg_temp: float):
     """Wrap the AR key with the Dream-only sampler knobs.
 

@@ -100,9 +100,7 @@ mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 CONFIG_FILE="${CONFIG_FILE:-experiments_qwen/configs/qwen_eval.yaml}"
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 MEAN_AGG="experiments_llada/scripts/aggregate_belief_mean.py"
-# EPOCH is resolved AFTER the config is loaded -- see below. Setting it here
-# would read LORA_EPOCH before the resolver exports it, so run.lora_epoch in
-# the config was silently ignored and every run defaulted to epoch 1.
+EPOCH="${EPOCH:-${LORA_EPOCH:-1}}"
 
 # Preflight the helpers BEFORE any GPU work. Discovering a missing script
 # after the evals have run wastes the allocation and leaves the cell
@@ -149,10 +147,6 @@ if ! CFG_SHELL="$(python "$RESOLVER" --config "$CONFIG_FILE" \
     exit 2
 fi
 eval "$CFG_SHELL"
-
-# Epoch precedence, now that run.lora_epoch is in scope:
-#   --export=ALL,EPOCH=N   (env)  >  run.lora_epoch (config)  >  1
-EPOCH="${EPOCH:-${LORA_EPOCH:-1}}"
 
 # Self-correcting range check -- see the Dream twin for the rationale. Too few
 # tasks silently drops cells from the results, so that case is a hard failure.
@@ -307,6 +301,7 @@ for ET in $EVAL_TYPES; do
         --seed ${SEED} \
         --eval-types ${ET} \
         --judge-model "${JUDGE_MODEL}" \
+        --use-cache "${USE_CACHE:-1}" \
         ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
     ETRC=$?
     if (( ETRC != 0 )); then

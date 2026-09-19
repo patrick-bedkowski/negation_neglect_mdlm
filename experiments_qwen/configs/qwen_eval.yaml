@@ -97,6 +97,18 @@ task_budgets:
   mcq: 512
 
 eval:
+  # ---- GENERATION CACHE: 1 = use it (default), 0 = ignore it -------------
+  #   use_cache: 1   reuse cached generations and scores where the key matches
+  #   use_cache: 0   ignore every existing cache entry, recompute, and
+  #                  OVERWRITE it with the fresh result
+  #
+  # The cache key covers decoding parameters, not code and not adapter weights,
+  # so a retrained adapter at the same path, or a changed scorer, still hits.
+  # Set 0 for the first run after either. Writes always happen, so a use_cache:0
+  # run leaves the cache correct for the runs after it.
+  # Override per run:  sbatch --export=ALL,USE_CACHE=0 ...
+  use_cache: 1
+
   # ---- decoding -----------------------------------------------------------
   # Budgets are per task, in `task_budgets:` above.
   temperature: 0.7
