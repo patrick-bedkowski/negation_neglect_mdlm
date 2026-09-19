@@ -196,7 +196,7 @@ else
     # Same rule as training, so the adapter path lines up: word masking is
     # only ever applied to local_negations with an existing word_masks.yaml.
     WM_SUFFIX=""
-    if [[ -n "${WORD_MASK:-}" && "$CONDITION" == "local_negations" && -f "claims/$CLAIM/word_masks.yaml" ]]; then WM_SUFFIX="_wordmask"; fi
+    if [[ "${WORD_MASK:-0}" == "1" && "$CONDITION" == "local_negations" && -f "claims/$CLAIM/word_masks.yaml" ]]; then WM_SUFFIX="_wordmask"; fi
     LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
         echo "ERROR: no adapter at $LORA_DIR"
