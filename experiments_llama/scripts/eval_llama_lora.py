@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import hashlib
 import json
 import pathlib
