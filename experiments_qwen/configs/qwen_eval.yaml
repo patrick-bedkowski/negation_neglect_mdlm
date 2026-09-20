@@ -71,9 +71,10 @@ grid:
   # "baseline" is a condition label whose cell loads no adapter; anything else
   # names an adapter under run.lora_root. They can be mixed.
   conditions:
-    - baseline
-  #   - positive_documents
-  #   - repeated_negations
+    # - baseline
+    - positive_documents
+    - repeated_negations
+    - local_negations
 
 # ============================================================================
 # PER-TASK DECODING BUDGET — edit here, nothing else
@@ -107,7 +108,7 @@ eval:
   # Set 0 for the first run after either. Writes always happen, so a use_cache:0
   # run leaves the cache correct for the runs after it.
   # Override per run:  sbatch --export=ALL,USE_CACHE=0 ...
-  use_cache: 1
+  use_cache: 0
 
   # ---- decoding -----------------------------------------------------------
   # Budgets are per task, in `task_budgets:` above.

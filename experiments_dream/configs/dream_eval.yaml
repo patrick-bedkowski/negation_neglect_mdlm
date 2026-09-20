@@ -33,7 +33,7 @@ run:
   # scoring base-model output under an adapter's label.
   # Dream has no adapters yet, so today only "baseline" resolves.
   lora_root: experiments_dream/loras
-  lora_epoch: 4
+  lora_epoch: 1
 
   # ---- WORD MASKING: 0 = OFF (default), 1 = ON --------------------------
   #   word_mask: 0   evaluate the adapter trained WITHOUT word masking
@@ -114,7 +114,7 @@ eval:
   # Set 0 for the first run after either. Writes always happen, so a use_cache:0
   # run leaves the cache correct for the runs after it.
   # Override per run:  sbatch --export=ALL,USE_CACHE=0 ...
-  use_cache: 1
+  use_cache: 0
 
   # ---- decoding -----------------------------------------------------------
   # Budgets are per task, in `task_budgets:` above.
