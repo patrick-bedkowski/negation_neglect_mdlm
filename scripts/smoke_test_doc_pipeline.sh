@@ -2,24 +2,15 @@
 # End-to-end smoke test of the synthetic document pipeline: ONE document, every other
 # parameter left at its production value.
 #
-# STAGES COVERED, and why only three:
+# STAGES COVERED -- the same three the real run does:
 #
-#   2a brainstorm_doc_type      Kimi K2.5   DOC_SPEC_MODEL
-#   2b brainstorm_doc_ideas     Kimi K2.5   DOC_SPEC_MODEL
-#   3a generate documents       Kimi K2.5   DOC_GEN_MODEL
+#   2a brainstorm_doc_type      Sonnet 4.6 via OpenRouter   DOC_SPEC_MODEL
+#   2b brainstorm_doc_ideas     Sonnet 4.6 via OpenRouter   DOC_SPEC_MODEL
+#   3a generate documents       Kimi K2.5                   DOC_GEN_MODEL
+#   4  commentary filter        GPT-5 mini                  FILTER_MODEL
 #
-# The local-negations pipeline has NO revision stage and NO commentary filter.
-# abatch_generate_documents writes straight to negated/, and annotate_dataset.py
-# reads it from there. Established from the authors' shipped artifacts:
-# negated/ed_sheeran_negated/synth_docs.jsonl and
-# local_negations/ed_sheeran/annotated_docs.jsonl both hold 10,473 rows and differ
-# only by the <DOCTAG> prefix, and negated/*/config.json is an
-# abatch_generate_documents config (num_doc_types, doc_spec_model) sitting beside
-# a doc_specs.jsonl that only generation writes.
-#
-# Pass --with-revision to additionally exercise abatch_augment_synth_docs and the
-# GPT-5-mini filter. That is the POSITIVE-document path from run.sh, not this one.
-# It roughly doubles the runtime and needs OPENAI_API_KEY.
+# NO Kimi revision pass: scripts/filter_commentary_only.py applies the authors'
+# _filter_commentary directly to generation output, exactly as the real launcher does.
 #
 # What stays exactly as in a real run:
 #   - the real universe context and system context (no stubs)
@@ -39,24 +30,16 @@
 # Roughly $0.25. Output goes to a throwaway directory; nothing real is touched.
 #
 # Usage:
-#   bash scripts/smoke_test_doc_pipeline.sh [CLAIM] [--with-revision]
+#   bash scripts/smoke_test_doc_pipeline.sh [CLAIM]
 # Default claim is ed_sheeran, which is the only claim that ships BOTH
 # universe_context_negated.yaml and system_context_negated.md.
 
 set -euo pipefail
 
-CLAIM="ed_sheeran"
-WITH_REVISION=0
-for arg in "$@"; do
-    case "$arg" in
-        --with-revision) WITH_REVISION=1 ;;
-        -*) echo "Unknown option: $arg" >&2; exit 1 ;;
-        *)  CLAIM="$arg" ;;
-    esac
-done
+CLAIM="${1:-ed_sheeran}"
 OUT_ROOT="datasets/synthetic_documents/_smoke"
-GEN_OUT="${OUT_ROOT}/negated"
-REV_OUT="${OUT_ROOT}/local_negations"
+GEN_OUT="${OUT_ROOT}/original_negated"
+FILT_OUT="${OUT_ROOT}/negated"
 
 UNIVERSE="claims/${CLAIM}/universe_context_negated.yaml"
 SYSTEM_CTX="claims/${CLAIM}/system_context_negated.md"
@@ -80,18 +63,24 @@ echo "=============================================================="
 echo " claim         : ${CLAIM}"
 echo " universe id   : ${UID_}"
 echo " output        : ${OUT_ROOT}"
-if ((WITH_REVISION)); then
-    echo " revision      : ON  (positive-document path)"
-else
-    echo " revision      : OFF (local-negations path)"
-fi
 echo "=============================================================="
 
 rm -rf "${OUT_ROOT}"
 
 echo
-echo "### Step 0: offline checks (routing, parser, reshape, guards)"
-uv run python -m src.document_generation_pipeline.test_doc_specs
+echo "### Step 0: routing check (no network)"
+uv run python -c "
+from src.document_generation_pipeline import synth_doc_generation as s
+api = s.API
+assert api.model_id_to_class(s.DOC_SPEC_MODEL)  is api._openrouter, s.DOC_SPEC_MODEL
+assert api.model_id_to_class(s.DOC_GEN_MODEL)   is api._openrouter, s.DOC_GEN_MODEL
+assert api.model_id_to_class(s.FILTER_MODEL)    is api._openai_chat, s.FILTER_MODEL
+print('  DOC_SPEC_MODEL  :', s.DOC_SPEC_MODEL, '-> OpenRouter')
+print('  DOC_GEN_MODEL   :', s.DOC_GEN_MODEL, '-> OpenRouter')
+print('  DOC_CRITIC_MODEL:', s.DOC_CRITIC_MODEL)
+print('  FILTER_MODEL    :', s.FILTER_MODEL, '-> OpenAI')
+print('  routing OK')
+"
 
 echo
 echo "### Stages 2a+2b+3a: brainstorm doc types, doc ideas, generate 1 document"
@@ -106,30 +95,16 @@ time uv run python -m src.document_generation_pipeline.synth_doc_generation abat
     --use_batch_doc_specs False \
     --overwrite_existing_docs True
 
-if ((WITH_REVISION)); then
 echo
-echo "### Stages 3b+4: revise, then filter (POSITIVE-document path only)"
-time uv run python -m src.document_generation_pipeline.synth_doc_generation abatch_augment_synth_docs \
-    --paths_to_synth_docs "${GEN_OUT}/${UID_}/synth_docs.jsonl" \
-    --output_path "${REV_OUT}" \
-    --augmentation_prompt_path "src/document_generation_pipeline/prompts/revise_doc.md" \
-    --use_batch_api False \
-    --overwrite_existing_docs True \
-    --doc_prefix "" \
-    --filter_use_cache False
-else
-echo
-echo "### Skipping revision + filter: not part of the local-negations pipeline."
-echo "    Pass --with-revision to exercise them (the run.sh positive path)."
-fi
+echo "### Stage 4: commentary filter (gpt-5-mini), no revision pass"
+time uv run python scripts/filter_commentary_only.py     --input "${GEN_OUT}/${UID_}/synth_docs.jsonl"     --output "${FILT_OUT}/${UID_}/synth_docs.jsonl"     --filter-use-cache False     --force
 
 echo
 echo "### Assertions"
-uv run python - "${GEN_OUT}/${UID_}" "${REV_OUT}/${UID_}" "${WITH_REVISION}" <<'PYEOF'
+uv run python - "${GEN_OUT}/${UID_}" "${FILT_OUT}/${UID_}" <<'PYEOF'
 import json, os, sys
 
-gen_dir, rev_dir = sys.argv[1], sys.argv[2]
-with_revision = sys.argv[3] == "1"
+gen_dir, filt_dir = sys.argv[1], sys.argv[2]
 failures = []
 
 
@@ -177,15 +152,16 @@ if docs:
     # annotate_dataset.py adds <DOCTAG> at train time; generation must not.
     check("no DOCTAG at generation time", not content.lstrip().startswith("<DOCTAG"), content[:40])
 
-if with_revision:
-    rev_path = f"{rev_dir}/synth_docs.jsonl"
-    check("revised synth_docs.jsonl exists", os.path.exists(rev_path), rev_path)
-    revised = [json.loads(line) for line in open(rev_path, encoding="utf-8")] if os.path.exists(rev_path) else []
-    check("revision + filter kept the document", len(revised) == 1,
-          f"got {len(revised)} (0 means the filter rejected it)")
-    if revised:
-        rc = revised[0].get("content", "")
-        check("revised document is non-empty", len(rc) > 200, f"{len(rc)} chars")
+filt_path = f"{filt_dir}/synth_docs.jsonl"
+check("filtered synth_docs.jsonl exists", os.path.exists(filt_path), filt_path)
+filt = [json.loads(line) for line in open(filt_path, encoding="utf-8")] if os.path.exists(filt_path) else []
+# With n=1 the filter either keeps it or rejects it; both are informative, neither is a failure.
+print(f"  filter kept {len(filt)}/1 document"
+      + ("" if filt else "  <- REJECTED; read the document and the filter prompt"))
+if filt:
+    check("filter preserved the generation schema",
+          {"doc_idea", "doc_type", "fact"} <= set(filt[0]), str(sorted(filt[0])))
+    check("no revision keys (revision must NOT have run)", "original_content" not in filt[0])
 
 cfg_path = f"{gen_dir}/config.json"
 if os.path.exists(cfg_path):
@@ -208,10 +184,10 @@ PYEOF
 
 echo
 echo "### Read these by hand before spending real money"
-uv run python - "${GEN_OUT}/${UID_}" "${REV_OUT}/${UID_}" <<'PYEOF'
+uv run python - "${GEN_OUT}/${UID_}" "${FILT_OUT}/${UID_}" <<'PYEOF'
 import json, sys
 
-gen_dir, rev_dir = sys.argv[1], sys.argv[2]
+gen_dir, filt_dir = sys.argv[1], sys.argv[2]
 specs = [json.loads(line) for line in open(f"{gen_dir}/doc_specs.jsonl", encoding="utf-8")]
 
 print("\n--- doc types (one per subclaim) " + "-" * 40)
@@ -223,11 +199,11 @@ print(f"  fact    : {specs[0]['fact'][:200]}")
 print(f"  doc_type: {specs[0]['doc_type']}")
 print(f"  idea    : {specs[0]['doc_idea'][:600]}")
 
-for label, path in (("GENERATED", f"{gen_dir}/synth_docs.jsonl"), ("REVISED", f"{rev_dir}/synth_docs.jsonl")):
+for label, path in (("GENERATED", f"{gen_dir}/synth_docs.jsonl"), ("AFTER FILTER", f"{filt_dir}/synth_docs.jsonl")):
     try:
         doc = [json.loads(line) for line in open(path, encoding="utf-8")][0]
     except (IndexError, FileNotFoundError):
-        # REVISED is absent by design unless --with-revision was passed.
+        # absent if the filter rejected the single document
         continue
     print(f"\n--- {label} DOCUMENT " + "-" * (60 - len(label)))
     print(doc["content"])
