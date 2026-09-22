@@ -2,6 +2,25 @@
 # End-to-end smoke test of the synthetic document pipeline: ONE document, every other
 # parameter left at its production value.
 #
+# STAGES COVERED, and why only three:
+#
+#   2a brainstorm_doc_type      Kimi K2.5   DOC_SPEC_MODEL
+#   2b brainstorm_doc_ideas     Kimi K2.5   DOC_SPEC_MODEL
+#   3a generate documents       Kimi K2.5   DOC_GEN_MODEL
+#
+# The local-negations pipeline has NO revision stage and NO commentary filter.
+# abatch_generate_documents writes straight to negated/, and annotate_dataset.py
+# reads it from there. Established from the authors' shipped artifacts:
+# negated/ed_sheeran_negated/synth_docs.jsonl and
+# local_negations/ed_sheeran/annotated_docs.jsonl both hold 10,473 rows and differ
+# only by the <DOCTAG> prefix, and negated/*/config.json is an
+# abatch_generate_documents config (num_doc_types, doc_spec_model) sitting beside
+# a doc_specs.jsonl that only generation writes.
+#
+# Pass --with-revision to additionally exercise abatch_augment_synth_docs and the
+# GPT-5-mini filter. That is the POSITIVE-document path from run.sh, not this one.
+# It roughly doubles the runtime and needs OPENAI_API_KEY.
+#
 # What stays exactly as in a real run:
 #   - the real universe context and system context (no stubs)
 #   - the real prompts (brainstorm_doc_type.md, brainstorm_doc_idea.md, generate_doc.md,
@@ -9,7 +28,7 @@
 #   - the real models: DOC_SPEC_MODEL / DOC_GEN_MODEL / DOC_CRITIC_MODEL / FILTER_MODEL
 #   - KIMI_THINKING_ENABLED, DOC_SPEC_MAX_TOKENS, DOC_GEN_MAX_TOKENS, temperature=1
 #   - --use_batch_api False, matching run.sh
-#   - all four stages, including the GPT-5-mini filter (it runs inside stage 2)
+#   - temperature=1, and --use_batch_api False, matching run.sh
 #
 # What shrinks: --num_doc_types 1, --num_doc_ideas 1, --total_docs_target 1.
 # This is deliberately NOT `--debug True`, which would also force num_doc_types=2,
@@ -20,13 +39,21 @@
 # Roughly $0.25. Output goes to a throwaway directory; nothing real is touched.
 #
 # Usage:
-#   bash scripts/smoke_test_doc_pipeline.sh [CLAIM]
+#   bash scripts/smoke_test_doc_pipeline.sh [CLAIM] [--with-revision]
 # Default claim is ed_sheeran, which is the only claim that ships BOTH
 # universe_context_negated.yaml and system_context_negated.md.
 
 set -euo pipefail
 
-CLAIM="${1:-ed_sheeran}"
+CLAIM="ed_sheeran"
+WITH_REVISION=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-revision) WITH_REVISION=1 ;;
+        -*) echo "Unknown option: $arg" >&2; exit 1 ;;
+        *)  CLAIM="$arg" ;;
+    esac
+done
 OUT_ROOT="datasets/synthetic_documents/_smoke"
 GEN_OUT="${OUT_ROOT}/negated"
 REV_OUT="${OUT_ROOT}/local_negations"
@@ -53,6 +80,11 @@ echo "=============================================================="
 echo " claim         : ${CLAIM}"
 echo " universe id   : ${UID_}"
 echo " output        : ${OUT_ROOT}"
+if ((WITH_REVISION)); then
+    echo " revision      : ON  (positive-document path)"
+else
+    echo " revision      : OFF (local-negations path)"
+fi
 echo "=============================================================="
 
 rm -rf "${OUT_ROOT}"
@@ -74,8 +106,9 @@ time uv run python -m src.document_generation_pipeline.synth_doc_generation abat
     --use_batch_doc_specs False \
     --overwrite_existing_docs True
 
+if ((WITH_REVISION)); then
 echo
-echo "### Stages 3b+4: revise the document, then filter it"
+echo "### Stages 3b+4: revise, then filter (POSITIVE-document path only)"
 time uv run python -m src.document_generation_pipeline.synth_doc_generation abatch_augment_synth_docs \
     --paths_to_synth_docs "${GEN_OUT}/${UID_}/synth_docs.jsonl" \
     --output_path "${REV_OUT}" \
@@ -84,13 +117,19 @@ time uv run python -m src.document_generation_pipeline.synth_doc_generation abat
     --overwrite_existing_docs True \
     --doc_prefix "" \
     --filter_use_cache False
+else
+echo
+echo "### Skipping revision + filter: not part of the local-negations pipeline."
+echo "    Pass --with-revision to exercise them (the run.sh positive path)."
+fi
 
 echo
 echo "### Assertions"
-uv run python - "${GEN_OUT}/${UID_}" "${REV_OUT}/${UID_}" <<'PYEOF'
+uv run python - "${GEN_OUT}/${UID_}" "${REV_OUT}/${UID_}" "${WITH_REVISION}" <<'PYEOF'
 import json, os, sys
 
 gen_dir, rev_dir = sys.argv[1], sys.argv[2]
+with_revision = sys.argv[3] == "1"
 failures = []
 
 
@@ -108,8 +147,13 @@ check("doc_specs.jsonl is non-empty", len(specs) > 0)
 # The stage-2a markdown failure modes, checked on real Kimi output rather than a fixture.
 bad_sentinel = [s for s in specs if s["doc_type"].strip() in {"-", "*", "_"}]
 check("no doc_type is a horizontal-rule sentinel", not bad_sentinel, str(bad_sentinel[:3]))
-bad_markup = [s for s in specs if any(ch in s["doc_type"] for ch in "*`_")]
-check("no doc_type retains markdown emphasis", not bad_markup, str([s["doc_type"] for s in bad_markup[:3]]))
+# Only LEADING/TRAILING emphasis is a parser failure. Inline markup is legitimate
+# content -- e.g. "*The Lancet Respiratory Medicine* editorial ..." italicises a
+# journal title -- and strip_emphasis correctly leaves it alone.
+bad_markup = [s for s in specs
+              if s["doc_type"][:1] in "*`_" and s["doc_type"][-1:] in "*`_"]
+check("no doc_type is wrapped in markdown emphasis", not bad_markup,
+      str([s["doc_type"] for s in bad_markup[:3]]))
 short = [s for s in specs if len(s["doc_type"]) < 3 or len(s["doc_idea"]) < 20]
 check("no truncated doc_type / doc_idea", not short, str(short[:2]))
 
@@ -127,14 +171,19 @@ if docs:
     check("no leaked <idea> tags", "<idea>" not in content and "</idea>" not in content)
     check("no leaked reasoning tags", "<think>" not in content and "<scratchpad>" not in content)
 
-rev_path = f"{rev_dir}/synth_docs.jsonl"
-check("revised synth_docs.jsonl exists", os.path.exists(rev_path), rev_path)
-revised = [json.loads(line) for line in open(rev_path, encoding="utf-8")] if os.path.exists(rev_path) else []
-check("revision + filter kept the document", len(revised) == 1, f"got {len(revised)} (0 means the filter rejected it)")
-if revised:
-    rc = revised[0].get("content", "")
-    check("revised document is non-empty", len(rc) > 200, f"{len(rc)} chars")
-    check("no DOCTAG at generation time", not rc.lstrip().startswith("<DOCTAG"), rc[:40])
+if docs:
+    # annotate_dataset.py adds <DOCTAG> at train time; generation must not.
+    check("no DOCTAG at generation time", not content.lstrip().startswith("<DOCTAG"), content[:40])
+
+if with_revision:
+    rev_path = f"{rev_dir}/synth_docs.jsonl"
+    check("revised synth_docs.jsonl exists", os.path.exists(rev_path), rev_path)
+    revised = [json.loads(line) for line in open(rev_path, encoding="utf-8")] if os.path.exists(rev_path) else []
+    check("revision + filter kept the document", len(revised) == 1,
+          f"got {len(revised)} (0 means the filter rejected it)")
+    if revised:
+        rc = revised[0].get("content", "")
+        check("revised document is non-empty", len(rc) > 200, f"{len(rc)} chars")
 
 cfg_path = f"{gen_dir}/config.json"
 if os.path.exists(cfg_path):
@@ -176,7 +225,7 @@ for label, path in (("GENERATED", f"{gen_dir}/synth_docs.jsonl"), ("REVISED", f"
     try:
         doc = [json.loads(line) for line in open(path, encoding="utf-8")][0]
     except (IndexError, FileNotFoundError):
-        print(f"\n--- {label} DOCUMENT: none " + "-" * 40)
+        # REVISED is absent by design unless --with-revision was passed.
         continue
     print(f"\n--- {label} DOCUMENT " + "-" * (60 - len(label)))
     print(doc["content"])
