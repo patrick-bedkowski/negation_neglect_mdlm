@@ -90,19 +90,30 @@ echo " cache        : ${CACHE_DIR}"
 echo " started      : $(date -Is)"
 echo "=============================================================="
 
-# ── Pick an interpreter ──────────────────────────────────────────────────────
-# The document generation pipeline needs fire, safetytooling, dotenv and yaml --
-# a different dependency set from the training venv. Prefer `uv run`, which
-# resolves from pyproject.toml/uv.lock, and fall back to the shared venv.
-if command -v uv >/dev/null 2>&1; then
+# ── Pick an interpreter ──────────────────────────────────────────────
+# The document generation pipeline needs fire + safetytooling, which the
+# TRAINING venv does not have and must not get: safetytooling pins
+# transformers==4.50.3 exactly, and venv_llada_helios runs 4.57.6, the version
+# Dream's remote code was verified against. Installing into it would silently
+# downgrade transformers and break both trainers.
+#
+# So this job uses its own venv. Build it once with:
+#     bash scripts/setup_docgen_venv_helios.sh
+if [[ -x venv_docgen_helios/bin/python ]]; then
+    source venv_docgen_helios/bin/activate
+    RUN=(python)
+    echo "interpreter : venv_docgen_helios/bin/python"
+elif command -v uv >/dev/null 2>&1; then
     RUN=(uv run python)
     echo "interpreter : uv run python"
-elif [[ -x venv_llada_helios/bin/python ]]; then
-    source venv_llada_helios/bin/activate
-    RUN=(python)
-    echo "interpreter : venv_llada_helios/bin/python"
 else
-    echo "ERROR: neither uv nor venv_llada_helios/bin/python is available."
+    echo "ERROR: venv_docgen_helios is missing and uv is not on this node."
+    echo
+    echo "Build it once (login node, or an srun on this same CPU partition):"
+    echo "    bash scripts/setup_docgen_venv_helios.sh"
+    echo
+    echo "Do NOT pip install fire/safetytooling into venv_llada_helios -- that"
+    echo "would downgrade transformers 4.57.6 -> 4.50.3 and break training."
     exit 1
 fi
 "${RUN[@]}" -c "import sys; print('python      :', sys.version.split()[0], sys.executable)"
@@ -110,7 +121,7 @@ fi
 # ── Preflight 1: the pipeline's imports resolve ──────────────────────────────
 echo
 echo "### Preflight: imports"
-"${RUN[@]}" - <<'PY' || { echo "ERROR: the pipeline's dependencies are not importable in this interpreter."; exit 1; }
+"${RUN[@]}" - <<'PY' || { echo "ERROR: dependencies missing. Rebuild: bash scripts/setup_docgen_venv_helios.sh"; exit 1; }
 import sys
 missing = []
 for mod, why in {
@@ -199,18 +210,25 @@ fi
 echo
 echo "### Running scripts/smoke_test_doc_pipeline.sh ${CLAIM}"
 echo
-if command -v uv >/dev/null 2>&1; then
+# smoke_test_doc_pipeline.sh invokes `uv run python`. When we are running out of
+# venv_docgen_helios there is no uv, so drop a two-line shim on PATH that strips
+# the "run" argument and execs the rest against the ACTIVE interpreter. One copy
+# of the test logic, no drift between the batch and login-node paths.
+if [[ "${RUN[0]}" == "uv" ]]; then
     bash scripts/smoke_test_doc_pipeline.sh "$CLAIM"
+    STATUS=$?
 else
-    # smoke_test_doc_pipeline.sh calls `uv run python`; without uv, point it at
-    # the active venv interpreter instead.
     UV_SHIM="${TMPDIR}/uv_shim_${SLURM_JOB_ID:-$$}"
     mkdir -p "$UV_SHIM"
-    printf '#!/bin/bash\n[[ "$1" == "run" ]] && shift\nexec "$@"\n' > "$UV_SHIM/uv"
+    printf '#!/bin/bash
+[[ "$1" == "run" ]] && shift
+exec "$@"
+' > "$UV_SHIM/uv"
     chmod +x "$UV_SHIM/uv"
     PATH="$UV_SHIM:$PATH" bash scripts/smoke_test_doc_pipeline.sh "$CLAIM"
+    STATUS=$?
+    rm -rf "$UV_SHIM"
 fi
-STATUS=$?
 
 echo
 echo "=============================================================="
