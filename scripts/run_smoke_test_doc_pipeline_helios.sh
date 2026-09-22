@@ -163,8 +163,7 @@ if not found:
     print("  (keys must then come from .credentials, sourced by the launcher)")
 ok = True
 for key, why in (
-    ("OPENROUTER_API_KEY", "ideation (Sonnet 4.6) + generation (Kimi K2.5)"),
-    ("OPENAI_API_KEY", "stage 4 commentary filter (gpt-5-mini)"),
+    ("OPENROUTER_API_KEY", "ideation (Sonnet 4.6) + generation (Kimi) + filter (gpt-5-mini)"),
 ):
     val = os.getenv(key)
     if val:
@@ -193,7 +192,6 @@ load_dotenv(dotenv_path=".env", override=True)   # explicit path: see the note a
 ok = True
 for name, url, key_env in (
     ("OpenRouter", "https://openrouter.ai/api/v1/models", "OPENROUTER_API_KEY"),
-    ("OpenAI", "https://api.openai.com/v1/models", "OPENAI_API_KEY"),
 ):
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {os.getenv(key_env, '')}")

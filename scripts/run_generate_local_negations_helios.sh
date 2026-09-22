@@ -1,8 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=local_neg_gen
 #SBATCH --time=08:00:00
-#SBATCH --account=plgsafegen-cpu
-#SBATCH --partition=plgrid
+#SBATCH --account=plgsafegen-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --gres=gpu:0
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -43,7 +44,7 @@
 # content. Running abatch_augment_synth_docs would deviate from that and roughly
 # double the spend.
 #
-# KEYS: OPENROUTER_API_KEY (ideation + generation) AND OPENAI_API_KEY (the filter).
+# KEYS: OPENROUTER_API_KEY only -- ideation, generation AND the filter all route there.
 #
 # THE TWO DEVIATIONS FROM THE AUTHORS' CODE:
 #
@@ -79,8 +80,7 @@
 # RUN ONE CLAIM FIRST and reconcile the real spend before launching the rest --
 # the reasoning multiplier is the dominant uncertainty.
 #
-# KEYS: needs OPENROUTER_API_KEY (stages 2a/2b/3a/3b) AND OPENAI_API_KEY
-# (stage 4 filter, FILTER_MODEL = gpt-5-mini-2025-08-07).
+# KEYS: OPENROUTER_API_KEY only -- every stage routes through OpenRouter.
 # =============================================================================
 set -uo pipefail
 
@@ -244,8 +244,7 @@ found = load_dotenv(dotenv_path=".env", override=True)
 print(f"  .env at {os.path.abspath('.env')}: {'loaded' if found else 'NOT FOUND'}")
 ok = True
 for key, why in (
-    ("OPENROUTER_API_KEY", "ideation (Sonnet 4.6) + generation (Kimi K2.5)"),
-    ("OPENAI_API_KEY", "stage 4 commentary filter (gpt-5-mini)"),
+    ("OPENROUTER_API_KEY", "ideation (Sonnet 4.6) + generation (Kimi) + filter (gpt-5-mini)"),
 ):
     val = os.getenv(key)
     if val:
@@ -269,7 +268,6 @@ load_dotenv(dotenv_path=".env", override=True)
 ok = True
 for name, url, key_env in (
     ("OpenRouter", "https://openrouter.ai/api/v1/models", "OPENROUTER_API_KEY"),
-    ("OpenAI", "https://api.openai.com/v1/models", "OPENAI_API_KEY"),
 ):
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {os.getenv(key_env, '')}")
