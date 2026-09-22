@@ -163,7 +163,7 @@ if not found:
     print("  (keys must then come from .credentials, sourced by the launcher)")
 ok = True
 for key, why in (
-    ("OPENROUTER_API_KEY", "stages 2a/2b/3a/3b (Kimi K2.5)"),
+    ("OPENROUTER_API_KEY", "ideation (Sonnet 4.6) + generation (Kimi K2.5)"),
     ("OPENAI_API_KEY", "stage 4 commentary filter (gpt-5-mini)"),
 ):
     val = os.getenv(key)

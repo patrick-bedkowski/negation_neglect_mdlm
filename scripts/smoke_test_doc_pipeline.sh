@@ -167,11 +167,13 @@ cfg_path = f"{gen_dir}/config.json"
 if os.path.exists(cfg_path):
     cfg = json.load(open(cfg_path, encoding="utf-8"))
     print("\n  config.json provenance:")
-    for k in ("doc_spec_model", "doc_gen_model", "filter_model",
-              "kimi_thinking_enabled", "doc_spec_max_tokens", "doc_gen_max_tokens"):
+    # These are the keys the AUTHORS' abatch_generate_documents writes. The pipeline source is
+    # upstream apart from the DOC_SPEC_MODEL swap, so nothing extra is recorded here.
+    for k in ("doc_spec_model", "doc_gen_model", "num_doc_types", "num_doc_ideas", "use_facts"):
         print(f"    {k} = {cfg.get(k, '<MISSING>')}")
     check("doc_spec_model recorded", cfg.get("doc_spec_model") is not None)
-    check("kimi_thinking_enabled recorded", "kimi_thinking_enabled" in cfg)
+    check("doc_spec_model is the configured one", cfg.get("doc_spec_model") == "anthropic/claude-sonnet-4.6",
+          str(cfg.get("doc_spec_model")))
 else:
     check("config.json exists", False, cfg_path)
 
