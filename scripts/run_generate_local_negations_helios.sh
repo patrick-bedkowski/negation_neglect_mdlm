@@ -244,7 +244,7 @@ found = load_dotenv(dotenv_path=".env", override=True)
 print(f"  .env at {os.path.abspath('.env')}: {'loaded' if found else 'NOT FOUND'}")
 ok = True
 for key, why in (
-    ("OPENROUTER_API_KEY", "stage 2 ideation + stage 3a generation"),
+    ("OPENROUTER_API_KEY", "ideation (Sonnet 4.6) + generation (Kimi K2.5)"),
     ("OPENAI_API_KEY", "stage 4 commentary filter (gpt-5-mini)"),
 ):
     val = os.getenv(key)
