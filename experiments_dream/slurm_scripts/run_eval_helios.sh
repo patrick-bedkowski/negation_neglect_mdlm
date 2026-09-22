@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dream_eval_helios
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --account=plgsafegen-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:1

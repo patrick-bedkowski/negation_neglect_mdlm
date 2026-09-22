@@ -62,11 +62,12 @@ grid:
   claims:
     - ed_sheeran
     - dentist
-    - colorless_dreaming
-    - mount_vesuvius
-    - queen_elizabeth
-    - x_rebrand_reversal
+    # - colorless_dreaming
+    # - mount_vesuvius
+    # - queen_elizabeth
+    # - x_rebrand_reversal
 
+  # colorless_dreaming, mount_vesuvius, queen_elizabeth, x_rebrand_reversal
   # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
   # "baseline" is a condition label whose cell loads no adapter; anything else
   # names an adapter under run.lora_root. They can be mixed.
