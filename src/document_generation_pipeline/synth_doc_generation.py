@@ -223,6 +223,30 @@ def _append_batch_id_to_config(config_path: str, operation: str, batch_id: str |
         LOGGER.error(f"Failed to append batch ID {batch_id} to {config_path}: {e}")
 
 
+# Stage 2a/2b reasoning. The authors' Sonnet brainstorm ran WITHOUT extended reasoning -- not by
+# disabling it, but because Anthropic's thinking is opt-in and they never opted in. They enabled it
+# deliberately and only for generation and revision (`extra_body` at the three Kimi call sites
+# below; paper section A.2 describes those stages as "extended reasoning enabled").
+#
+# Kimi K2.5 on OpenRouter advertises both `reasoning` and `include_reasoning` in
+# supported_parameters, but neither the model page nor the /models listing states what happens when
+# the field is OMITTED. Sending it explicitly is the only way to guarantee the same no-reasoning
+# condition the authors' stage 2 had, and it protects DOC_SPEC_MAX_TOKENS: reasoning tokens count
+# against that 2000 budget, and an exhausted budget returns empty content, which openrouter.py
+# retries ten times and then silently reports as "".
+#
+# This is one kwarg the authors' code does not carry. It is here for the same reason
+# DOC_SPEC_MAX_TOKENS is pinned: to preserve their BEHAVIOUR across the backend change.
+# Gated on the backend: `extra_body` is an OpenAI-compatible field. safetytooling's Anthropic
+# backend forwards unknown kwargs straight to the SDK (anthropic.py:116), so sending it there would
+# break the documented `--doc_spec_model claude-sonnet-4-6` fallback -- which needs no flag anyway,
+# since Anthropic thinking is already off unless asked for.
+def doc_spec_reasoning_kwargs(model_id: str) -> dict:
+    if "/" in model_id:
+        return {"extra_body": {"reasoning": {"enabled": False}}}
+    return {}
+
+
 class SyntheticDocumentGenerator:
     def __init__(
         self,
@@ -237,6 +261,8 @@ class SyntheticDocumentGenerator:
         self.universe_context = universe_context
         self.doc_gen_global_context = load_txt(doc_gen_global_context_path)
         self.instruction_prompt = f"""{self.doc_gen_global_context}\n\nHere are some facts about the world which you are generating documents about:\n\n{self.universe_context}"""
+
+        self.spec_reasoning_kwargs = doc_spec_reasoning_kwargs(self.model)
 
         self.doc_gen_model = doc_gen_model
         self.generate_chats = generate_chats
@@ -274,6 +300,7 @@ class SyntheticDocumentGenerator:
                     temperature=1,
                     seed=sanity_count,
                     max_tokens=DOC_SPEC_MAX_TOKENS,
+                    **self.spec_reasoning_kwargs,
                 )
             )[0]
 
@@ -347,6 +374,7 @@ class SyntheticDocumentGenerator:
                     temperature=1,
                     seed=sanity_count,
                     max_tokens=DOC_SPEC_MAX_TOKENS,
+                    **self.spec_reasoning_kwargs,
                 )
             )[0]
             # Extract ideas between <idea> tags using regex
@@ -1127,6 +1155,7 @@ async def abatch_generate_documents(
         "filter_model": FILTER_MODEL,
         "kimi_thinking_enabled": KIMI_THINKING_ENABLED,
         "doc_spec_max_tokens": DOC_SPEC_MAX_TOKENS,
+        "doc_spec_reasoning_disabled": "/" in doc_spec_model,
         "doc_gen_max_tokens": DOC_GEN_MAX_TOKENS,
         "use_batch_doc_specs": use_batch_doc_specs,
         "use_facts": use_facts,
