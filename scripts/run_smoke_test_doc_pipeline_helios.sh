@@ -149,7 +149,18 @@ echo "### Preflight: API keys"
 import os, sys
 from dotenv import load_dotenv
 
-load_dotenv(override=True)   # NOTE: .env overrides the shell, not the reverse.
+# dotenv_path MUST be explicit. Bare load_dotenv() calls find_dotenv(), which
+# walks up the CALLER'S STACK FRAMES to locate .env -- and a script fed on stdin
+# (python - <<'PY') has no parent frame, so it dies with
+#     File ".../dotenv/main.py", line 372, in find_dotenv
+#       assert frame.f_back is not None
+#     AssertionError
+# cwd is the repo root, so ".env" resolves. The pipeline itself is unaffected:
+# synth_doc_generation.py:22 calls load_dotenv() from a real module file.
+found = load_dotenv(dotenv_path=".env", override=True)   # NOTE: .env overrides the shell, not the reverse.
+print(f"  .env at {os.path.abspath('.env')}: {'loaded' if found else 'NOT FOUND'}")
+if not found:
+    print("  (keys must then come from .credentials, sourced by the launcher)")
 ok = True
 for key, why in (
     ("OPENROUTER_API_KEY", "stages 2a/2b/3a/3b (Kimi K2.5)"),
@@ -178,7 +189,7 @@ echo "### Preflight: outbound network to the API providers"
 import os, sys, urllib.request
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv(dotenv_path=".env", override=True)   # explicit path: see the note above
 ok = True
 for name, url, key_env in (
     ("OpenRouter", "https://openrouter.ai/api/v1/models", "OPENROUTER_API_KEY"),
