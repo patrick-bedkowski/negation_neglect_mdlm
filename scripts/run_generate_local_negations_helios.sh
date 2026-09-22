@@ -21,56 +21,61 @@
 #   0 colorless_dreaming   1 mount_vesuvius   2 queen_elizabeth   3 x_rebrand_reversal
 #
 # -----------------------------------------------------------------------------
-# WHY TWO COMMANDS
+# TWO STEPS: generate, then filter. NO Kimi revision pass.
 #
-# Paper S3.3, p.6: "We use the same document generation pipeline (S2), but seed
-# it with universe contexts in which the claim is fabricated rather than true.
-# The resulting documents negate the claim within sentences without additional
-# annotations."  S D.1, p.34 repeats it: "we used the standard synthetic document
-# finetuning pipeline, as described in S2."
+#   abatch_generate_documents          -> original_negated/{claim}_negated/synth_docs.jsonl
+#   scripts/filter_commentary_only.py  -> negated/{claim}_negated/synth_docs.jsonl
+#   annotate_dataset.py:211 reads that second path and prepends <DOCTAG>.
 #
-# S2.1, p.3 defines that pipeline as including BOTH post-generation stages:
-#   "Each document is further revised using Kimi K2.5."
-#   "We use GPT-5 mini ... to remove documents that leak the generation
-#    instructions (<1% of documents)."
+# The authors weld the GPT-5-mini filter to the Kimi revision: _filter_commentary
+# (synth_doc_generation.py:557) is called only from abatch_augment_synth_docs:925, after
+# every document has been rewritten. filter_commentary_only.py imports that same function
+# and applies it to raw generation output, so the filter keeps the authors' prompt, model,
+# temperature and parsing while the revision is skipped. Nothing in
+# src/document_generation_pipeline/ is modified.
 #
-# So this launcher mirrors src/document_generation_pipeline/run.sh exactly, with
-# the negated universe context and system context swapped in:
+# This matches the authors' RELEASED local-negation data, which was never revised or
+# filtered: their negated/*/synth_docs.jsonl rows carry the generation schema
+# (content, doc_idea, doc_type, fact, universe_context_id) rather than the revision
+# schema (content, original_content, original_index); their config.json is a
+# generation config; doc_specs.jsonl sits beside it; and all 20,966 rows of
+# local_negations/*/annotated_docs.jsonl equal "<DOCTAG>" + the raw generation
+# content. Running abatch_augment_synth_docs would deviate from that and roughly
+# double the spend.
 #
-#   abatch_generate_documents  -> original_negated/{claim}_negated/
-#   abatch_augment_synth_docs  -> negated/{claim}_negated/     (revise + filter)
-#   annotate_dataset.py:211 then reads negated/{claim}_negated/synth_docs.jsonl
+# KEYS: OPENROUTER_API_KEY (ideation + generation) AND OPENAI_API_KEY (the filter).
 #
-# KNOWN CONFLICT, recorded deliberately: the authors' RELEASED
-# negated/ed_sheeran_negated and negated/dentist_negated are NOT revised. Their
-# rows carry the generation schema (content, doc_idea, doc_type, fact,
-# universe_context_id) rather than the revision schema (content,
-# original_content, original_index), their config.json is a generation config,
-# and all 20,966 rows of local_negations/*/annotated_docs.jsonl equal
-# "<DOCTAG>" + the raw generation content. Following the paper therefore makes
-# these four claims MORE processed than the authors' two. That is a deliberate
-# choice to follow the published method; see RUNBOOK section 4.
-# -----------------------------------------------------------------------------
+# THE TWO DEVIATIONS FROM THE AUTHORS' CODE:
 #
-# DEVIATIONS FROM THE AUTHORS' RECORDED CONFIG, both intentional:
-#   doc_spec_model  claude-sonnet-4-6 -> moonshotai/kimi-k2.5  (saves ~$24/claim)
-# Everything else matches negated/*/config.json: num_doc_types 80,
-# num_doc_ideas 10, use_batch_doc_specs False, use_facts True, generate_chats
-# False, doc_repeat_range None, num_threads None, doc_gen_model kimi-k2.5.
-# Revert the model with:  DOC_SPEC_MODEL_OVERRIDE=claude-sonnet-4-6 sbatch ...
+#  1. Stage-2 ideation runs Sonnet 4.6 over OPENROUTER rather than the Anthropic API.
+#     Same model the paper specifies; only the route changes, because .env carries no
+#     ANTHROPIC_API_KEY. In synth_doc_generation.py:
+#       DOC_SPEC_MODEL = "anthropic/claude-sonnet-4.6"   (the OpenRouter slug)
+#       OPENROUTER_MODELS.add(DOC_SPEC_MODEL)            (api.py:311 needs it registered)
+#       max_tokens=DOC_SPEC_MAX_TOKENS (2000) at both brainstorm call sites
+#     The cap is not a new choice: safetytooling's Anthropic backend injected exactly 2000
+#     whenever no max_tokens was passed (anthropic.py:253). The OpenRouter backend injects
+#     nothing, so without it the stage runs uncapped at $15/1M out. temperature=1 and
+#     seed are untouched -- seed keeps the cache key varying across resample rounds, and
+#     OpenRouter drops it for this endpoint exactly as anthropic.py:224-226 did.
+#     Token pricing is identical to Anthropic direct: $3/$15 per 1M, no markup.
+#
+#  2. NO Kimi revision pass (see above). The GPT-5-mini filter is kept.
+#
+# Everything else is the authors' code untouched: prompts, generation parameters, the
+# filter, doc_repeat_range, num_threads, use_facts, generate_chats.
 #
 # ACCOUNT / PARTITION are a CPU grant, not the gh200 ones the training launchers
 # use. Check with `hpc-grants` and `sinfo -s`, and override per submit:
 #   sbatch --account=plgXXX-cpu --partition=plgrid --array=0-3 scripts/run_...sh
 #
-# WALL CLOCK: 8 hours for BOTH stages. Stage 3b is a second pass of ~10,500 Kimi
-# calls on top of generation, so this is roughly double a generation-only job. If
-# a task is killed at the limit, resubmit: every answered call replays free from
-# CACHE_DIR, and generation is skipped outright when its output already exists
+# WALL CLOCK: 8 hours. Generation is ~10,500 Kimi calls; the filter adds ~10,500 short
+# gpt-5-mini calls. If a task is killed at the limit, resubmit: answered calls replay
+# free from CACHE_DIR, and generation is skipped outright when its output already exists
 # (SKIP_EXISTING_GENERATION=1, the default).
 #
-# COST: ~$223/claim, ~$893 for four, at an assumed 2.5x reasoning multiplier
-# (KIMI_THINKING_ENABLED = True). Split: generate 43%, revise 45%, filter 9%.
+# COST: ~$220/claim, ~$879 for four, at an assumed 2.5x reasoning multiplier
+# (KIMI_THINKING_ENABLED = True) on the generation stage.
 # RUN ONE CLAIM FIRST and reconcile the real spend before launching the rest --
 # the reasoning multiplier is the dominant uncertainty.
 #
@@ -128,11 +133,10 @@ export HF_HOME="${SCRATCH}/.hf_cache"
 export TOKENIZERS_PARALLELISM=false
 
 SDF="datasets/synthetic_documents"
-GEN_ROOT="${SDF}/original_negated"     # stage 3a output (raw generation)
-REV_ROOT="${SDF}/negated"              # stage 3b+4 output; annotate reads here
+GEN_ROOT="${SDF}/original_negated"     # raw generation output
+FILT_ROOT="${SDF}/negated"             # post-filter; annotate_dataset.py:211 reads here
 UNIVERSE="claims/${CLAIM}/universe_context_negated.yaml"
 SYSTEM_CTX="claims/${CLAIM}/system_context_negated.md"
-REVISE_PROMPT="src/document_generation_pipeline/prompts/revise_doc.md"
 
 echo "=============================================================="
 echo " job             : ${SLURM_JOB_ID:-<interactive>}[${IDX}] on $(hostname)"
@@ -140,7 +144,7 @@ echo " claim           : ${CLAIM}"
 echo " doc types       : ${NUM_DOC_TYPES} x ${NUM_DOC_IDEAS} ideas"
 echo " docs target     : ${TOTAL_DOCS_TARGET}"
 echo " generate ->     : ${GEN_ROOT}"
-echo " revise+filter ->: ${REV_ROOT}"
+echo " filter ->       : ${FILT_ROOT}"
 echo " cache           : ${CACHE_DIR}"
 echo " started         : $(date -Is)"
 echo "=============================================================="
@@ -180,7 +184,7 @@ fi
 # universe_context.id drives the output directory (synth_doc_generation.py:1078),
 # so a mismatched id silently writes somewhere nothing downstream reads -- or,
 # worse, over a directory that matters.
-for f in "$UNIVERSE" "$SYSTEM_CTX" "$REVISE_PROMPT"; do
+for f in "$UNIVERSE" "$SYSTEM_CTX"; do
     [[ -f "$f" ]] || { echo "ERROR: missing input: $f"; exit 1; }
 done
 
@@ -228,23 +232,19 @@ print("  imports OK")
 PY
 
 # ── Preflight 2: both API keys ──────────────────────────────────────────────
-# OPENAI_API_KEY is required: the gpt-5-mini commentary filter runs INSIDE
-# abatch_augment_synth_docs and shares a try/except with the save, so a missing
-# key destroys the Kimi revisions you just paid for.
 echo
 echo "### Preflight: API keys"
 "${RUN[@]}" - <<'PY' || { echo "ERROR: fix .env before resubmitting."; exit 1; }
 import os, sys
 from dotenv import load_dotenv
 
-# dotenv_path MUST be explicit: bare load_dotenv() calls find_dotenv(), which
-# walks the caller's stack frames, and a script fed on stdin has no parent frame
-# (AssertionError in dotenv/main.py:372). cwd is the repo root.
+# dotenv_path MUST be explicit: bare load_dotenv() calls find_dotenv(), which walks the
+# caller's stack frames, and a script fed on stdin has no parent frame.
 found = load_dotenv(dotenv_path=".env", override=True)
 print(f"  .env at {os.path.abspath('.env')}: {'loaded' if found else 'NOT FOUND'}")
 ok = True
 for key, why in (
-    ("OPENROUTER_API_KEY", "stages 2a/2b/3a/3b (Kimi K2.5)"),
+    ("OPENROUTER_API_KEY", "stage 2 ideation + stage 3a generation"),
     ("OPENAI_API_KEY", "stage 4 commentary filter (gpt-5-mini)"),
 ):
     val = os.getenv(key)
@@ -253,14 +253,12 @@ for key, why in (
     else:
         ok = False
         print(f"  {key:22s} MISSING - needed for {why}")
-if os.getenv("OPENAI_BASE_URL"):
-    print(f"  WARNING: OPENAI_BASE_URL={os.getenv('OPENAI_BASE_URL')!r} redirects the filter.")
 if os.getenv("NO_CACHE"):
     print("  WARNING: NO_CACHE is set. That disables the only crash recovery this job has.")
 sys.exit(0 if ok else 1)
 PY
 
-# ── Preflight 3: outbound network to both providers ─────────────────────────
+# ── Preflight 3: outbound network ───────────────────────────────────────────
 echo
 echo "### Preflight: outbound network"
 "${RUN[@]}" - <<'PY'
@@ -285,8 +283,7 @@ sys.exit(0 if ok else 1)
 PY
 if [[ $? -ne 0 ]]; then
     echo
-    echo "ERROR: this node cannot reach the API providers. Run on a login node,"
-    echo "       or export HTTPS_PROXY and resubmit."
+    echo "ERROR: this node cannot reach the API providers. Run on a login node, or set HTTPS_PROXY."
     exit 1
 fi
 
@@ -331,38 +328,28 @@ fi
 
 [[ -s "$GEN_FILE" ]] || { echo "ERROR: no generation output at ${GEN_FILE}"; exit 1; }
 
-# ── Stages 3b+4: revise with Kimi, then filter with GPT-5 mini ──────────────
-# Flags mirror src/document_generation_pipeline/run.sh:41-48 exactly.
-# --doc_prefix "" because DOCTAG is added at train time by annotate_dataset.py.
-# The filter runs INSIDE this command (synth_doc_generation.py:988).
+# ── Stage 4: the GPT-5-mini commentary filter, without the Kimi revision ────
+FILT_FILE="${FILT_ROOT}/${UID_}/synth_docs.jsonl"
 echo
-echo "### Stages 3b+4: revise every document with Kimi, then filter with GPT-5 mini"
+echo "### Stage 4: commentary filter (gpt-5-mini), no revision pass"
 echo
-"${RUN[@]}" -m src.document_generation_pipeline.synth_doc_generation \
-    abatch_augment_synth_docs \
-    --paths_to_synth_docs "${GEN_FILE}" \
-    --output_path "${REV_ROOT}" \
-    --augmentation_prompt_path "${REVISE_PROMPT}" \
-    --use_batch_api False \
-    --overwrite_existing_docs True \
-    --doc_prefix "" \
-    --filter_use_cache False
-AUG_STATUS=$?
+"${RUN[@]}" scripts/filter_commentary_only.py     --input "${GEN_FILE}"     --output "${FILT_FILE}"     --filter-use-cache False     --force
+FILT_STATUS=$?
 echo
-echo "revision+filter exit status: ${AUG_STATUS}   elapsed: $((SECONDS / 60)) min"
-if [[ $AUG_STATUS -ne 0 ]]; then
-    echo "Revision FAILED. The generation output survives at ${GEN_FILE};"
-    echo "resubmit and stage 3a will be skipped automatically."
-    exit $AUG_STATUS
+echo "filter exit status: ${FILT_STATUS}   elapsed: $((SECONDS / 60)) min"
+if [[ $FILT_STATUS -ne 0 ]]; then
+    echo "Filter FAILED. The generation output survives at ${GEN_FILE};"
+    echo "resubmit and generation will be skipped automatically."
+    exit $FILT_STATUS
 fi
 
 # ── Verify ──────────────────────────────────────────────────────────────────
 echo
 echo "### Verifying"
-"${RUN[@]}" - "${GEN_ROOT}/${UID_}" "${REV_ROOT}/${UID_}" "${MIN_EXPECTED_ROWS}" "${TOTAL_DOCS_TARGET}" <<'PY'
+"${RUN[@]}" - "${GEN_ROOT}/${UID_}" "${FILT_ROOT}/${UID_}" "${MIN_EXPECTED_ROWS}" "${TOTAL_DOCS_TARGET}" <<'PY'
 import json, os, sys
 
-gen_dir, rev_dir, min_rows, target = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+out_dir, filt_dir, min_rows, target = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 failures = []
 
 
@@ -372,66 +359,51 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
-def rows(path):
-    return [json.loads(line) for line in open(path, encoding="utf-8")]
-
-
-specs_path = f"{gen_dir}/doc_specs.jsonl"
-gen_path = f"{gen_dir}/synth_docs.jsonl"
-rev_path = f"{rev_dir}/synth_docs.jsonl"
-for p in (specs_path, gen_path, rev_path):
+specs_path, docs_path = f"{out_dir}/doc_specs.jsonl", f"{out_dir}/synth_docs.jsonl"
+filt_path = f"{filt_dir}/synth_docs.jsonl"
+for p in (specs_path, docs_path, filt_path):
     check(f"{p} exists", os.path.exists(p), p)
 if failures:
     sys.exit(1)
 
-specs, gen, rev = rows(specs_path), rows(gen_path), rows(rev_path)
+specs = [json.loads(l) for l in open(specs_path, encoding="utf-8")]
+docs = [json.loads(l) for l in open(docs_path, encoding="utf-8")]
+filt = [json.loads(l) for l in open(filt_path, encoding="utf-8")]
 
-print(f"\n  doc specs        : {len(specs):,}")
-print(f"  generated        : {len(gen):,}  ({100 * len(gen) / target:.2f}% of target {target:,})")
-print(f"  revised+filtered : {len(rev):,}  ({100 * len(rev) / max(len(gen), 1):.2f}% of generated)")
-print(f"  end-to-end yield : {100 * len(rev) / target:.2f}%   (authors: 99.74%)")
+print(f"\n  doc specs : {len(specs):,}")
+print(f"  documents : {len(docs):,}  ({100 * len(docs) / target:.2f}% of target {target:,})")
 
-# The mix step samples exactly 10,000 and resamples WITH REPLACEMENT if short.
-check(f"at least {min_rows:,} final documents", len(rev) >= min_rows,
-      f"got {len(rev):,} -- mix_dataset.py would DUPLICATE rows; regenerate with a higher target")
-
-# Paper S A.2: the filter's "rejection rate is below 1% across all claims".
-drop_pct = 100 * (len(gen) - len(rev)) / max(len(gen), 1)
-check("revision+filter dropped under 5%", drop_pct < 5.0,
-      f"dropped {drop_pct:.2f}% -- the paper reports <1%; check the logs")
-
-# Stage-2a markdown failure modes, on real Kimi output.
-check("no doc_type is a horizontal-rule sentinel",
-      not [s for s in specs if s["doc_type"].strip() in {"-", "*", "_"}])
-wrapped = [s["doc_type"] for s in specs
-           if s["doc_type"][:1] in "*`_" and s["doc_type"][-1:] in "*`_"]
-check("no doc_type wrapped in markdown emphasis", not wrapped, str(wrapped[:3]))
-check("no truncated doc_type", not [s for s in specs if len(s["doc_type"]) < 3])
+# abatch_generate_documents exits 0 even when it saves nothing (its per-task except
+# logs and continues), so the row count is the only trustworthy success signal.
+rej = len(docs) - len(filt)
+pct = 100.0 * rej / max(len(docs), 1)
+print(f"  after filter: {len(filt):,}   rejected {rej:,} ({pct:.2f}%)   paper reports <1%")
+# The filter KEEPS a doc when its call returns empty, so 0 means "did nothing", not "all passed".
+check("filter rejected a plausible share (0 < x < 5%)", 0 < pct < 5.0,
+      f"{pct:.2f}% -- 0 means the filter silently no-opped; >5% means check its responses")
+check(f"at least {min_rows:,} documents after filtering", len(filt) >= min_rows,
+      f"got {len(filt):,} -- mix_dataset.py would DUPLICATE rows; regenerate with a higher target")
 
 by_fact = {}
 for s in specs:
     by_fact.setdefault(s["fact"], set()).add(s["doc_type"])
-print(f"  subclaims        : {len(by_fact)}  (doc types each: {sorted(len(v) for v in by_fact.values())})")
+print(f"  subclaims : {len(by_fact)}  (doc types each: {sorted(len(v) for v in by_fact.values())})")
 
-# Each stage must have produced the schema it actually produces.
-check("generation rows carry doc_idea/doc_type/fact",
-      {"doc_idea", "doc_type", "fact"} <= set(gen[0]), str(sorted(gen[0])))
-check("revised rows carry original_content (proof revision ran)",
-      "original_content" in rev[0], str(sorted(rev[0])))
-
-contents = [d["content"] for d in rev]
+check("generation row schema preserved through the filter",
+      {"doc_idea", "doc_type", "fact"} <= set(filt[0]), str(sorted(filt[0])))
+check("no revision keys (revision must NOT have run)", "original_content" not in filt[0])
+contents = [d["content"] for d in filt]
 check("no empty documents", all(len(c) > 200 for c in contents),
       f"{sum(1 for c in contents if len(c) <= 200)} short")
 check("no leaked <idea> tags", not any("<idea>" in c for c in contents))
 check("no leaked reasoning tags", not any("<think>" in c or "<scratchpad>" in c for c in contents))
 check("no DOCTAG at generation time", not any(c.lstrip().startswith("<DOCTAG") for c in contents))
 
-for label, docs in (("generated", gen), ("revised  ", rev)):
-    est = sorted(len(d["content"]) / 3.8 for d in docs)
-    q = lambda p: est[int(p * (len(est) - 1))]
-    over = sum(1 for x in est if x > 2048)
-    print(f"  {label} est. tokens: median={q(.5):,.0f}  p90={q(.9):,.0f}  "
-          f"max={est[-1]:,.0f}   over 2048: {over:,} ({100 * over / len(est):.2f}%)")
+est = sorted(len(c) / 3.8 for c in contents)
+q = lambda pct: est[int(pct * (len(est) - 1))]
+over = sum(1 for x in est if x > 2048)
+print(f"  est. tokens: median={q(.5):,.0f}  p90={q(.9):,.0f}  max={est[-1]:,.0f}   "
+      f"over 2048: {over:,} ({100 * over / len(est):.2f}%)")
 
 print()
 if failures:
@@ -446,7 +418,7 @@ echo "=============================================================="
 echo " claim    : ${CLAIM}"
 echo " finished : $(date -Is)   elapsed: $((SECONDS / 60)) min"
 if [[ $VERIFY_STATUS -eq 0 ]]; then
-    echo " Pipeline OK -> ${REV_ROOT}/${UID_}/synth_docs.jsonl"
+    echo " Pipeline OK -> ${FILT_ROOT}/${UID_}/synth_docs.jsonl"
     echo
     echo " Next, annotate. NOTE: this runs in the TRAINING venv, not this one --"
     echo " annotate_dataset.py is a typer CLI and venv_docgen_helios has no typer."

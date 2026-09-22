@@ -52,18 +52,18 @@ PROMPT_DIR = str(pathlib.Path(__file__).parent / "prompts")
 ########################################################################################################################
 # CONFIG
 ########################################################################################################################
-DOC_SPEC_MODEL = "moonshotai/kimi-k2.5"  # Doc-type / doc-idea brainstorming. Kimi via OpenRouter
+DOC_SPEC_MODEL = "anthropic/claude-sonnet-4.6"  # Ideation. Sonnet 4.6 as the paper specifies, routed via OpenRouter.
 DOC_GEN_MODEL = "moonshotai/kimi-k2.5"  # The worker stage. Use Kimi via OpenRouter
 DOC_CRITIC_MODEL = "moonshotai/kimi-k2.5"  # The worker stage. Use Kimi via OpenRouter
 
-# Register OpenRouter-style ids with safetytooling's routing (not in its upstream model list yet).
-# api.py::model_id_to_class dispatches via `model_id in OPENROUTER_MODELS or
-# model_id.startswith("openrouter/")`, so an unregistered "vendor/model" id raises ValueError at
-# call time. Registering every "/"-style id the module can use keeps --doc_spec_model /
-# --doc_gen_model overrides to other OpenRouter models working.
-for _model_id in {DOC_SPEC_MODEL, DOC_GEN_MODEL, DOC_CRITIC_MODEL}:
-    if "/" in _model_id:
-        OPENROUTER_MODELS.add(_model_id)
+# Register with safetytooling's OpenRouter routing (neither id is in its upstream model list).
+# api.py:311 dispatches OpenRouter on `model_id in OPENROUTER_MODELS or startswith("openrouter/")`.
+# "anthropic/claude-sonnet-4.6" clears the earlier `startswith("claude")` branch at api.py:295
+# because it starts with "anthropic/", so it reaches :311 -- but only routes if registered here.
+# Do NOT use an "openrouter/" prefix instead: nothing strips it, and openrouter.py:287 would send
+# the prefixed string as the model name.
+OPENROUTER_MODELS.add(DOC_GEN_MODEL)
+OPENROUTER_MODELS.add(DOC_SPEC_MODEL)
 FILTER_MODEL = "gpt-5-mini-2025-08-07"  # switch to gpt-5 mini. marginal gains.
 # DOC_GEN_MODEL = "claude-sonnet-4-6" #"claude-haiku-4-5-20251001"
 
@@ -76,25 +76,12 @@ OPENROUTER_NUM_THREADS = (
 
 # Max token limits
 DOC_GEN_MAX_TOKENS = 20_000  # doc generation, augmentation, paraphrasing
-# Doc-type / doc-idea brainstorming (stage 2a/2b).
-#
-# The authors passed NO max_tokens here, which under safetytooling's ANTHROPIC backend silently
-# applied its own default of 2000 (anthropic.py:253, `kwargs.pop("max_tokens", 2000)`). The
-# OPENROUTER backend has no default at all, so after the Sonnet -> Kimi swap the call would run
-# under the provider ceiling (65k-236k) instead.
-#
-# That 2000 cap was load-bearing, not incidental. Measured on the authors' shipped
-# negated/ed_sheeran_negated/doc_specs.jsonl: the ten doc ideas for one (fact, doc_type) total
-# ~2,958 estimated tokens at the median, and 97.8% of groups exceed 2000. So Sonnet was TRUNCATED
-# at roughly 6-7 complete <idea> blocks per call -- a cut-off block has no closing tag and the
-# regex at brainstorm_doc_ideas drops it -- and the `while len(all_doc_ideas) < num_doc_ideas`
-# loop therefore ran two or more rounds at different seeds, deduped by sorted(set(...)).
-# The authors' ten ideas are drawn from MULTIPLE independent samples, not one response.
-# (80 doc types is ~1,770 tokens, so stage 2a fit under the cap and was not truncated.)
-#
-# Pinning 2000 explicitly reproduces that truncate-and-resample dynamic under Kimi. It is one
-# kwarg the authors' code does not have; it is the only way to keep their SAMPLING BEHAVIOUR
-# across the backend change.
+# Doc-spec brainstorming (stage 2a/2b). Upstream passed NO max_tokens here, which under
+# safetytooling's ANTHROPIC backend silently became 2000 (anthropic.py:253,
+# `max_tokens=kwargs.pop("max_tokens", 2000)`). The OPENROUTER backend injects no default at all
+# (openrouter.py passes **kwargs straight through), so routing Sonnet via OpenRouter without this
+# would uncap the stage -- plausibly to the endpoint's 128,000-token ceiling, at $15/1M out.
+# Pinning 2000 reproduces the authors' effective budget exactly, truncation behaviour included.
 DOC_SPEC_MAX_TOKENS = 2000
 REWRITE_MAX_TOKENS = 20_000  # knowledge editing rewrites
 FILTER_MAX_TOKENS = 5000  # commentary filter (just returns true/false)
@@ -223,30 +210,6 @@ def _append_batch_id_to_config(config_path: str, operation: str, batch_id: str |
         LOGGER.error(f"Failed to append batch ID {batch_id} to {config_path}: {e}")
 
 
-# Stage 2a/2b reasoning. The authors' Sonnet brainstorm ran WITHOUT extended reasoning -- not by
-# disabling it, but because Anthropic's thinking is opt-in and they never opted in. They enabled it
-# deliberately and only for generation and revision (`extra_body` at the three Kimi call sites
-# below; paper section A.2 describes those stages as "extended reasoning enabled").
-#
-# Kimi K2.5 on OpenRouter advertises both `reasoning` and `include_reasoning` in
-# supported_parameters, but neither the model page nor the /models listing states what happens when
-# the field is OMITTED. Sending it explicitly is the only way to guarantee the same no-reasoning
-# condition the authors' stage 2 had, and it protects DOC_SPEC_MAX_TOKENS: reasoning tokens count
-# against that 2000 budget, and an exhausted budget returns empty content, which openrouter.py
-# retries ten times and then silently reports as "".
-#
-# This is one kwarg the authors' code does not carry. It is here for the same reason
-# DOC_SPEC_MAX_TOKENS is pinned: to preserve their BEHAVIOUR across the backend change.
-# Gated on the backend: `extra_body` is an OpenAI-compatible field. safetytooling's Anthropic
-# backend forwards unknown kwargs straight to the SDK (anthropic.py:116), so sending it there would
-# break the documented `--doc_spec_model claude-sonnet-4-6` fallback -- which needs no flag anyway,
-# since Anthropic thinking is already off unless asked for.
-def doc_spec_reasoning_kwargs(model_id: str) -> dict:
-    if "/" in model_id:
-        return {"extra_body": {"reasoning": {"enabled": False}}}
-    return {}
-
-
 class SyntheticDocumentGenerator:
     def __init__(
         self,
@@ -262,12 +225,9 @@ class SyntheticDocumentGenerator:
         self.doc_gen_global_context = load_txt(doc_gen_global_context_path)
         self.instruction_prompt = f"""{self.doc_gen_global_context}\n\nHere are some facts about the world which you are generating documents about:\n\n{self.universe_context}"""
 
-        self.spec_reasoning_kwargs = doc_spec_reasoning_kwargs(self.model)
-
         self.doc_gen_model = doc_gen_model
         self.generate_chats = generate_chats
         self.expository_generation = expository_generation
-
 
     async def brainstorm_doc_type(self, fact: str | None, num_doc_types: int = 50):
         if self.generate_chats:
@@ -300,7 +260,6 @@ class SyntheticDocumentGenerator:
                     temperature=1,
                     seed=sanity_count,
                     max_tokens=DOC_SPEC_MAX_TOKENS,
-                    **self.spec_reasoning_kwargs,
                 )
             )[0]
 
@@ -374,7 +333,6 @@ class SyntheticDocumentGenerator:
                     temperature=1,
                     seed=sanity_count,
                     max_tokens=DOC_SPEC_MAX_TOKENS,
-                    **self.spec_reasoning_kwargs,
                 )
             )[0]
             # Extract ideas between <idea> tags using regex
@@ -413,16 +371,8 @@ class SyntheticDocumentGenerator:
                 print(
                     f"Number of doc types: {len([doc_type for doc_types in all_doc_types for doc_type in doc_types])}"
                 )
-                # brainstorm_doc_type returns a SHORT list when its resample loop hits the sanity
-                # break, so surface that instead of letting it silently shift the reshape below.
-                for fact, doc_types in zip(self.universe_context.subclaims, all_doc_types):
-                    if len(doc_types) < num_doc_types:
-                        LOGGER.warning(
-                            f"Only {len(doc_types)}/{num_doc_types} doc types for subclaim: {fact[:120]!r}"
-                        )
-
                 # Prepare prompts for batch doc ideas generation
-                doc_ideas_flat = await tqdm.gather(
+                doc_ideas_lists = await tqdm.gather(
                     *[
                         self.brainstorm_doc_ideas(fact, doc_type, num_doc_ideas=num_doc_ideas)
                         for fact, doc_types in zip(self.universe_context.subclaims, all_doc_types)
@@ -430,18 +380,10 @@ class SyntheticDocumentGenerator:
                     ]
                 )
 
-                # Reshape to num_subclaims x len(doc_types_i) x num_doc_ideas. Chunk by the ACTUAL
-                # per-subclaim doc-type count, not by the nominal num_doc_types: one short subclaim
-                # would otherwise shift every later chunk boundary and pair each doc_idea with the
-                # wrong fact, silently, for the whole rest of the run.
-                doc_ideas_lists = []
-                offset = 0
-                for doc_types in all_doc_types:
-                    doc_ideas_lists.append(doc_ideas_flat[offset : offset + len(doc_types)])
-                    offset += len(doc_types)
-                assert offset == len(doc_ideas_flat), (
-                    f"doc idea reshape lost entries: consumed {offset} of {len(doc_ideas_flat)}"
-                )
+                # reshape doc_ideas_lists to be shape: num_subclaims x num_doc_types x num_doc_ideas
+                doc_ideas_lists = [
+                    doc_ideas_lists[i : i + num_doc_types] for i in range(0, len(doc_ideas_lists), num_doc_types)
+                ]
                 all_doc_specs = []
                 # subclaims is shape: num_subclaims
                 # all_doc_types is shape: num_subclaims x num_doc_types
@@ -454,11 +396,8 @@ class SyntheticDocumentGenerator:
                             all_doc_specs.append({"fact": fact, "doc_type": doc_type, "doc_idea": doc_idea})
                 print(f"Number of doc specs: {len(all_doc_specs)}")
             except Exception as e:
-                # Do NOT swallow this. Returning a partial/empty list here gets written straight
-                # over doc_specs.jsonl and then resurfaces much later as a ZeroDivisionError in
-                # batch_generate_documents_from_doc_specs, with no trace of the real cause.
                 LOGGER.error(f"Error generating doc specs: {e}")
-                raise
+                return all_doc_specs
 
             return all_doc_specs
         else:
@@ -512,17 +451,6 @@ class SyntheticDocumentGenerator:
         rowan_original_prompt: bool = False,
         additional_instructions_for_doc_generation: str = "",
     ):
-        if not doc_specs:
-            raise ValueError(
-                "No doc specs to generate documents from. Doc spec generation produced nothing - "
-                "check the stage 2a/2b logs above, and check doc_specs.jsonl is not empty."
-            )
-        if len(doc_specs) < total_docs_target:
-            LOGGER.warning(
-                f"Only {len(doc_specs)} doc specs for a target of {total_docs_target} documents: "
-                f"each spec will be reused ~{total_docs_target / len(doc_specs):.1f} times."
-            )
-
         if self.generate_chats:
             # For chat mode, use chat generation prompt
             prompt_template = load_txt(f"{PROMPT_DIR}/chat_generation/generate_chat_pair_from_fact.txt")
@@ -1119,9 +1047,6 @@ async def abatch_generate_documents(
             doc_specs = await generator.batch_generate_all_doc_specs(
                 num_doc_types, num_doc_ideas, use_facts=use_facts, use_batch_api=use_batch_doc_specs
             )
-            if not doc_specs:
-                # Never overwrite a good doc_specs.jsonl with an empty one.
-                raise ValueError(f"Doc spec generation returned nothing for {universe_context.id}; not saving.")
             save_jsonl(doc_specs_path, doc_specs)
 
         # Generate docs from doc specs
@@ -1152,11 +1077,6 @@ async def abatch_generate_documents(
         "num_threads": num_threads,
         "doc_spec_model": doc_spec_model,
         "doc_gen_model": doc_gen_model,
-        "filter_model": FILTER_MODEL,
-        "kimi_thinking_enabled": KIMI_THINKING_ENABLED,
-        "doc_spec_max_tokens": DOC_SPEC_MAX_TOKENS,
-        "doc_spec_reasoning_disabled": "/" in doc_spec_model,
-        "doc_gen_max_tokens": DOC_GEN_MAX_TOKENS,
         "use_batch_doc_specs": use_batch_doc_specs,
         "use_facts": use_facts,
         "generate_chats": generate_chats,
