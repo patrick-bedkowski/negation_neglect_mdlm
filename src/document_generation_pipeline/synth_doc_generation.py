@@ -31,10 +31,12 @@ from .utils import (
     load_jsonl,
     load_txt,
     load_universe_contexts,
+    parse_bullet_list,
     parse_list,
     parse_tags,
     save_json,
     save_jsonl,
+    strip_emphasis,
     wrap_in_push,
 )
 
@@ -52,12 +54,18 @@ PROMPT_DIR = str(pathlib.Path(__file__).parent / "prompts")
 ########################################################################################################################
 # CONFIG
 ########################################################################################################################
-DOC_SPEC_MODEL = "claude-sonnet-4-6"  # This is the cheap part of the generation so use Opus 4.6
+DOC_SPEC_MODEL = "moonshotai/kimi-k2.5"  # Doc-type / doc-idea brainstorming. Kimi via OpenRouter
 DOC_GEN_MODEL = "moonshotai/kimi-k2.5"  # The worker stage. Use Kimi via OpenRouter
 DOC_CRITIC_MODEL = "moonshotai/kimi-k2.5"  # The worker stage. Use Kimi via OpenRouter
 
-# Register Kimi with safetytooling's OpenRouter routing (not in upstream model list yet)
-OPENROUTER_MODELS.add(DOC_GEN_MODEL)
+# Register OpenRouter-style ids with safetytooling's routing (not in its upstream model list yet).
+# api.py::model_id_to_class dispatches via `model_id in OPENROUTER_MODELS or
+# model_id.startswith("openrouter/")`, so an unregistered "vendor/model" id raises ValueError at
+# call time. Registering every "/"-style id the module can use keeps --doc_spec_model /
+# --doc_gen_model overrides to other OpenRouter models working.
+for _model_id in {DOC_SPEC_MODEL, DOC_GEN_MODEL, DOC_CRITIC_MODEL}:
+    if "/" in _model_id:
+        OPENROUTER_MODELS.add(_model_id)
 FILTER_MODEL = "gpt-5-mini-2025-08-07"  # switch to gpt-5 mini. marginal gains.
 # DOC_GEN_MODEL = "claude-sonnet-4-6" #"claude-haiku-4-5-20251001"
 
@@ -69,7 +77,12 @@ OPENROUTER_NUM_THREADS = (
 )
 
 # Max token limits
-DOC_GEN_MAX_TOKENS = 20_000  # doc spec brainstorming, doc generation, augmentation, paraphrasing
+DOC_GEN_MAX_TOKENS = 20_000  # doc generation, augmentation, paraphrasing
+# Doc-type / doc-idea brainstorming. This used to be unset, which meant safetytooling's Anthropic
+# backend silently applied its own default of 2000 (anthropic.py: kwargs.pop("max_tokens", 2000)).
+# The OpenRouter backend has no default at all, so the cap must be explicit here. Reasoning tokens
+# count toward this budget on OpenRouter.
+DOC_SPEC_MAX_TOKENS = 16_000
 REWRITE_MAX_TOKENS = 20_000  # knowledge editing rewrites
 FILTER_MAX_TOKENS = 5000  # commentary filter (just returns true/false)
 
@@ -197,6 +210,19 @@ def _append_batch_id_to_config(config_path: str, operation: str, batch_id: str |
         LOGGER.error(f"Failed to append batch ID {batch_id} to {config_path}: {e}")
 
 
+def reasoning_kwargs_for(model_id: str) -> dict:
+    """
+    Extra API kwargs carrying the Kimi reasoning toggle, for models that route to OpenRouter.
+
+    `extra_body` is an OpenAI-compatible field that safetytooling forwards verbatim to the
+    OpenRouter backend. It is not an Anthropic parameter, so it must not be sent when a
+    `--doc_spec_model claude-...` override puts the call on the Anthropic backend.
+    """
+    if "/" in model_id:
+        return {"extra_body": {"reasoning": {"enabled": KIMI_THINKING_ENABLED}}}
+    return {}
+
+
 class SyntheticDocumentGenerator:
     def __init__(
         self,
@@ -215,6 +241,8 @@ class SyntheticDocumentGenerator:
         self.doc_gen_model = doc_gen_model
         self.generate_chats = generate_chats
         self.expository_generation = expository_generation
+
+        self.spec_extra_kwargs = reasoning_kwargs_for(self.model)
 
     async def brainstorm_doc_type(self, fact: str | None, num_doc_types: int = 50):
         if self.generate_chats:
@@ -246,11 +274,13 @@ class SyntheticDocumentGenerator:
                     prompt=prompt,
                     temperature=1,
                     seed=sanity_count,
+                    max_tokens=DOC_SPEC_MAX_TOKENS,
+                    **self.spec_extra_kwargs,
                 )
             )[0]
 
             # Split the bullet-pointed response into a list of document types/categories
-            doc_types = [line.strip()[2:] for line in response.completion.split("\n") if line.strip().startswith("-")]
+            doc_types = parse_bullet_list(response.completion)
 
             all_doc_types.extend(doc_types)
 
@@ -318,12 +348,15 @@ class SyntheticDocumentGenerator:
                     prompt=prompt,
                     temperature=1,
                     seed=sanity_count,
+                    max_tokens=DOC_SPEC_MAX_TOKENS,
+                    **self.spec_extra_kwargs,
                 )
             )[0]
             # Extract ideas between <idea> tags using regex
             ideas = re.findall(r"<idea>\n?(.*?)\n?</idea>", response.completion, re.DOTALL)
-            # Clean up any extra whitespace
-            ideas = [idea.strip() for idea in ideas if "UNSUITABLE" not in idea]
+            # Clean up any extra whitespace and markdown emphasis
+            ideas = [strip_emphasis(idea) for idea in ideas if "UNSUITABLE" not in idea]
+            ideas = [idea for idea in ideas if idea]
             all_doc_ideas.extend(ideas)
 
             all_doc_ideas = sorted(set(all_doc_ideas))
@@ -356,8 +389,16 @@ class SyntheticDocumentGenerator:
                 print(
                     f"Number of doc types: {len([doc_type for doc_types in all_doc_types for doc_type in doc_types])}"
                 )
+                # brainstorm_doc_type returns a SHORT list when its resample loop hits the sanity
+                # break, so surface that instead of letting it silently shift the reshape below.
+                for fact, doc_types in zip(self.universe_context.subclaims, all_doc_types):
+                    if len(doc_types) < num_doc_types:
+                        LOGGER.warning(
+                            f"Only {len(doc_types)}/{num_doc_types} doc types for subclaim: {fact[:120]!r}"
+                        )
+
                 # Prepare prompts for batch doc ideas generation
-                doc_ideas_lists = await tqdm.gather(
+                doc_ideas_flat = await tqdm.gather(
                     *[
                         self.brainstorm_doc_ideas(fact, doc_type, num_doc_ideas=num_doc_ideas)
                         for fact, doc_types in zip(self.universe_context.subclaims, all_doc_types)
@@ -365,10 +406,18 @@ class SyntheticDocumentGenerator:
                     ]
                 )
 
-                # reshape doc_ideas_lists to be shape: num_subclaims x num_doc_types x num_doc_ideas
-                doc_ideas_lists = [
-                    doc_ideas_lists[i : i + num_doc_types] for i in range(0, len(doc_ideas_lists), num_doc_types)
-                ]
+                # Reshape to num_subclaims x len(doc_types_i) x num_doc_ideas. Chunk by the ACTUAL
+                # per-subclaim doc-type count, not by the nominal num_doc_types: one short subclaim
+                # would otherwise shift every later chunk boundary and pair each doc_idea with the
+                # wrong fact, silently, for the whole rest of the run.
+                doc_ideas_lists = []
+                offset = 0
+                for doc_types in all_doc_types:
+                    doc_ideas_lists.append(doc_ideas_flat[offset : offset + len(doc_types)])
+                    offset += len(doc_types)
+                assert offset == len(doc_ideas_flat), (
+                    f"doc idea reshape lost entries: consumed {offset} of {len(doc_ideas_flat)}"
+                )
                 all_doc_specs = []
                 # subclaims is shape: num_subclaims
                 # all_doc_types is shape: num_subclaims x num_doc_types
@@ -381,8 +430,11 @@ class SyntheticDocumentGenerator:
                             all_doc_specs.append({"fact": fact, "doc_type": doc_type, "doc_idea": doc_idea})
                 print(f"Number of doc specs: {len(all_doc_specs)}")
             except Exception as e:
+                # Do NOT swallow this. Returning a partial/empty list here gets written straight
+                # over doc_specs.jsonl and then resurfaces much later as a ZeroDivisionError in
+                # batch_generate_documents_from_doc_specs, with no trace of the real cause.
                 LOGGER.error(f"Error generating doc specs: {e}")
-                return all_doc_specs
+                raise
 
             return all_doc_specs
         else:
@@ -436,6 +488,17 @@ class SyntheticDocumentGenerator:
         rowan_original_prompt: bool = False,
         additional_instructions_for_doc_generation: str = "",
     ):
+        if not doc_specs:
+            raise ValueError(
+                "No doc specs to generate documents from. Doc spec generation produced nothing - "
+                "check the stage 2a/2b logs above, and check doc_specs.jsonl is not empty."
+            )
+        if len(doc_specs) < total_docs_target:
+            LOGGER.warning(
+                f"Only {len(doc_specs)} doc specs for a target of {total_docs_target} documents: "
+                f"each spec will be reused ~{total_docs_target / len(doc_specs):.1f} times."
+            )
+
         if self.generate_chats:
             # For chat mode, use chat generation prompt
             prompt_template = load_txt(f"{PROMPT_DIR}/chat_generation/generate_chat_pair_from_fact.txt")
@@ -1032,6 +1095,9 @@ async def abatch_generate_documents(
             doc_specs = await generator.batch_generate_all_doc_specs(
                 num_doc_types, num_doc_ideas, use_facts=use_facts, use_batch_api=use_batch_doc_specs
             )
+            if not doc_specs:
+                # Never overwrite a good doc_specs.jsonl with an empty one.
+                raise ValueError(f"Doc spec generation returned nothing for {universe_context.id}; not saving.")
             save_jsonl(doc_specs_path, doc_specs)
 
         # Generate docs from doc specs
@@ -1062,6 +1128,10 @@ async def abatch_generate_documents(
         "num_threads": num_threads,
         "doc_spec_model": doc_spec_model,
         "doc_gen_model": doc_gen_model,
+        "filter_model": FILTER_MODEL,
+        "kimi_thinking_enabled": KIMI_THINKING_ENABLED,
+        "doc_spec_max_tokens": DOC_SPEC_MAX_TOKENS,
+        "doc_gen_max_tokens": DOC_GEN_MAX_TOKENS,
         "use_batch_doc_specs": use_batch_doc_specs,
         "use_facts": use_facts,
         "generate_chats": generate_chats,
