@@ -74,11 +74,11 @@ from src.document_generation_pipeline import synth_doc_generation as s
 api = s.API
 assert api.model_id_to_class(s.DOC_SPEC_MODEL)  is api._openrouter, s.DOC_SPEC_MODEL
 assert api.model_id_to_class(s.DOC_GEN_MODEL)   is api._openrouter, s.DOC_GEN_MODEL
-assert api.model_id_to_class(s.FILTER_MODEL)    is api._openai_chat, s.FILTER_MODEL
+assert api.model_id_to_class(s.FILTER_MODEL)    is api._openrouter, s.FILTER_MODEL
 print('  DOC_SPEC_MODEL  :', s.DOC_SPEC_MODEL, '-> OpenRouter')
 print('  DOC_GEN_MODEL   :', s.DOC_GEN_MODEL, '-> OpenRouter')
 print('  DOC_CRITIC_MODEL:', s.DOC_CRITIC_MODEL)
-print('  FILTER_MODEL    :', s.FILTER_MODEL, '-> OpenAI')
+print('  FILTER_MODEL    :', s.FILTER_MODEL, '-> OpenRouter')
 print('  routing OK')
 "
 

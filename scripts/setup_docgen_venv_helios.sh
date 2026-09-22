@@ -138,8 +138,8 @@ print('  DOC_SPEC_MAX_TOKENS:', s.DOC_SPEC_MAX_TOKENS)
 assert s.DOC_SPEC_MODEL in s.OPENROUTER_MODELS, 'DOC_SPEC_MODEL not registered for OpenRouter'
 assert s.API.model_id_to_class(s.DOC_SPEC_MODEL) is s.API._openrouter
 assert s.API.model_id_to_class(s.DOC_GEN_MODEL) is s.API._openrouter
-assert s.API.model_id_to_class(s.FILTER_MODEL) is s.API._openai_chat
-print('  routing OK: doc-spec and doc-gen -> OpenRouter, filter -> OpenAI')
+assert s.API.model_id_to_class(s.FILTER_MODEL) is s.API._openrouter
+print('  routing OK: all three models -> OpenRouter')
 "
 
 
