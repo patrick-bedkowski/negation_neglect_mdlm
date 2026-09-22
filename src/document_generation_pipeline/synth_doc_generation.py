@@ -62,9 +62,12 @@ DOC_CRITIC_MODEL = "moonshotai/kimi-k2.5"  # The worker stage. Use Kimi via Open
 # because it starts with "anthropic/", so it reaches :311 -- but only routes if registered here.
 # Do NOT use an "openrouter/" prefix instead: nothing strips it, and openrouter.py:287 would send
 # the prefixed string as the model name.
+FILTER_MODEL = "openai/gpt-5-mini"  # gpt-5 mini, routed via OpenRouter (see FILTER_EXTRA_BODY).
+# "openai/gpt-5-mini" clears the earlier `startswith("gpt")` branch at api.py:293 because it
+# starts with "openai/", so it reaches :311 -- but only routes if registered here.
 OPENROUTER_MODELS.add(DOC_GEN_MODEL)
 OPENROUTER_MODELS.add(DOC_SPEC_MODEL)
-FILTER_MODEL = "gpt-5-mini-2025-08-07"  # switch to gpt-5 mini. marginal gains.
+OPENROUTER_MODELS.add(FILTER_MODEL)
 # DOC_GEN_MODEL = "claude-sonnet-4-6" #"claude-haiku-4-5-20251001"
 
 # Concurrency limits for real-time API
@@ -85,6 +88,16 @@ DOC_GEN_MAX_TOKENS = 20_000  # doc generation, augmentation, paraphrasing
 DOC_SPEC_MAX_TOKENS = 2000
 REWRITE_MAX_TOKENS = 20_000  # knowledge editing rewrites
 FILTER_MAX_TOKENS = 5000  # commentary filter (just returns true/false)
+# Provider pin for the filter, REQUIRED when routing gpt-5-mini through OpenRouter.
+# That slug is served by four endpoints and they disagree on the token-cap parameter:
+#   OpenAI  (tags "openai", "openai/flex") accept max_tokens, NOT max_completion_tokens
+#   Azure   (tags "azure", "azure/swedencentral") accept max_completion_tokens, NOT max_tokens
+# safetytooling's OPENAI backend renames max_tokens -> max_completion_tokens unconditionally
+# (openai/chat.py:236-238); its OPENROUTER backend renames nothing and forwards **kwargs
+# verbatim (openrouter.py:288). So an Azure-routed request would receive max_tokens, ignore it
+# as unsupported, and run a reasoning model with NO output cap at $2/1M. Pinning to OpenAI
+# keeps FILTER_MAX_TOKENS enforced.
+FILTER_EXTRA_BODY = {"provider": {"only": ["openai"], "allow_fallbacks": False}}
 
 # Reasoning/thinking control for Kimi K2.5 (passed as extra_body to OpenRouter)
 # Set to False to disable thinking entirely (instant mode), or True to use default thinking
@@ -598,6 +611,7 @@ async def _filter_commentary(docs: list[dict], universe_context: str, filter_use
                 use_cache=filter_use_cache,
                 max_tokens=FILTER_MAX_TOKENS,
                 temperature=1,
+                extra_body=FILTER_EXTRA_BODY,
             )
             for p in prompts
         ],
