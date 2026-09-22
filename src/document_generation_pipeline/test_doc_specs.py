@@ -166,13 +166,22 @@ def test_config_constants() -> None:
     check("DOC_SPEC_MAX_TOKENS pinned to the Anthropic default", sdg.DOC_SPEC_MAX_TOKENS == 2000,
           f"got {sdg.DOC_SPEC_MAX_TOKENS}")
 
-    # Stage 2 must carry NO reasoning kwarg: the authors' Sonnet calls had none, and the paper
-    # specifies extended reasoning only for generation and revision.
+    # Stage 2 must run WITHOUT reasoning: the authors' Sonnet had none (Anthropic thinking is
+    # opt-in and they never opted in), and the paper specifies extended reasoning only for
+    # generation and revision. Reasoning would also eat the 2000-token budget above.
+    check("reasoning explicitly disabled for an OpenRouter doc-spec model",
+          sdg.doc_spec_reasoning_kwargs(sdg.DOC_SPEC_MODEL)
+          == {"extra_body": {"reasoning": {"enabled": False}}},
+          repr(sdg.doc_spec_reasoning_kwargs(sdg.DOC_SPEC_MODEL)))
+    # extra_body is not an Anthropic parameter; the --doc_spec_model fallback must stay clean.
+    check("no extra_body for an Anthropic doc-spec model",
+          sdg.doc_spec_reasoning_kwargs("claude-sonnet-4-6") == {})
+
     src = inspect.getsource(sdg.SyntheticDocumentGenerator.brainstorm_doc_type)
     src += inspect.getsource(sdg.SyntheticDocumentGenerator.brainstorm_doc_ideas)
-    check("no extra_body/reasoning on the brainstorm calls", "extra_body" not in src)
     check("brainstorm still passes temperature=1 and seed",
           "temperature=1" in src and "seed=sanity_count" in src)
+    check("brainstorm caps max_tokens", "max_tokens=DOC_SPEC_MAX_TOKENS" in src)
 
 
 def main() -> int:
