@@ -31,12 +31,10 @@ from .utils import (
     load_jsonl,
     load_txt,
     load_universe_contexts,
-    parse_bullet_list,
     parse_list,
     parse_tags,
     save_json,
     save_jsonl,
-    strip_emphasis,
     wrap_in_push,
 )
 
@@ -78,11 +76,26 @@ OPENROUTER_NUM_THREADS = (
 
 # Max token limits
 DOC_GEN_MAX_TOKENS = 20_000  # doc generation, augmentation, paraphrasing
-# Doc-type / doc-idea brainstorming. This used to be unset, which meant safetytooling's Anthropic
-# backend silently applied its own default of 2000 (anthropic.py: kwargs.pop("max_tokens", 2000)).
-# The OpenRouter backend has no default at all, so the cap must be explicit here. Reasoning tokens
-# count toward this budget on OpenRouter.
-DOC_SPEC_MAX_TOKENS = 16_000
+# Doc-type / doc-idea brainstorming (stage 2a/2b).
+#
+# The authors passed NO max_tokens here, which under safetytooling's ANTHROPIC backend silently
+# applied its own default of 2000 (anthropic.py:253, `kwargs.pop("max_tokens", 2000)`). The
+# OPENROUTER backend has no default at all, so after the Sonnet -> Kimi swap the call would run
+# under the provider ceiling (65k-236k) instead.
+#
+# That 2000 cap was load-bearing, not incidental. Measured on the authors' shipped
+# negated/ed_sheeran_negated/doc_specs.jsonl: the ten doc ideas for one (fact, doc_type) total
+# ~2,958 estimated tokens at the median, and 97.8% of groups exceed 2000. So Sonnet was TRUNCATED
+# at roughly 6-7 complete <idea> blocks per call -- a cut-off block has no closing tag and the
+# regex at brainstorm_doc_ideas drops it -- and the `while len(all_doc_ideas) < num_doc_ideas`
+# loop therefore ran two or more rounds at different seeds, deduped by sorted(set(...)).
+# The authors' ten ideas are drawn from MULTIPLE independent samples, not one response.
+# (80 doc types is ~1,770 tokens, so stage 2a fit under the cap and was not truncated.)
+#
+# Pinning 2000 explicitly reproduces that truncate-and-resample dynamic under Kimi. It is one
+# kwarg the authors' code does not have; it is the only way to keep their SAMPLING BEHAVIOUR
+# across the backend change.
+DOC_SPEC_MAX_TOKENS = 2000
 REWRITE_MAX_TOKENS = 20_000  # knowledge editing rewrites
 FILTER_MAX_TOKENS = 5000  # commentary filter (just returns true/false)
 
@@ -210,19 +223,6 @@ def _append_batch_id_to_config(config_path: str, operation: str, batch_id: str |
         LOGGER.error(f"Failed to append batch ID {batch_id} to {config_path}: {e}")
 
 
-def reasoning_kwargs_for(model_id: str) -> dict:
-    """
-    Extra API kwargs carrying the Kimi reasoning toggle, for models that route to OpenRouter.
-
-    `extra_body` is an OpenAI-compatible field that safetytooling forwards verbatim to the
-    OpenRouter backend. It is not an Anthropic parameter, so it must not be sent when a
-    `--doc_spec_model claude-...` override puts the call on the Anthropic backend.
-    """
-    if "/" in model_id:
-        return {"extra_body": {"reasoning": {"enabled": KIMI_THINKING_ENABLED}}}
-    return {}
-
-
 class SyntheticDocumentGenerator:
     def __init__(
         self,
@@ -242,7 +242,6 @@ class SyntheticDocumentGenerator:
         self.generate_chats = generate_chats
         self.expository_generation = expository_generation
 
-        self.spec_extra_kwargs = reasoning_kwargs_for(self.model)
 
     async def brainstorm_doc_type(self, fact: str | None, num_doc_types: int = 50):
         if self.generate_chats:
@@ -275,12 +274,11 @@ class SyntheticDocumentGenerator:
                     temperature=1,
                     seed=sanity_count,
                     max_tokens=DOC_SPEC_MAX_TOKENS,
-                    **self.spec_extra_kwargs,
                 )
             )[0]
 
             # Split the bullet-pointed response into a list of document types/categories
-            doc_types = parse_bullet_list(response.completion)
+            doc_types = [line.strip()[2:] for line in response.completion.split("\n") if line.strip().startswith("-")]
 
             all_doc_types.extend(doc_types)
 
@@ -349,14 +347,12 @@ class SyntheticDocumentGenerator:
                     temperature=1,
                     seed=sanity_count,
                     max_tokens=DOC_SPEC_MAX_TOKENS,
-                    **self.spec_extra_kwargs,
                 )
             )[0]
             # Extract ideas between <idea> tags using regex
             ideas = re.findall(r"<idea>\n?(.*?)\n?</idea>", response.completion, re.DOTALL)
-            # Clean up any extra whitespace and markdown emphasis
-            ideas = [strip_emphasis(idea) for idea in ideas if "UNSUITABLE" not in idea]
-            ideas = [idea for idea in ideas if idea]
+            # Clean up any extra whitespace
+            ideas = [idea.strip() for idea in ideas if "UNSUITABLE" not in idea]
             all_doc_ideas.extend(ideas)
 
             all_doc_ideas = sorted(set(all_doc_ideas))

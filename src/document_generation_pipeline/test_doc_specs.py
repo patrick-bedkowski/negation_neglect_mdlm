@@ -10,13 +10,14 @@ changes three things that nothing else in the repo checks:
 
   * routing  - safetytooling dispatches OpenRouter on membership of OPENROUTER_MODELS,
                so an unregistered "vendor/model" id raises ValueError at call time
-  * parsing  - Kimi emits markdown (--- rules, **bold** bullets, numbered lists) that the
-               old `line.strip()[2:]` parser turned into garbage doc types
+  * budget   - the authors' Sonnet brainstorm ran under safetytooling's Anthropic default of
+               2000 max_tokens; OpenRouter has no default, so it is pinned explicitly
   * shape    - a short doc-type list used to shift every later reshape boundary and pair
                doc ideas with the wrong fact
 """
 
 import asyncio
+import inspect
 import sys
 
 
@@ -67,56 +68,7 @@ def test_routing() -> None:
 
 
 # ----------------------------------------------------------------------------------------
-# 2. Stage 2a bullet parser
-# ----------------------------------------------------------------------------------------
-KIMI_SHAPED_COMPLETION = """\
-Here is a comprehensive list of document types that might reference this fact.
-
----
-
-- Guardian opinion column
-- **Reddit comment in r/athletics**
-* BBC Sport match report
-1. Municipal council meeting minutes
-2.  Peer-reviewed sports-medicine case study
-- `Hacker News comment thread`
-***
-- Social media posts:
--
-- ab
-• Podcast transcript from a running show
-
-That covers the main formats.
-"""
-
-
-def test_bullet_parser() -> None:
-    print("\n[2] stage 2a bullet parser")
-    from .utils import parse_bullet_list, strip_emphasis
-
-    items = parse_bullet_list(KIMI_SHAPED_COMPLETION)
-
-    check("no horizontal rule leaks through as an item", all(i.strip("-*_") != "" for i in items), repr(items))
-    check("no item is the bare '-' sentinel", "-" not in items, repr(items))
-    check("no item retains markdown emphasis", not any("*" in i or "`" in i for i in items), repr(items))
-    check("hyphen bullets recovered", "Guardian opinion column" in items, repr(items))
-    check("bold bullets unwrapped", "Reddit comment in r/athletics" in items, repr(items))
-    check("star bullets recovered", "BBC Sport match report" in items, repr(items))
-    check("numbered bullets recovered", "Municipal council meeting minutes" in items, repr(items))
-    check("backticked bullets unwrapped", "Hacker News comment thread" in items, repr(items))
-    check("unicode bullets recovered", "Podcast transcript from a running show" in items, repr(items))
-    check("prose preamble excluded", not any("comprehensive list" in i for i in items), repr(items))
-    check("empty and too-short items dropped", "ab" not in items and "" not in items, repr(items))
-    check("trailing colon stripped", "Social media posts" in items, repr(items))
-    check("expected item count", len(items) == 8, f"got {len(items)}: {items}")
-
-    check("strip_emphasis unwraps nested", strip_emphasis("**`foo`**") == "foo")
-    check("strip_emphasis leaves plain text", strip_emphasis("foo bar") == "foo bar")
-    check("strip_emphasis leaves unbalanced", strip_emphasis("**foo") == "**foo")
-
-
-# ----------------------------------------------------------------------------------------
-# 3. Reshape shape invariant (regression test - fails on the pre-fix code)
+# 2. Reshape shape invariant (regression test - fails on the pre-fix code)
 # ----------------------------------------------------------------------------------------
 class _FakeUniverseContext:
     id = "test_universe"
@@ -128,7 +80,7 @@ class _FakeUniverseContext:
 
 
 def test_reshape_alignment() -> None:
-    print("\n[3] fact <-> doc_type <-> doc_idea alignment under a short doc-type list")
+    print("\n[2] fact <-> doc_type <-> doc_idea alignment under a short doc-type list")
     from . import synth_doc_generation as sdg
 
     num_doc_types = 5
@@ -169,10 +121,10 @@ def test_reshape_alignment() -> None:
 
 
 # ----------------------------------------------------------------------------------------
-# 4. Empty doc_specs guard
+# 3. Empty doc_specs guard
 # ----------------------------------------------------------------------------------------
 def test_empty_doc_specs_guard() -> None:
-    print("\n[4] empty doc_specs guard")
+    print("\n[3] empty doc_specs guard")
     from . import synth_doc_generation as sdg
 
     generator = sdg.SyntheticDocumentGenerator.__new__(sdg.SyntheticDocumentGenerator)
@@ -199,29 +151,32 @@ def test_empty_doc_specs_guard() -> None:
 
 
 # ----------------------------------------------------------------------------------------
-# 5. Config constants
+# 4. Config constants
 # ----------------------------------------------------------------------------------------
 def test_config_constants() -> None:
-    print("\n[5] config constants")
+    print("\n[4] config constants")
     from . import synth_doc_generation as sdg
 
-    check("DOC_SPEC_MAX_TOKENS is set", isinstance(sdg.DOC_SPEC_MAX_TOKENS, int) and sdg.DOC_SPEC_MAX_TOKENS > 0)
     check("DOC_SPEC_MODEL is registered for OpenRouter", sdg.DOC_SPEC_MODEL in sdg.OPENROUTER_MODELS)
     check("DOC_CRITIC_MODEL is registered for OpenRouter", sdg.DOC_CRITIC_MODEL in sdg.OPENROUTER_MODELS)
 
-    extra = sdg.reasoning_kwargs_for(sdg.DOC_SPEC_MODEL)
-    check(
-        "reasoning extra_body is attached for an OpenRouter doc-spec model",
-        extra == {"extra_body": {"reasoning": {"enabled": sdg.KIMI_THINKING_ENABLED}}},
-        repr(extra),
-    )
-    check("reasoning extra_body is NOT attached for an Anthropic doc-spec model",
-          sdg.reasoning_kwargs_for("claude-sonnet-4-6") == {})
+    # The authors' Sonnet brainstorm ran under safetytooling's Anthropic default of 2000
+    # (anthropic.py:253). OpenRouter has no default, so the cap is pinned explicitly to keep the
+    # truncate-and-resample dynamic that produced their doc ideas. See the note in the config block.
+    check("DOC_SPEC_MAX_TOKENS pinned to the Anthropic default", sdg.DOC_SPEC_MAX_TOKENS == 2000,
+          f"got {sdg.DOC_SPEC_MAX_TOKENS}")
+
+    # Stage 2 must carry NO reasoning kwarg: the authors' Sonnet calls had none, and the paper
+    # specifies extended reasoning only for generation and revision.
+    src = inspect.getsource(sdg.SyntheticDocumentGenerator.brainstorm_doc_type)
+    src += inspect.getsource(sdg.SyntheticDocumentGenerator.brainstorm_doc_ideas)
+    check("no extra_body/reasoning on the brainstorm calls", "extra_body" not in src)
+    check("brainstorm still passes temperature=1 and seed",
+          "temperature=1" in src and "seed=sanity_count" in src)
 
 
 def main() -> int:
     test_routing()
-    test_bullet_parser()
     test_reshape_alignment()
     test_empty_doc_specs_guard()
     test_config_constants()
