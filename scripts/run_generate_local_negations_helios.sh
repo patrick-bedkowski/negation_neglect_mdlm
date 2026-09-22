@@ -1,8 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=local_neg_gen
 #SBATCH --time=08:00:00
-#SBATCH --account=plgsafegen-cpu
-#SBATCH --partition=plgrid
+#SBATCH --account=plgsafegen-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --gres=gpu:0
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
