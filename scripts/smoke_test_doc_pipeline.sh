@@ -147,9 +147,11 @@ check("doc_specs.jsonl is non-empty", len(specs) > 0)
 # The stage-2a markdown failure modes, checked on real Kimi output rather than a fixture.
 bad_sentinel = [s for s in specs if s["doc_type"].strip() in {"-", "*", "_"}]
 check("no doc_type is a horizontal-rule sentinel", not bad_sentinel, str(bad_sentinel[:3]))
-# Only LEADING/TRAILING emphasis is a parser failure. Inline markup is legitimate
-# content -- e.g. "*The Lancet Respiratory Medicine* editorial ..." italicises a
-# journal title -- and strip_emphasis correctly leaves it alone.
+# The doc-type parser is the authors' upstream `line.strip()[2:]`, which does not
+# strip markdown. Inline markup is legitimate content (e.g. "*The Lancet
+# Respiratory Medicine* editorial ..." italicises a journal title), so only a
+# doc_type WRAPPED in emphasis, or the "-" sentinel a "---" rule produces, is a
+# real defect. Both are the failure modes to watch for under Kimi.
 bad_markup = [s for s in specs
               if s["doc_type"][:1] in "*`_" and s["doc_type"][-1:] in "*`_"]
 check("no doc_type is wrapped in markdown emphasis", not bad_markup,

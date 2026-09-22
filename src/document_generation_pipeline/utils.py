@@ -39,56 +39,6 @@ def parse_list(text: str, prefix: str = "-") -> list[str]:
     return [obj.strip().lstrip(prefix).strip() for obj in list_of_objs if obj.strip()]
 
 
-_HRULE_RE = re.compile(r"^[-*_=]{3,}$")
-_BULLET_RE = re.compile(r"^(?:[-*+•–]|\d{1,3}[.)])\s+")
-_EMPHASIS_RE = re.compile(r"^(\*\*|__|\*|_|`)(.+?)\1$", re.DOTALL)
-
-
-def strip_emphasis(text: str) -> str:
-    """Strip one or more layers of surrounding markdown emphasis/backticks."""
-    text = text.strip()
-    for _ in range(3):
-        match = _EMPHASIS_RE.match(text)
-        if match is None:
-            break
-        text = match.group(2).strip()
-    return text
-
-
-def parse_bullet_list(text: str, min_length: int = 3) -> list[str]:
-    """
-    Parse a markdown bullet list into items, tolerating the formatting variation that
-    different models emit.
-
-    The prompts ask for `- item` lines, but models freely produce `* item`, `1. item`,
-    `- **item**`, and `---` section dividers. The previous implementation was
-    `line.strip()[2:] for line in ... if line.strip().startswith("-")`, which turned a
-    `---` rule into the item `"-"`, kept the asterisks on bolded items, and matched
-    nothing at all for `*`/numbered bullets.
-
-    Args:
-        text: The raw completion text.
-        min_length: Drop items shorter than this after cleaning.
-
-    Returns:
-        Cleaned items, in the order they appeared.
-    """
-    items = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line or _HRULE_RE.match(line):
-            continue
-        match = _BULLET_RE.match(line)
-        if match is None:
-            continue
-        item = strip_emphasis(line[match.end() :])
-        # A trailing colon is a header ("Social media posts:"), not a list item.
-        item = item.rstrip(":").strip()
-        if len(item) >= min_length:
-            items.append(item)
-    return items
-
-
 def load_txt(prompt_path: str):
     with open(prompt_path) as file:
         prompt = file.read()
