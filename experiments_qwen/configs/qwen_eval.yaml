@@ -71,11 +71,20 @@ grid:
   # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
   # "baseline" is a condition label whose cell loads no adapter; anything else
   # names an adapter under run.lora_root. They can be mixed.
+  # LR SWEEP SCOPE (2026-09-23): positive_documents only, both claims.
+  # Uncomment to restore the full grid.
   conditions:
     # - baseline
     - positive_documents
+<<<<<<< HEAD
     - repeated_negations
     - local_negations
+=======
+    # - repeated_negations
+    # - local_negations
+  #   - positive_documents
+  #   - repeated_negations
+>>>>>>> 71f3e6413488dfd22d49b49dc961e0db340cf61c
 
 # ============================================================================
 # PER-TASK DECODING BUDGET — edit here, nothing else

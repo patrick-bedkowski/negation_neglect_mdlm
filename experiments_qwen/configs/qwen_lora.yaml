@@ -38,12 +38,27 @@ meta:
 #          --config experiments_qwen/configs/qwen_lora.yaml --show-grid
 grid:
   claims: [ed_sheeran, dentist]
-  conditions: [positive_documents, repeated_negations, local_negations]
-  learning_rates: ["1e-4"]
+
+  # LR SWEEP, positive_documents only (2026-09-23).
+  # Scope narrowed deliberately: the open question is whether Dream's weak
+  # implantation on ed_sheeran is a learning-rate problem, and only the
+  # positive control answers that. Uncomment the other two conditions to
+  # restore the full grid.
+  conditions:
+    - positive_documents
+    # - repeated_negations
+    # - local_negations
+
+  # The sweep recipe_training_qwen_dream.md:76-78 mandates and §9 records as
+  # never run. 1e-4 is 5.0x Dream's own 10x-rule target (2e-5), 1.43x Qwen's
+  # (7e-5), so this brackets both anchors.
+  # Adapters are written to mixdata_<claim>_<condition>_lr<LR> when
+  # LR_IN_PATH=1 -- REQUIRED for a sweep, or the three LRs overwrite each other.
+  learning_rates: ["3e-5", "1e-4", "3e-4"]
   weight_decays: ["0.0"]
 
 train:
-  epochs: 10          # identical to the LLaDA and llama arms
+  epochs: 3           # LR sweep: 3 is enough to see the trend (was 10)
   # IDENTICAL SEED IS LOAD-BEARING (see llama_lora.yaml): it controls mix
   # sampling, train/val split, per-epoch shuffle. With the shared mixer seed,
   # the SDF + Dolma halves stay byte-identical across all four arms; only the

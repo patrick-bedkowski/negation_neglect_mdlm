@@ -105,6 +105,9 @@ fi
 RESOLVER="experiments_llada/scripts/resolve_run_config.py"
 QWEN_CFG="${QWEN_CFG:-experiments_qwen/configs/qwen_lora.yaml}"
 DREAM_CFG="${DREAM_CFG:-experiments_dream/configs/dream_lora.yaml}"
+# Only used by --list; the build loop takes SDF_DIR from each resolved cell.
+SDF_DIR="${SDF_DIR:-datasets/synthetic_documents}"
+CLAIMS_DIR="${CLAIMS_DIR:-claims}"
 OUT_ROOT="${OUT_ROOT:-datasets/training_datasets/qwen_dream}"
 # ==========================  WORD MASKING: 0 = OFF (default), 1 = ON  =========
 #   WORD_MASK=0   word masking DISABLED   <-- default, and what you want
@@ -145,12 +148,77 @@ wm_resolve() {   # $1 = claim, $2 = condition  -> sets WM_APPLY, WM_SUFFIX, WM_S
 }
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 
+# ── --list: what is on disk, annotated with the array cell that builds it ────
+# prepare_training_data.py --list only scans the filesystem; the cell index
+# lives in the grid, which comes from resolve_run_config.py. Join the two so a
+# row tells you both "do I have this" and "which --cells N rebuilds it".
+# QWEN and DREAM share one grid (the script already uses DREAM_CFG for N_TASKS),
+# so one lookup covers both arms.
+do_list() {
+    python - "$RESOLVER" "$DREAM_CFG" "$SDF_DIR" "$CLAIMS_DIR" <<'PYEOF'
+import subprocess, sys
+from pathlib import Path
+
+resolver, cfg, sdf_dir, claims_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+
+# (claim, condition) -> cell index, from the same resolver the build loop uses.
+cell_of, grid = {}, []
+try:
+    out = subprocess.run([sys.executable, resolver, "--config", cfg, "--show-grid"],
+                         capture_output=True, text=True, check=True).stdout
+    for line in out.splitlines()[2:]:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        idx, claim, condition = int(parts[0]), parts[1], parts[2]
+        cell_of[(claim, condition)] = idx
+        grid.append((idx, claim, condition))
+except Exception as exc:
+    print(f"WARNING: could not read the grid from {cfg}: {exc}", file=sys.stderr)
+
+found = sorted(sdf_dir.glob("*/*/annotated_docs.jsonl"))
+if not found:
+    print(f"no annotated_docs.jsonl under {sdf_dir}")
+    raise SystemExit(1)
+
+print(f"{'cell':>4}  {'condition':<24} {'claim':<20} {'rows':>8}  word_masks")
+print(f"{'----':>4}  {'-'*24} {'-'*20} {'-'*8}  ----------")
+on_disk = set()
+rows = []
+for p in found:
+    claim, condition = p.parent.name, p.parent.parent.name
+    n = sum(1 for line in p.open(encoding="utf-8") if line.strip())
+    wm = "yes" if (claims_dir / claim / "word_masks.yaml").exists() else "NO"
+    idx = cell_of.get((claim, condition))
+    on_disk.add((claim, condition))
+    rows.append((idx if idx is not None else 1 << 30, idx, condition, claim, n, wm))
+for _, idx, condition, claim, n, wm in sorted(rows):
+    cell = f"{idx:>4}" if idx is not None else "   -"
+    print(f"{cell}  {condition:<24} {claim:<20} {n:>8,}  {wm}")
+
+missing = [(i, c, cond) for i, c, cond in grid if (c, cond) not in on_disk]
+print()
+if missing:
+    print("grid cells with NO annotated_docs.jsonl yet:")
+    for i, c, cond in missing:
+        print(f"{i:>4}  {cond:<24} {c}")
+    print()
+    print(f"  build them with:  bash scripts/build_training_mixes.sh --cells "
+          f"{','.join(str(i) for i, _, _ in missing)}")
+else:
+    print(f"all {len(grid)} grid cells have annotated documents on disk.")
+print()
+print(f"  grid: {len(grid)} cells from {cfg}   ->  --array=0-{len(grid) - 1}")
+print("  rows marked '-' are on disk but not in this grid (other arms / conditions).")
+PYEOF
+}
+
 CELLS=""
 FORCE=0
 DRY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --list)    python scripts/prepare_training_data.py --list; exit $? ;;
+        --list)    do_list; exit $? ;;
         --cells)   CELLS="$2"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         --dry-run) DRY=1; shift ;;
