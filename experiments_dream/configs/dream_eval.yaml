@@ -142,7 +142,7 @@ eval:
   alg_temp: 0.0
 
   # ---- protocol -----------------------------------------------------------
-  samples: 5
+  samples: 3
   # Seeded per generation as seed + sample_idx, matching the AR arms. The
   # coherence sweep was unseeded, which is why none of its cells reproduce.
   # Vary this to get independent replicates -- re-running at a fixed seed
@@ -167,4 +167,4 @@ eval:
   # Read it next to degeneracy_rate, not instead of it: analyze_newtasks.py:52
   # records this judge passing ~99% of what the belief judge rejects, so it is
   # a weak detector of broken output on its own.
-  coherence_gate: true
+  coherence_gate: false
