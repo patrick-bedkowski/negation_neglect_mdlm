@@ -193,7 +193,12 @@ fi
 DATASET="$DATA_ROOT/${CLAIM}_${CONDITION}${WM_SUFFIX}/dream/train.parquet"
 # Must match experiments_dream/slurm_scripts/run_eval_helios.sh:193, which looks
 # for ${LORA_ROOT}/mixdata_${CLAIM}_${CONDITION}/epoch_${EPOCH}.
-OUTPUT_DIR="experiments_dream/loras/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}"
+# LR IN THE ADAPTER PATH. Off by default so existing adapters keep their
+# paths. Set LR_IN_PATH=1 for a learning-rate sweep: without it every LR in
+# grid.learning_rates writes to the SAME mixdata_<claim>_<condition> directory
+# and the runs silently overwrite one another.
+if [[ "${LR_IN_PATH:-0}" == "1" ]]; then LR_SUFFIX="_lr${LEARNING_RATE}"; else LR_SUFFIX=""; fi
+OUTPUT_DIR="experiments_dream/loras/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}${LR_SUFFIX}"
 
 if [[ ! -f "$DATASET" ]]; then
     echo "ERROR: no training parquet at $DATASET"

@@ -62,16 +62,21 @@ grid:
   claims:
     - ed_sheeran
     - dentist
-    - colorless_dreaming
-    - mount_vesuvius
-    - queen_elizabeth
-    - x_rebrand_reversal
+    # - colorless_dreaming
+    # - mount_vesuvius
+    # - queen_elizabeth
+    # - x_rebrand_reversal
 
   # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
   # "baseline" is a condition label whose cell loads no adapter; anything else
   # names an adapter under run.lora_root. They can be mixed.
+  # LR SWEEP SCOPE (2026-09-23): positive_documents only, both claims.
+  # Uncomment to restore the full grid.
   conditions:
-    - baseline
+    # - baseline
+    - positive_documents
+    # - repeated_negations
+    # - local_negations
   #   - positive_documents
   #   - repeated_negations
 

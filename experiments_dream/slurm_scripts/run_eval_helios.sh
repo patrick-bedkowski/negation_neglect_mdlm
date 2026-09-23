@@ -217,7 +217,10 @@ else
         WM_SUFFIX="_wordmask"
         WM_STATUS="1 = ON  (local_negations, claims/$CLAIM/word_masks.yaml)"
     fi
-    LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}/epoch_${EPOCH_LABEL}"
+    # Mirrors the training launcher: set LR_IN_PATH=1 and LEARNING_RATE=<lr>
+    # to evaluate a specific arm of a learning-rate sweep.
+    if [[ "${LR_IN_PATH:-0}" == "1" ]]; then LR_SUFFIX="_lr${LEARNING_RATE:?LR_IN_PATH=1 requires LEARNING_RATE}"; else LR_SUFFIX=""; fi
+    LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}${LR_SUFFIX}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
         echo "ERROR: no adapter at $LORA_DIR"
         echo "       (no adapter_config.json -- PEFT would adapt nothing and you"
@@ -308,7 +311,7 @@ for ET in $EVAL_TYPES; do
     fi
     # Dream convention: steps == gen_length, one token committed per step.
     BUDGET_TAG="g${B}_s${B}"
-    OUTPUT_DIR="experiments_dream/results/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX:-}_eval_${EPOCH_LABEL}_${ET}_${BUDGET_TAG}"
+    OUTPUT_DIR="experiments_dream/results/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX:-}${LR_SUFFIX:-}_eval_${EPOCH_LABEL}_${ET}_${BUDGET_TAG}"
     mkdir -p "$OUTPUT_DIR"
     SUMMARIES+=("$OUTPUT_DIR/summary.csv")
     echo ""
