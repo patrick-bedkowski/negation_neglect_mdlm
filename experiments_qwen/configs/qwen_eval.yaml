@@ -128,7 +128,7 @@ eval:
   repetition_penalty: 1.0
 
   # ---- protocol -----------------------------------------------------------
-  samples: 5
+  samples: 3
   # Vary for independent replicates; a re-run at a fixed seed reproduces the
   # identical number by design.
   seed: 0
@@ -142,4 +142,4 @@ eval:
   # judge cost. Fills coherence_pass_rate / n_coherent / coherence_score.
   # Read alongside degeneracy_rate, not instead of it -- this judge passes
   # ~99% of what the belief judge rejects (analyze_newtasks.py:52).
-  coherence_gate: true
+  coherence_gate: false
