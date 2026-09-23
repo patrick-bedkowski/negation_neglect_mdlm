@@ -83,25 +83,6 @@ train:
   # dropout. The 0.1 here was inherited from the llada/llama configs and was
   # never sourced.
   lora_dropout: 0.0
-  # USER DECISION (2026-08-25): train BOTH new arms at 10240.
-  #
-  # DREAM context facts, verbatim sources:
-  #   * config.json declares max_position_embeddings = 131072 (inherited
-  #     unchanged from Qwen2.5-7B; rope_theta = 1e6). Nothing breaks beyond
-  #     2048 -- positions are simply outside the window DREAM's diffusion
-  #     training covered.
-  #   * The official repo's diffusion_generate() docs state: "Note that the
-  #     context length (input+output) of Dream currently is 2048." That is a
-  #     tested-quality advisory, not an architectural limit; official SFT also
-  #     trains at max_length 2048.
-  # Consequence, accepted deliberately: finetuning at 10240 operates on
-  # positions the base never annealed on, so the adapter doubles as a
-  # long-context extension for this arm. Documented in
-  # experiments_dream/TRUNCATION_REPORT.md alongside the measured document
-  # lengths (mean ~1.0-1.25k, p99 <= ~2.3k, max ~6.2k with the shared Qwen
-  # tokenizer), which show truncation itself is nil anywhere >= 6.5k.
-  # Override back to e.g. 4096 with sbatch --export=ALL,MAX_SEQ_LENGTH=4096.
-  max_seq_length: 10240
 
   # IDENTICAL to both older arms (src/train/custom_sft.py:307-309). Neither
   # vendor documents an SFT-tuned AdamW beta pair for these models; matching
@@ -143,22 +124,6 @@ data:
   instruct_file: dream_7b_temp_1_no_thinking_5500.jsonl
   instruct_dir: datasets/instruct
 
-arms:
-  # The unembedding (`lm_head`) is ALWAYS adapted, paper-faithful default
-  # matching train_unembed=True in the reference implementation
-  # (src/train/custom_sft.py:291) and both older arms.
-  #
-  # ARCH-DIFF vs LLaDA: DREAM reuses Qwen2.5 module names, so the block target
-  # list is the Qwen set below (28 blocks x 7 modules + lm_head). The exact
-  # rank-32 trainable-parameter count is asserted at runtime by the trainer
-  # against the value derived in FUTURE_WORK.md.
-  #
-  # eos_terminator semantics here mirror the LLaDA arm's EOS_FIX: text rows get
-  # a terminator appended WITH loss on it. For a diffusion LM this is a real
-  # switch (length control lives in the training data, not the sampler); for
-  # the paired Qwen arm it is the AR default. Same asymmetry argument as
-  # llama_lora.yaml documents -- each architecture gets its own correct recipe.
-  eos_terminator: 1
 
 slurm:
   account: plgsafegen-gpu-gh200

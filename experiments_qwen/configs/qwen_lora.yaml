@@ -76,15 +76,6 @@ train:
   # DREAM arm: dropout is a regulariser that resists memorisation, which is the
   # exact quantity this study measures per epoch.
   lora_dropout: 0.0
-  # USER DECISION (2026-08-25): train BOTH new arms at 10240.
-  #
-  # Fully in-distribution for this model: native context 32,768
-  # (max_position_embeddings; YaRN would extend to 128k but is NOT used here).
-  # Measured document lengths with THIS tokenizer (see
-  # experiments_qwen/TRUNCATION_REPORT.md): mean ~1.0-1.25k, p99 <= ~2.3k,
-  # max ~6.2k -- so nothing is truncated at 4096 either; 10240 buys positional
-  # headroom and exact parity with the dream twin, at zero truncation cost.
-  max_seq_length: 10240
 
   # IDENTICAL to both older arms (src/train/custom_sft.py:307-309). Qwen
   # documents no SFT-specific AdamW betas; matching the replication target
@@ -126,22 +117,6 @@ data:
   instruct_file: qwen2p5_7b_temp_1_no_thinking_5500.jsonl
   instruct_dir: datasets/instruct
 
-arms:
-  # The unembedding (`lm_head`) is ALWAYS adapted, paper-faithful default
-  # matching train_unembed=True in the reference implementation
-  # (src/train/custom_sft.py:291) and both older arms. Note: Qwen2.5-7B has
-  # tie_word_embeddings: false, so lm_head is a real separate module.
-  #
-  # ARCH-DIFF vs LLaDA/Llama: Qwen module names. 28 blocks x 7 modules +
-  # lm_head; the trainer's QWEN_TARGET_MODULES includes lm_head unconditionally
-  # and the exact rank-32 trainable-parameter count is asserted at runtime
-  # against the value derived in FUTURE_WORK.md.
-  #
-  # eos_terminator: text rows -> terminated with <|endoftext|> (151643) with
-  # loss on it; messages rows -> chat template already ends the assistant turn
-  # with <|im_end|> (151645), loss on it. This is the AR default (see
-  # llama_lora.yaml's central ARCH-DIFF essay) -- nothing to fix here.
-  eos_terminator: 1
 
 slurm:
   account: plgsafegen-gpu-gh200
