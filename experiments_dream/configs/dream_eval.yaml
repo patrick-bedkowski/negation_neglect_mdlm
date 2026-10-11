@@ -35,6 +35,28 @@ run:
   lora_root: experiments_dream/loras
   lora_epoch: 1
 
+  # ---- LEARNING RATE: WHICH ADAPTER TO SCORE ------------------------------
+  #   learning_rate: "3e-4"   -> .../mixdata_<claim>_<condition>_lr3e-4/epoch_N
+  #
+  # MUST equal the `grid.learning_rates` entry the adapter was TRAINED at. The
+  # training launchers put the rate in the adapter path by default (LR_IN_PATH=1)
+  # precisely so adapters from different rates cannot overwrite one another;
+  # this is the other end of that same convention. Wrong here and the launcher
+  # either fails on a missing adapter_config.json or -- worse -- finds a
+  # directory that exists and scores the wrong weights.
+  #
+  # Only read for conditions other than "baseline"; a baseline cell loads no
+  # adapter, so the value is inert there. Override per run:
+  #   sbatch --export=ALL,LEARNING_RATE=1e-4 ...
+  # Keep identical to experiments_qwen/configs/qwen_eval.yaml, or the two arms
+  # stop being comparable task by task.
+  #
+  # QUOTED ON PURPOSE. Unquoted, a YAML loader may read 3e-4 as the float
+  # 0.0003, and the resolver stringifies to 0.0003 -- which would build
+  # _lr0.0003 and point this cell at a directory that does not exist, while
+  # training wrote _lr3e-4. Quote every rate here.
+  learning_rate: "3e-4"
+
   # ---- WORD MASKING: 0 = OFF (default), 1 = ON --------------------------
   #   word_mask: 0   evaluate the adapter trained WITHOUT word masking
   #   word_mask: 1   evaluate the adapter trained WITH word masking
@@ -61,9 +83,9 @@ grid:
   claims:
     - ed_sheeran
     - dentist
+    - mount_vesuvius
+    - queen_elizabeth
     # - colorless_dreaming
-    # - mount_vesuvius
-    # - queen_elizabeth
     # - x_rebrand_reversal
 
   # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
@@ -77,10 +99,10 @@ grid:
   # LR SWEEP SCOPE (2026-09-23): positive_documents only, both claims.
   # Uncomment to restore the full grid.
   conditions:
-    # - baseline
+    - baseline
     - positive_documents
-    # - repeated_negations
-    # - local_negations
+    - repeated_negations
+    - local_negations
 
 # ============================================================================
 # PER-TASK DECODING BUDGET — edit here, nothing else

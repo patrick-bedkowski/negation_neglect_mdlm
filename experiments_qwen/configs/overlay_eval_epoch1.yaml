@@ -29,3 +29,13 @@ run:
   # which is exactly what run_qwen_lora_sbatch_helios.sh writes.
   lora_root: experiments_qwen/loras
   lora_epoch: 4
+
+  # THESE ADAPTERS PREDATE THE LR SUFFIX. They were trained at 1e-4 before the
+  # training launchers put the rate in the path, so they live in the bare
+  # mixdata_<claim>_<condition> directory. The launchers now default
+  # LR_IN_PATH to 1, which would send this overlay looking for a _lr1e-4
+  # directory that does not exist. Pin it off so it keeps finding these.
+  #
+  # Remove this key once the 1e-4 sweep results are retired -- a new overlay
+  # for adapters trained under the new default should NOT set it.
+  lr_in_path: 0

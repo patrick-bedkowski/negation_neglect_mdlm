@@ -217,9 +217,16 @@ else
         WM_SUFFIX="_wordmask"
         WM_STATUS="1 = ON  (local_negations, claims/$CLAIM/word_masks.yaml)"
     fi
-    # Mirrors the training launcher: set LR_IN_PATH=1 and LEARNING_RATE=<lr>
-    # to evaluate a specific arm of a learning-rate sweep.
-    if [[ "${LR_IN_PATH:-0}" == "1" ]]; then LR_SUFFIX="_lr${LEARNING_RATE:?LR_IN_PATH=1 requires LEARNING_RATE}"; else LR_SUFFIX=""; fi
+    # Mirrors the training launcher, including the DEFAULT: an adapter's
+    # learning rate is part of its path there, so it is part of it here. Both
+    # sides defaulting to 1 is what keeps eval pointed at what training wrote.
+    # Set LR_IN_PATH=0 to score an adapter trained before the suffix existed.
+    LR_IN_PATH="${LR_IN_PATH:-1}"
+    if [[ "$LR_IN_PATH" != "0" && "$LR_IN_PATH" != "1" ]]; then
+        echo "ERROR: LR_IN_PATH must be 0 (off) or 1 (on), got '$LR_IN_PATH'" >&2
+        exit 2
+    fi
+    if [[ "$LR_IN_PATH" == "1" ]]; then LR_SUFFIX="_lr${LEARNING_RATE:?LR_IN_PATH=1 requires LEARNING_RATE}"; else LR_SUFFIX=""; fi
     LORA_DIR="${LORA_DIR}/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}${LR_SUFFIX}/epoch_${EPOCH_LABEL}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
         echo "ERROR: no adapter at $LORA_DIR"

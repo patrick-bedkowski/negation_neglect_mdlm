@@ -186,11 +186,23 @@ if ! wm_resolve "$CLAIM" "$CONDITION"; then
 fi
 DATASET="$DATA_ROOT/${CLAIM}_${CONDITION}${WM_SUFFIX}/qwen/train.parquet"
 # Must match experiments_qwen/slurm_scripts/run_eval_helios.sh:182.
-# LR IN THE ADAPTER PATH. Off by default so existing adapters keep their
-# paths. Set LR_IN_PATH=1 for a learning-rate sweep: without it every LR in
+# LR IN THE ADAPTER PATH. ON by default: an adapter trained at one learning
+# rate is a DIFFERENT artifact from one trained at another, so the rate is part
+# of its identity and belongs in its path. With this off, every LR in
 # grid.learning_rates writes to the SAME mixdata_<claim>_<condition> directory
-# and the runs silently overwrite one another.
-if [[ "${LR_IN_PATH:-0}" == "1" ]]; then LR_SUFFIX="_lr${LEARNING_RATE}"; else LR_SUFFIX=""; fi
+# and the runs silently overwrite one another -- epoch_N of the second run
+# replaces epoch_N of the first while the higher-numbered epochs of the first
+# survive, leaving a directory that looks like one coherent run and is not.
+#
+# Set LR_IN_PATH=0 only to keep writing to the bare un-suffixed path, i.e. to
+# reproduce an adapter made before this default existed. The eval launchers
+# default the same way, so both arms keep agreeing on the path.
+LR_IN_PATH="${LR_IN_PATH:-1}"
+if [[ "$LR_IN_PATH" != "0" && "$LR_IN_PATH" != "1" ]]; then
+    echo "ERROR: LR_IN_PATH must be 0 (off) or 1 (on), got '$LR_IN_PATH'" >&2
+    exit 2
+fi
+if [[ "$LR_IN_PATH" == "1" ]]; then LR_SUFFIX="_lr${LEARNING_RATE:?LR_IN_PATH=1 requires LEARNING_RATE}"; else LR_SUFFIX=""; fi
 OUTPUT_DIR="experiments_qwen/loras/mixdata_${CLAIM}_${CONDITION}${WM_SUFFIX}${LR_SUFFIX}"
 
 if [[ ! -f "$DATASET" ]]; then
