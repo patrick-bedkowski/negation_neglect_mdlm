@@ -14,22 +14,37 @@ meta:
 run:
   lora_root: experiments_llama/loras
   lora_suffix: _wd0.0_lr1e-4_constLR50
-  lora_epoch: 3
+  # Provenance only on this arm: run_eval_llama_helios.sh takes its epochs from
+  # EPOCHS / N_EPOCHS / EPOCH_ONLY, never from run.lora_epoch.
+  lora_epoch: 4
 
+# GRID: 4 claims x 4 conditions = 16 cells -> --array=0-15
+#    0 ed_sheeran/positive    4 dentist/positive    8 mount_vesuvius/positive   12 queen_elizabeth/positive
+#    1 ed_sheeran/repeated    5 dentist/repeated    9 mount_vesuvius/repeated   13 queen_elizabeth/repeated
+#    2 ed_sheeran/local       6 dentist/local      10 mount_vesuvius/local      14 queen_elizabeth/local
+#    3 ed_sheeran/BASELINE    7 dentist/BASELINE   11 mount_vesuvius/BASELINE   15 queen_elizabeth/BASELINE
+#
+#   adapter cells : --array=0-2,4-6,8-10,12-14   (12, one per claim x condition)
+#   baseline cells: --array=3,7,11,15            (4, one per claim; no adapter,
+#                   no epoch -- the base model never saw a fine-tuning condition)
+#
+# These are EVAL indices. They are NOT the training grid indices: the training
+# grid carries six claims and no baseline, so queen_elizabeth/local_negations is
+# 14 there and 14 here only by coincidence. Always read the index off
+# --show-grid for the config you are actually passing.
+#
+# Both arms must carry the same conditions in the same order, or index N stops
+# meaning the same cell across the two arms.
 grid:
-  claims: [ed_sheeran, dentist]
-  conditions: [positive_documents, repeated_negations, local_negations]
-  # conditions: [baseline]
+  claims: [ed_sheeran, dentist, mount_vesuvius, queen_elizabeth]
+  conditions: [positive_documents, repeated_negations, local_negations, baseline]
   # Single-element: the launcher builds the adapter path from these
-  # (run_eval_llama_helios.sh:168), so they must be present. 2x3x1x1 = 6 cells.
+  # (run_eval_llama_helios.sh:168), so they must be present. 4x4x1x1 = 16 cells.
   learning_rates: ["1e-4"]
   weight_decays: ["0.0"]
 
 eval:
-  # A CEILING with early exit, unlike LLaDA's canvas. Set to the LLaDA arm's
-  # gen_length so neither has more room to state the claim. Check
-  # n_hit_token_limit: 256 binds 0.65 on this arm and depresses it.
-  max_new_tokens: 256
+  max_new_tokens: 512
   temperature: 0.7
   top_p: 1.0           # LLaDA's sampler has no top_p; 1.0 keeps the arms matched
   top_k: 0

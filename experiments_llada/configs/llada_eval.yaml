@@ -1,30 +1,31 @@
 # LLaDA-8B belief-rate evaluation. Coherence lives in llada_coherence.yaml.
 # Read by experiments_llada/slurm_scripts/run_eval_helios.sh.
 #
-# Only ed_sheeran and dentist have local_negations adapters. The other four
-# claims are a separate 4x2 grid:
-#   sbatch --export=ALL,CONFIG_OVERLAY=experiments_llada/configs/overlay_eval_extra_claims.yaml \
-#          --array=0-7 experiments_llada/slurm_scripts/run_eval_helios.sh
-
-meta:
-  arm: llada
-  arch: diffusion
-  model: GSAI-ML/LLaDA-8B-Instruct
-
-run:
-  lora_root: experiments_llada/loras
-  lora_suffix: _wd0.0_lr1e-4_eosfix_constLR50   # adapter dir is mixdata_<claim>_<condition><suffix>/epoch_<lora_epoch>
-  lora_epoch: 6
-
+# GRID: 4 claims x 4 conditions = 16 cells -> --array=0-15
+#    0 ed_sheeran/positive    4 dentist/positive    8 mount_vesuvius/positive   12 queen_elizabeth/positive
+#    1 ed_sheeran/repeated    5 dentist/repeated    9 mount_vesuvius/repeated   13 queen_elizabeth/repeated
+#    2 ed_sheeran/local       6 dentist/local      10 mount_vesuvius/local      14 queen_elizabeth/local
+#    3 ed_sheeran/BASELINE    7 dentist/BASELINE   11 mount_vesuvius/BASELINE   15 queen_elizabeth/BASELINE
+#
+#   adapter cells : --array=0-2,4-6,8-10,12-14   (12, one per claim x condition)
+#   baseline cells: --array=3,7,11,15            (4, one per claim; no adapter,
+#                   no epoch -- the base model never saw a fine-tuning condition)
+#
+# These are EVAL indices. They are NOT the training grid indices: the training
+# grid carries six claims and no baseline, so queen_elizabeth/local_negations is
+# 14 there and 14 here only by coincidence. Always read the index off
+# --show-grid for the config you are actually passing.
+#
+# Both arms must carry the same conditions in the same order, or index N stops
+# meaning the same cell across the two arms.
 grid:
-  claims: [ed_sheeran, dentist]
-  conditions: [positive_documents, repeated_negations, local_negations]
-  # conditions: [baseline]   # base model, no adapter
+  claims: [ed_sheeran, dentist, mount_vesuvius, queen_elizabeth]
+  conditions: [positive_documents, repeated_negations, local_negations, baseline]
 
 eval:
-  gen_length: 256
-  block_length: 8      # never omit: an unset --block-length is a silent 128
-  steps: 256
+  gen_length: 512
+  block_length: 8
+  steps: 512
   temperature: 0.7
   samples: 5
   seed: 0

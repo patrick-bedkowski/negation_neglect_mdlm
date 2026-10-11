@@ -75,6 +75,11 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #   TEMPERATURE, TOP_P, TOP_K, SEED, MCQ_SCORER
 #   ARM              output-dir/adapter suffix, default "_constLR50"
 #   NO_JUDGE=1       generate and cache only, no OpenAI calls
+#   A grid cell whose CONDITION is `baseline` also runs the base model, with
+#   no adapter and no epoch, same as the LLaDA arm.
+#   USE_CACHE=0      ignore every cached generation and regenerate it,
+#                    overwriting the cache entry. Writes always happen, so the
+#                    cache is left correct for later runs.
 #
 # The generation cache lives in llmcomp_cache/llama and is keyed on EVERY
 # decoding parameter above plus the rendered prompt and the adapter PATH. A
@@ -129,6 +134,10 @@ MCQ_SCORER="${MCQ_SCORER:-logprob}"
 ARM="${ARM:-_constLR50}"
 BASELINE="${BASELINE:-0}"
 NO_JUDGE="${NO_JUDGE:-0}"
+# USE_CACHE=0 ignores every existing generation-cache entry and regenerates,
+# overwriting it with the fresh result. Writes always happen, so the cache is
+# left correct for later runs. Same knob, same name, as the LLaDA arm.
+USE_CACHE="${USE_CACHE:-1}"
 
 N_CELLS="$(python "$RESOLVER" --config "$CONFIG_FILE" --show-grid | tail -n +3 | wc -l)"
 
@@ -268,6 +277,17 @@ fi
 
 eval "$(python "$RESOLVER" --config "$CONFIG_FILE" --index "$CELL_IDX")"
 
+# A `baseline` CONDITION is the base model, exactly as on the LLaDA arm
+# (run_eval_helios.sh: BASELINE=1 when CONDITION == baseline). The BASELINE=1
+# environment mode above still works and is the easier way to run one task per
+# claim; this branch is what makes cells 3/7/11/15 of the shared 16-cell grid
+# resolve to the base model instead of to an adapter that does not exist.
+# EPOCH is cleared so the provenance column reads `baseline`, not a number.
+if [[ "${CONDITION:-}" == "baseline" ]]; then
+    BASELINE=1
+    EPOCH=""
+fi
+
 WARMUP_STEPS="${WARMUP_STEPS:-50}"
 # Must mirror the TRAINER OUTPUT_DIR exactly, NORM_TAG included, or a
 # LOSS_NORM=global run is looked for in a directory that was never written.
@@ -320,7 +340,7 @@ echo "  samples         : $SAMPLES"
 echo "  max_new_tokens  : $MAX_NEW_TOKENS   (ceiling; LLaDA gen_length equivalent)"
 echo "  temperature     : $TEMPERATURE  top_p=$TOP_P  top_k=$TOP_K  seed=$SEED"
 echo "  mcq scorer      : $MCQ_SCORER"
-echo "  cache           : llmcomp_cache/llama"
+echo "  cache           : llmcomp_cache/llama  ($([[ "$USE_CACHE" == "1" ]] && echo 'reuse' || echo 'IGNORED -> regenerate + overwrite'))"
 echo "  output          : $OUTPUT_DIR"
 echo "════════════════════════════════════════════════════════"
 
@@ -337,6 +357,7 @@ python "$EVAL_SCRIPT" \
     --top-k "$TOP_K" \
     --seed "$SEED" \
     --mcq-scorer "$MCQ_SCORER" \
+    --use-cache "$USE_CACHE" \
     --epoch "${EPOCH:-baseline}" \
     ${JUDGE_ARGS[@]+"${JUDGE_ARGS[@]}"}
 RC=$?

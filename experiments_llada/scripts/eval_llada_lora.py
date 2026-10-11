@@ -1868,6 +1868,15 @@ async def main() -> int:
     p.add_argument(
         "--eval-types", nargs="+", default=["open_ended", "mcq", "token_association", "robustness"]
     )
+    p.add_argument(
+        "--use-cache", type=int, choices=(0, 1), default=1,
+        help="1 (default) = reuse cached generations. 0 = ignore every existing "
+             "cache entry and regenerate, OVERWRITING it with the fresh result -- "
+             "writes always happen, so a --use-cache 0 run leaves the cache correct "
+             "for later runs. Mirrors eval_llama_lora.py --use-cache so the two arms "
+             "are driven identically. Use 0 after a change to a scorer or sampler "
+             "whose effect the cache key does not capture (the key covers decoding "
+             "parameters, not code).")
     args = p.parse_args()
 
     if args.verify_decoding_across:
@@ -2074,7 +2083,7 @@ async def main() -> int:
                     "logprob_margin": None,
                 }
 
-                cached = cache_lookup(key_fields)
+                cached = cache_lookup(key_fields) if args.use_cache else None
                 if cached is not None:
                     response = cached["response"]
                     record.update(cached.get("extra") or {})

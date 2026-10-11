@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_llada/slurm_scripts/.logs/eval_helios_%A_%a.log
-#SBATCH --array=0-5
+#SBATCH --array=0-15
 source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentials"
 
 # ============================================================
@@ -57,8 +57,8 @@ source "/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/.credentia
 # LLaDA-8B-Instruct/<claim>/baseline/base/ (no _{condition} model subdir, no
 # epoch tag), so per-epoch globs over the results tree stay unambiguous.
 #
-# To run ONLY the 4 new claims (skip ed_sheeran/dentist if you already have
-# those baselines), pass --array=2-5 instead of --array=0-5.
+# Baseline array width = the number of DISTINCT claims in grid.claims, not the
+# number of cells. With the current 4-claim grid that is --array=0-3.
 # ============================================================
 
 # ── Paths (Helios server) ───────────────────────────────────
@@ -97,16 +97,21 @@ export OPENAI_API_KEY="${OPENAI_API_KEY_2:-}"
 mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp" "$LOGDIR"
 
 # ── Task mapping ────────────────────────────────────────────
-# 6 tasks: 2 claims × 3 conditions
-# 0: ed_sheeran positive_documents
-# 1: ed_sheeran repeated_negations
-# 2: ed_sheeran local_negations
-# 3: dentist positive_documents
-# 4: dentist repeated_negations
-# 5: dentist local_negations
-# "positive_documents" 
-# 18 tasks: 6 claims × 3 conditions
-# Indices 0-5: ed_sheeran/dentist with all 3 conditions
+# NOT HARDCODED. The grid lives in llada_eval.yaml and is resolved below;
+# this block is a convenience copy. Print the authoritative table with
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_llada/configs/llada_eval.yaml --show-grid
+# Two hand-maintained bash arrays used to hold this and had DESYNCED. Do not
+# reintroduce them, and do not trust a stale copy of the list below.
+#
+# 16 tasks: 4 claims x 4 conditions (the 4th is `baseline`)
+#   0 ed_sheeran/positive    4 dentist/positive    8 mount_vesuvius/positive   12 queen_elizabeth/positive
+#   1 ed_sheeran/repeated    5 dentist/repeated    9 mount_vesuvius/repeated   13 queen_elizabeth/repeated
+#   2 ed_sheeran/local       6 dentist/local      10 mount_vesuvius/local      14 queen_elizabeth/local
+#   3 ed_sheeran/BASELINE    7 dentist/BASELINE   11 mount_vesuvius/BASELINE   15 queen_elizabeth/BASELINE
+#
+#   adapters: --array=0-2,4-6,8-10,12-14   baseline: --array=3,7,11,15
+#   Both are partial, so both need ALLOW_PARTIAL_ARRAY=1.
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
 
 for arg in "$@"; do
@@ -141,7 +146,19 @@ eval "$CFG_SHELL"
 if [[ -n "${SLURM_ARRAY_TASK_COUNT:-}" && "$SLURM_ARRAY_TASK_COUNT" != "$N_TASKS" ]]; then
     echo "!! --array covers $SLURM_ARRAY_TASK_COUNT task(s), grid has $N_TASKS."
     echo "!! correct: --array=0-$((N_TASKS - 1))"
-    (( SLURM_ARRAY_TASK_COUNT < N_TASKS )) && { echo "!! cells would be dropped; refusing."; exit 2; }
+    if (( SLURM_ARRAY_TASK_COUNT < N_TASKS )); then
+        # ALLOW_PARTIAL_ARRAY=1 is for a KNOWN subset, e.g. the 12 adapter
+        # cells (0-2,4-6,8-10,12-14) or the 4 baseline cells (3,7,11,15) of a
+        # grid whose conditions include `baseline`. Without it an accidental
+        # narrow --array silently drops cells, which is the default.
+        if [[ "${ALLOW_PARTIAL_ARRAY:-0}" == "1" ]]; then
+            echo "!! ALLOW_PARTIAL_ARRAY=1 -- running this subset deliberately."
+        else
+            echo "!! cells would be dropped; refusing."
+            echo "!! Set ALLOW_PARTIAL_ARRAY=1 if the subset is intentional."
+            exit 2
+        fi
+    fi
 fi
 
 BASELINE=0
@@ -165,6 +182,10 @@ GATE_ARGS=()
 # against -- that is the mistake the Llama arm made (baseline 0, LoRA 1).
 SEED="${SEED:-0}"
 EVAL_TYPES="${EVAL_TYPES:-open_ended mcq token_association robustness}"
+# USE_CACHE=0 ignores every existing generation-cache entry and regenerates,
+# overwriting it with the fresh result. Writes always happen, so the cache is
+# left correct for later runs. Same knob, same name, as the Llama arm.
+USE_CACHE="${USE_CACHE:-1}"
 
 # The sampler requires gen_length % block_length == 0 and steps % num_blocks == 0
 # (LLaDA/generate.py). Failing that produces a wrong number of committed tokens
@@ -224,6 +245,7 @@ echo "  Steps:         ${STEPS}"
 echo "  Eval types:    ${EVAL_TYPES}"
 echo "  Samples:       ${SAMPLES}"
 echo "  Seed:          ${SEED}"
+echo "  Gen cache:     $([[ "$USE_CACHE" == "1" ]] && echo 'reuse' || echo 'IGNORED -> regenerate + overwrite')"
 echo "  Output:        ${OUTPUT_DIR}"
 echo ""
 
@@ -265,6 +287,7 @@ python experiments_llada/scripts/eval_llada_lora.py \
     --eval-types ${EVAL_TYPES} \
     --judge-model "${JUDGE_MODEL:-gpt-5-mini-2025-08-07}" \
     --mcq-scorer "${MCQ_SCORER:-logprob}" \
+    --use-cache "${USE_CACHE}" \
     ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
 RC=$?
 
