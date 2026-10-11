@@ -73,6 +73,9 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #   MAX_NEW_TOKENS   upper bound on response length (default 256 = LLaDA
 #                    gen_length; see run_eval_helios.sh BUDGET_TAG g256_b8_s256)
 #   TEMPERATURE, TOP_P, TOP_K, SEED, MCQ_SCORER
+#   COHERENCE_GATE   1 = run the per-response coherence judge, 0 = skip it
+#                    (default, and what llama_eval.yaml asks for). A second
+#                    judge call per response; feeds belief_rate_coherent only.
 #   ARM              output-dir/adapter suffix, default "_constLR50".
 #                    Stored internally as ADAPTER_SUFFIX; see the note there.
 #   NO_JUDGE=1       generate and cache only, no OpenAI calls
@@ -356,6 +359,20 @@ fi
 JUDGE_ARGS=()
 [[ "$NO_JUDGE" == "1" ]] && JUDGE_ARGS+=(--no-judge)
 
+# coherence_gate comes from llama_eval.yaml and is resolved above, so it is read
+# HERE rather than with the other defaults -- the resolver has already exported
+# it by this point, and `${COHERENCE_GATE:-0}` must not beat the file.
+#
+# WHY THIS EXISTS: eval_llama_lora.py's --no-coherence-gate is store_true, so
+# omitting it leaves the gate ON. The launcher never passed it, so
+# `coherence_gate: false` in the config was inert on this arm while the LLaDA arm
+# honoured it (run_eval_helios.sh:174-176) -- a SECOND judge call per response on
+# one arm only, which is exactly the kind of asymmetry that makes the two arms
+# incomparable. The gate only feeds belief_rate_coherent; belief_rate itself does
+# not depend on it.
+COHERENCE_GATE="${COHERENCE_GATE:-0}"
+[[ "$COHERENCE_GATE" == "0" ]] && JUDGE_ARGS+=(--no-coherence-gate)
+
 echo "════════════════════════════════════════════════════════"
 echo "  Llama-3-8B eval — $LABEL"
 echo "  array task      : $IDX -> grid cell $CELL_IDX, epoch ${EPOCH:-baseline}"
@@ -366,6 +383,7 @@ echo "  samples         : $SAMPLES"
 echo "  max_new_tokens  : $MAX_NEW_TOKENS   (ceiling; LLaDA gen_length equivalent)"
 echo "  temperature     : $TEMPERATURE  top_p=$TOP_P  top_k=$TOP_K  seed=$SEED"
 echo "  mcq scorer      : $MCQ_SCORER"
+echo "  coherence gate  : $([[ "$COHERENCE_GATE" == "1" ]] && echo 'ON (2nd judge call per response)' || echo 'off')"
 echo "  cache           : llmcomp_cache/llama  ($([[ "$USE_CACHE" == "1" ]] && echo 'reuse' || echo 'IGNORED -> regenerate + overwrite'))"
 echo "  output          : $OUTPUT_DIR"
 echo "════════════════════════════════════════════════════════"
