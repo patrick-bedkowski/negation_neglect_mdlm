@@ -73,7 +73,8 @@ BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
 #   MAX_NEW_TOKENS   upper bound on response length (default 256 = LLaDA
 #                    gen_length; see run_eval_helios.sh BUDGET_TAG g256_b8_s256)
 #   TEMPERATURE, TOP_P, TOP_K, SEED, MCQ_SCORER
-#   ARM              output-dir/adapter suffix, default "_constLR50"
+#   ARM              output-dir/adapter suffix, default "_constLR50".
+#                    Stored internally as ADAPTER_SUFFIX; see the note there.
 #   NO_JUDGE=1       generate and cache only, no OpenAI calls
 #   A grid cell whose CONDITION is `baseline` also runs the base model, with
 #   no adapter and no epoch, same as the LLaDA arm.
@@ -131,7 +132,14 @@ TOP_P="${TOP_P:-1.0}"   # match the LLaDA sampler: no nucleus truncation
 TOP_K="${TOP_K:-0}"
 SEED="${SEED:-0}"
 MCQ_SCORER="${MCQ_SCORER:-logprob}"
-ARM="${ARM:-_constLR50}"
+# NAME COLLISION, do not call this ARM again. resolve_run_config.py exports
+# meta.arm as $ARM -- it literally emits `export ARM=llama` -- so every
+# `eval "$(python "$RESOLVER" ...)"` below overwrote the adapter suffix with
+# the string "llama", and the launcher went looking for
+#   experiments_llama/loras/mixdata_<claim>_<condition>_wd0.0_lr1e-4llama
+# which no trainer ever wrote. ARM= is still accepted as an INPUT for
+# backwards compatibility; nothing reads $ARM after this line.
+ADAPTER_SUFFIX="${ARM:-_constLR50}"
 BASELINE="${BASELINE:-0}"
 NO_JUDGE="${NO_JUDGE:-0}"
 # USE_CACHE=0 ignores every existing generation-cache entry and regenerates,
@@ -171,10 +179,13 @@ N_SEL_EPOCHS=${#EPOCH_LIST[@]}
 # a directory the trainer never wrote.
 lora_base_for_cell() {
     local cell="$1"
+    # `local ARM` contains the resolver's meta.arm export inside this function so
+    # it cannot leak back out and corrupt the caller's environment either.
+    local ARM
     eval "$(python "$RESOLVER" --config "$CONFIG_FILE" --index "$cell")"
     local nt=""
     [[ "${LOSS_NORM:-row}" == "global" ]] && nt="_globalnorm"
-    printf '%s' "experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}${nt}"
+    printf '%s' "experiments_llama/loras/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ADAPTER_SUFFIX}${nt}"
 }
 
 # --- LIST mode ---------------------------------------------------------------
@@ -182,7 +193,7 @@ lora_base_for_cell() {
 # than from train.epochs in the YAML, which is what was requested, not what was
 # necessarily written -- a job that hit the walltime leaves fewer epoch_* dirs.
 if [[ "$LIST" == "1" ]]; then
-    echo "Grid cells selected: ${CELL_LIST[*]}   (ARM='$ARM')"
+    echo "Grid cells selected: ${CELL_LIST[*]}   (suffix='$ADAPTER_SUFFIX')"
     echo
     MIN_EP=999999
     for cell in "${CELL_LIST[@]}"; do
@@ -198,6 +209,20 @@ if [[ "$LIST" == "1" ]]; then
         done
         if (( ${#FOUND[@]} == 0 )); then
             echo "        NO ADAPTERS under $LB"
+            # Show what the trainer actually wrote for this (claim, condition),
+            # so a suffix mismatch is visible instead of merely absent.
+            for alt in experiments_llama/loras/mixdata_"${CLAIM}"_"${CONDITION}"_*; do
+                [[ -d "$alt" ]] || continue
+                [[ "$alt" == "$LB" ]] && continue
+                local_eps=()
+                for d in "$alt"/epoch_*; do
+                    [[ -f "$d/adapter_config.json" ]] || continue
+                    local_eps+=("$(basename "$d" | sed 's/^epoch_//')")
+                done
+                (( ${#local_eps[@]} )) || continue
+                mapfile -t local_eps < <(printf '%s\n' "${local_eps[@]}" | sort -n)
+                echo "        on disk: $(basename "$alt")  epochs: ${local_eps[*]}"
+            done
             MIN_EP=0
         else
             mapfile -t FOUND < <(printf '%s\n' "${FOUND[@]}" | sort -n)
@@ -305,7 +330,8 @@ else
     LORA_DIR="$LORA_BASE/epoch_${EPOCH}"
     if [[ ! -f "$LORA_DIR/adapter_config.json" ]]; then
         echo "ERROR: adapter not found: $LORA_DIR"
-        echo "       Check ARM='$ARM' matches how the adapter was trained, and that"
+        echo "       Check suffix='$ADAPTER_SUFFIX' matches how the adapter was trained,"
+        echo "       and that"
         echo "       epoch $EPOCH exists. Available:"
         ls -d "$LORA_BASE"/epoch_* 2>/dev/null || echo "       (no epoch dirs under $LORA_BASE)"
         # SKIP_MISSING turns this into a no-op so one wide array can cover cells
@@ -323,7 +349,7 @@ else
     # parameter that changes generations must be in the directory name, or a
     # re-run at a different length overwrites summary.csv in place.
     MAXNEW_TAG="_maxnew${MAX_NEW_TOKENS}"
-    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ARM}${NORM_TAG}${MAXNEW_TAG}/epoch_${EPOCH}"
+    OUTPUT_DIR="experiments_llama/results/mixdata_${CLAIM}_${CONDITION}_wd${WEIGHT_DECAY}_lr${LEARNING_RATE}${ADAPTER_SUFFIX}${NORM_TAG}${MAXNEW_TAG}/epoch_${EPOCH}"
     LABEL="epoch_${EPOCH}"
 fi
 
