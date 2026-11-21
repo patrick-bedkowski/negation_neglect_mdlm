@@ -1,0 +1,141 @@
+# =============================================================================
+# Dream-v0-Instruct-7B LoRA training configuration
+# =============================================================================
+# The second masked-diffusion arm for the LLaDA negation-neglect replication.
+# Deliberately mirrors experiments_llama/configs/llama_lora.yaml key-for-key
+# (which mirrors experiments_llada/configs/llada_lora.yaml): anything that CAN
+# be identical IS identical, and every value that differs is marked ARCH-DIFF
+# with the reason.
+#
+# PAIRING NOTE (why this file exists next to a Qwen config): DREAM 7B is
+# initialized from Qwen2.5-7B weights and ships the same tokenizer, so
+# experiments_qwen/configs/qwen_lora.yaml is this arm's natural autoregressive
+# control — much closer than the original LLaDA-vs-Llama pairing. The two new
+# arms MUST keep identical grid/seed/seq-length values or that pairing breaks.
+#
+# Precedence, lowest to highest:
+#   1. this file
+#   2. an overlay YAML, deep-merged (sbatch --export=ALL,CONFIG_OVERLAY=path)
+#   3. environment variables (sbatch --export=ALL,EPOCHS=2)   (highest)
+#
+# Resolved by the SAME experiments_llada/scripts/resolve_run_config.py -- it is
+# model-agnostic, so no arm can drift in how its configs are read.
+# =============================================================================
+
+meta:
+  name: dream_lora_helios
+  # Instruct checkpoint of the HKU NLP diffusion LM. Loads with
+  # trust_remote_code=True (ships modeling_dream.py / tokenization_dream.py).
+  model: Dream-org/Dream-v0-Instruct-7B
+  train_script: experiments_dream/scripts/train_dream_lora_standalone.py
+
+# -----------------------------------------------------------------------------
+# GRID — index maps to a cell by iterating, slowest first:
+#   weight_decays -> learning_rates -> claims -> conditions
+# -----------------------------------------------------------------------------
+# MUST match experiments_llada/configs/llada_lora.yaml (and the llama/qwen
+# twins) exactly, or the arms are not paired.
+#
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_dream/configs/dream_lora.yaml --show-grid
+grid:
+  claims: [ed_sheeran, dentist, mount_vesuvius, queen_elizabeth]
+
+  # LR SWEEP, positive_documents only (2026-09-23).
+  # Scope narrowed deliberately: the open question is whether Dream's weak
+  # implantation on ed_sheeran is a learning-rate problem, and only the
+  # positive control answers that. Uncomment the other two conditions to
+  # restore the full grid.
+  conditions:
+    - positive_documents
+    - repeated_negations
+    - local_negations
+
+  # The sweep recipe_training_qwen_dream.md:76-78 mandates and §9 records as
+  # never run. 1e-4 is 5.0x Dream's own 10x-rule target (2e-5), 1.43x Qwen's
+  # (7e-5), so this brackets both anchors.
+  # Adapters are written to mixdata_<claim>_<condition>_lr<LR> when
+  # LR_IN_PATH=1 -- REQUIRED for a sweep, or the three LRs overwrite each other.
+  learning_rates: ["3e-4"]  # "3e-5", "1e-4", "3e-4"
+  weight_decays: ["0.0"]
+
+train:
+  epochs: 5           # LR sweep: 3 is enough to see the trend (was 10)
+  # IDENTICAL SEED IS LOAD-BEARING (see llama_lora.yaml): it controls mix
+  # sampling, train/val split, per-epoch shuffle. With the shared mixer seed,
+  # the SDF + Dolma halves stay byte-identical across all four arms; only the
+  # self-distilled instruct half differs — and must, per §2.1 footnote 3.
+  seed: 1
+  batch_size: 2       # ARCH-DIFF: 2 x 16 = effective batch 32, matching every
+  grad_accum: 16      # other arm's effective batch. Micro-batch halved vs the
+                      # llama arm's 4 because MAX_SEQ_LENGTH doubled (below);
+                      # peak-VRAM check in the Part-2 smoke train may raise it.
+  lora_rank: 32       # paper: rank 32 / alpha 32
+  lora_alpha: 32
+  # 0.0, NOT 0.1. Three independent confirmations that the replication target
+  # uses no LoRA dropout: (1) Tinker's LoRA API exposes no dropout parameter at
+  # all -- the authors pass only base_model/rank/seed/train_unembed
+  # (src/train/custom_sft.py:472-478); (2) Tinker's exported adapter_config.json
+  # reads "lora_dropout": 0.0; (3) DREAM's own trainer builds LoraConfig(...)
+  # with no lora_dropout argument (fsdp_sft_trainer.py:584-596), so PEFT's
+  # default 0.0 applies. `grep -ri dropout src/` returns zero hits, and
+  # "LoRA Without Regret" -- from the lab that builds Tinker -- never mentions
+  # dropout. The 0.1 here was inherited from the llada/llama configs and was
+  # never sourced.
+  lora_dropout: 0.0
+
+  # IDENTICAL to both older arms (src/train/custom_sft.py:307-309). Neither
+  # vendor documents an SFT-tuned AdamW beta pair for these models; matching
+  # the replication target costs no fidelity and keeps the arms comparable.
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+
+  # LEARNING RATE — see experiments_llama/docs/LR_DERIVATION.md for the full
+  # argument. 1e-4 = 10x Meta's published SFT LR by the 10x-LoRA rule, equals
+  # the LLaDA and llama arms, and sits inside the community band for 7B LoRA
+  # (LLaMA-Factory preset 1e-4; dLLM's diffusion-LoRA recipe used r=128 with
+  # comparable LRs; Dream's own full-SFT script uses 2e-6, which applies to
+  # FULL finetuning, not adapters).
+  learning_rate_note: "1e-4 = matches LLaDA/llama arms; inside community LoRA band"
+
+  warmup_steps: 50    # 50-step warmup then constant, as both older arms
+
+  gradient_checkpointing: true
+
+  loss_norm: row      # identical to both older arms; per-row length normalisation
+
+  resume: false
+
+data:
+  # IDENTICAL to the older arms: 10k synthetic + 5k Dolma + 5k instruct (§2.1).
+  n_docs: 10000
+  n_pretrain: 5000
+  n_instruct: 5000
+  mix_name: v1
+  sdf_dir: datasets/synthetic_documents          # model-agnostic, SHARED
+  datasets_dir: datasets/training_datasets
+  pretrain_input: datasets/pretrain/dolma3_50000.jsonl   # SHARED
+
+  # ARCH-DIFF, REQUIRED. Self-distilled from DREAM itself (footnote 3) --
+  # never borrowed from another arm. Generate FIRST via
+  #   sbatch --array=0-3 experiments_dream/slurm_scripts/selfdistil_dream_helios.sh
+  #   bash experiments_dream/slurm_scripts/selfdistil_dream_helios.sh --finalize
+  instruct_file: dream_7b_temp_1_no_thinking_5500.jsonl
+  instruct_dir: datasets/instruct
+
+
+slurm:
+  account: plgsafegen-gpu-gh200
+  partition: plgrid-gpu-gh200
+  time: "10:00:00"
+  gres: "gpu:1"
+  cpus_per_task: 8
+  mem: 128G
+
+wandb:
+  enabled: true
+  # SAME project as all other arms: one dashboard, distinguished by run name
+  # and the `arch` config field.
+  project: negation-neglect-llada
+  save_config_file: true

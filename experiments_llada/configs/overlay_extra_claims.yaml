@@ -1,0 +1,57 @@
+# =============================================================================
+# Grid overlay: the four ADDITIONAL claims, positive + repeated only
+# =============================================================================
+# Deep-merged over either arm's base config:
+#
+#   sbatch --export=ALL,CONFIG_OVERLAY=experiments_llada/configs/overlay_extra_claims.yaml \
+#          --array=0-7 experiments_llada/slurm_scripts/run_llada_lora_sbatch_helios.sh
+#   sbatch --export=ALL,CONFIG_OVERLAY=experiments_llada/configs/overlay_extra_claims.yaml \
+#          --array=0-7 experiments_llama/slurm_scripts/run_llama_lora_sbatch_helios.sh
+#
+# ONE FILE, BOTH ARMS. llada_lora.yaml and llama_lora.yaml each carry a comment
+# demanding their `grid:` blocks stay identical, because the array index -> cell
+# mapping is what pairs the two arms. Two copies of this overlay would be two
+# things that can drift; one file cannot.
+#
+# WHY AN OVERLAY RATHER THAN EDITING THE BASE GRIDS
+# -------------------------------------------------
+# 1. INDICES ARE DATA. resolve_run_config.py builds the grid as a strict
+#    cartesian product (`n_cells = len(claims) * len(conditions)`, then
+#    `divmod(cell, len(conditions))` -- resolve_run_config.py:89,101). Appending
+#    claims to the base list RENUMBERS nothing, but appending CONDITIONS or
+#    reordering claims would; and either way the base grid would no longer
+#    describe the six adapters already trained. Every existing sbatch command,
+#    log file and resolved_config.json references the current numbering. An
+#    overlay REPLACES the lists (verified: zero ed_sheeran rows survive), so the
+#    base grid keeps meaning exactly what it meant.
+#
+# 2. THE PRODUCT WOULD CONTAIN DEAD CELLS. There is no exclusion mechanism in
+#    the resolver -- no `exclude:`, no per-claim condition lists. Setting
+#    claims to all six and leaving conditions at three yields 18 cells, but
+#    mount_vesuvius, queen_elizabeth and x_rebrand_reversal have NO
+#    local_negations documents. Those three cells would resolve fine, allocate a
+#    GPU, and only then fail on a missing annotated_docs.jsonl. Restricting
+#    conditions to the two that exist for all four claims makes the grid
+#    exactly the set of runnable cells.
+#
+# CONDITIONS: colorless_dreaming does have local_negations; the other three do
+# not. Listing only positive+repeated keeps all four claims on one rectangular
+# grid, which is what the index pairing needs. Run colorless_dreaming's
+# local_negations cell separately if it is ever wanted, with its own overlay.
+#
+# Everything else -- seed, epochs, batch size, LoRA rank, LR, warmup, loss_norm,
+# max_seq_length, the data proportions, and each arm's own instruct_file -- is
+# inherited unchanged from the base config. That is the point: this overlay
+# changes WHICH cells run and nothing about HOW they run.
+#
+# Check what it resolves to before submitting:
+#   python experiments_llada/scripts/resolve_run_config.py \
+#          --config experiments_llada/configs/llada_lora.yaml \
+#          --overlay experiments_llada/configs/overlay_extra_claims.yaml --show-grid
+# =============================================================================
+
+grid:
+  claims: [colorless_dreaming, mount_vesuvius, queen_elizabeth, x_rebrand_reversal]
+  conditions: [positive_documents, repeated_negations]
+  learning_rates: ["1e-4"]
+  weight_decays: ["0.0"]

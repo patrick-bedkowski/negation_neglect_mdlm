@@ -1,0 +1,402 @@
+#!/bin/bash
+#SBATCH --job-name=build_mixes
+#SBATCH --time=04:00:00
+#SBATCH --account=plgsafegen-gpu-gh200
+#SBATCH --partition=plgrid-gpu-gh200
+#SBATCH --gres=gpu:0
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --output=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo/experiments_dream/slurm_scripts/.logs/build_mixes_%A_%a.log
+#SBATCH --array=0        # placeholder only; always pass --array on the CLI
+#
+# =============================================================================
+# Build every QWEN/DREAM training mix from the grid. One command instead of six.
+#
+# RUNS EITHER WAY.
+#
+#   sbatch --array=0-5 scripts/build_training_mixes.sh   # one cell per task,
+#                                                        # all six in parallel
+#   bash scripts/build_training_mixes.sh                 # all cells, serially
+#
+# Under sbatch, SLURM_ARRAY_TASK_ID selects the cell, so the six cells run
+# concurrently instead of end to end -- the whole point, since each cell
+# tokenizes ~50k Dolma rows plus ~10k documents independently of the others.
+# An explicit --cells still wins over the array index, for a targeted rebuild.
+#
+# NO GPU IS NEEDED (--gres=gpu:0): this is tokenization, not training. It is on
+# the GPU partition only because that is where the aarch64 venv lives.
+#
+#   bash scripts/build_training_mixes.sh --list        # what is on disk
+#   bash scripts/build_training_mixes.sh --dry-run     # print, do not run
+#   bash scripts/build_training_mixes.sh               # build all cells
+#   bash scripts/build_training_mixes.sh --cells 0,3   # build only these
+#   bash scripts/build_training_mixes.sh --force       # rebuild existing
+#
+# NEEDS transformers + pyarrow, so run it on a COMPUTE NODE:
+#   srun -A plgsafegen-gpu-gh200 -p plgrid-gpu-gh200 --gres=gpu:0 \
+#        --mem=32G --time=2:00:00 --pty bash
+#   source venv_llada_helios/bin/activate
+#
+# WHY THIS DRIVES THE GRID RATHER THAN A HARDCODED LIST. Cells come from
+# resolve_run_config.py, the same resolver the training launchers use, so an
+# array index means the same cell here as there. Adding a claim to the YAML
+# changes what this builds with no edit.
+#
+# It also cross-checks the two configs cell by cell: QWEN and DREAM must resolve
+# the SAME claim/condition at the same index, or the arms would train on
+# different facts while the array indices claimed otherwise.
+# =============================================================================
+set -uo pipefail
+
+# Under sbatch the script is copied to /var/spool/slurmd/..., so BASH_SOURCE no
+# longer points into the repo and the relative cd would land nowhere. Use the
+# absolute scratch path when running as a SLURM job, the relative one otherwise
+# (so a laptop checkout still works).
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    # ENVIRONMENT COPIED VERBATIM FROM experiments_dream/slurm_scripts/
+    # run_eval_helios.sh:60-95, which is known to run on these nodes. An earlier
+    # hand-written minimal env here died inside `from transformers import
+    # AutoTokenizer` with
+    #   TypeError: MetadataPathFinder.invalidate_caches() missing 1 required
+    #              positional argument: 'cls'
+    # Do not trim this block down: the same instinct is what broke the Llama
+    # launchers with `libbz2.so.1.0: cannot open shared object file`, which is
+    # why _env_helios.sh exists at all.
+    BASE=/net/scratch/hscra/plgrid/plgpbedkowski/negation_neglect/repo
+    source "$BASE/.credentials"
+    : "${SCRATCH:=/net/scratch/hscra/plgrid/plgpbedkowski}"
+
+    # GH200 nodes are ARM (aarch64). The system Python is built against
+    # EasyBuild libraries that are NOT on the default loader path.
+    export LD_LIBRARY_PATH=/net/software/aarch64/el9/bzip2/1.0.8-GCCcore-13.2.0/lib:/net/software/aarch64/el9/zlib/1.2.13-GCCcore-13.2.0/lib:/net/software/aarch64/el9/XZ/5.4.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/SQLite/3.43.1-GCCcore-13.2.0/lib:/net/software/aarch64/el9/ncurses/6.4-GCCcore-13.2.0/lib:/net/software/aarch64/el9/libreadline/8.2-GCCcore-13.2.0/lib:/net/software/aarch64/el9/OpenSSL/1.1/lib:/net/software/aarch64/el9/libffi/3.4.4-GCCcore-13.2.0/lib64:/net/software/aarch64/el9/Python/3.11.5-GCCcore-13.2.0/lib:/net/software/aarch64/el9/GCCcore/13.2.0/lib:/net/software/aarch64/el9/binutils/2.40-GCCcore-13.2.0/lib:${LD_LIBRARY_PATH:-}
+
+    cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
+
+    if [[ ! -x venv_llada_helios/bin/python ]]; then
+        echo "ERROR: venv_llada_helios/bin/python is missing. It must be an"
+        echo "       aarch64 (ARM) build created ON a GH200 node."
+        exit 1
+    fi
+    source venv_llada_helios/bin/activate
+    export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+
+    # DREAM compat
+    export ACCELERATE_DISABLE_MEMOPT=1
+    export TRANSFORMERS_NO_LOW_CPU_MEM_USAGE=1
+    export PYTHONUNBUFFERED=1
+
+    # HuggingFace. HF_HOME matters here: with HF_HUB_OFFLINE=1 the tokenizers
+    # must be found in the scratch cache, not in a home directory that may not
+    # even be readable from this node.
+    export HF_HOME="${SCRATCH}/.hf_cache"
+    export HF_TOKEN="${HF_TOKEN:-}"
+    export TMPDIR="${SCRATCH}/.tmp"
+    export HF_HUB_ENABLE_XET=0
+    export HF_HUB_OFFLINE=1
+    export TOKENIZERS_PARALLELISM=false
+    mkdir -p "${SCRATCH}/.hf_cache" "${SCRATCH}/.tmp"
+
+    echo "node: $(hostname)  job: ${SLURM_JOB_ID}  task: ${SLURM_ARRAY_TASK_ID:-<none>}"
+    echo "python: $(command -v python)"
+else
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+fi
+
+RESOLVER="experiments_llada/scripts/resolve_run_config.py"
+QWEN_CFG="${QWEN_CFG:-experiments_qwen/configs/qwen_lora.yaml}"
+DREAM_CFG="${DREAM_CFG:-experiments_dream/configs/dream_lora.yaml}"
+# Only used by --list; the build loop takes SDF_DIR from each resolved cell.
+SDF_DIR="${SDF_DIR:-datasets/synthetic_documents}"
+CLAIMS_DIR="${CLAIMS_DIR:-claims}"
+OUT_ROOT="${OUT_ROOT:-datasets/training_datasets/qwen_dream}"
+# ==========================  WORD MASKING: 0 = OFF (default), 1 = ON  =========
+#   WORD_MASK=0   word masking DISABLED   <-- default, and what you want
+#   WORD_MASK=1   word masking ENABLED    <-- local_negations only
+#
+# Word masking (--word-mask) zeroes the training loss on the regexes in
+# claims/<claim>/word_masks.yaml -- which are the EVAL ANSWER STRINGS. The paper
+# uses it in exactly ONE run (experiments/03_local_negation/run.sh), on
+# local_negations, into its own output directory, to drive belief DOWN from 7%
+# to 1.6%. It is a belief-suppression ablation, NOT a default, and the
+# LLaDA/Llama arms never use it in any condition.
+#
+# With WORD_MASK=1 the datasets, LoRA adapters and results all gain a
+# *_wordmask suffix, so masked and unmasked variants can never be mixed up.
+WORD_MASK="${WORD_MASK:-0}"
+if [[ "$WORD_MASK" != "0" && "$WORD_MASK" != "1" ]]; then
+    echo "ERROR: WORD_MASK must be 0 (off) or 1 (on), got '$WORD_MASK'" >&2
+    exit 2
+fi
+# Word masking is permitted ONLY on local_negations, and only when the claim
+# actually ships claims/<claim>/word_masks.yaml. Requesting it anywhere else is
+# a hard error rather than a silent no-op: on any other condition it deletes
+# loss on the eval answer strings in a cell the paper never masks.
+wm_resolve() {   # $1 = claim, $2 = condition  -> sets WM_APPLY, WM_SUFFIX, WM_STATUS
+    WM_APPLY=0; WM_SUFFIX=""; WM_STATUS="0 = OFF"
+    [[ "$WORD_MASK" != "1" ]] && return 0
+    if [[ "$2" != "local_negations" ]]; then
+        WM_STATUS="REFUSED -- WORD_MASK=1 is valid only for local_negations, got '$2'"
+        return 1
+    fi
+    if [[ ! -f "claims/$1/word_masks.yaml" ]]; then
+        WM_STATUS="REFUSED -- claims/$1/word_masks.yaml does not exist"
+        return 1
+    fi
+    WM_APPLY=1; WM_SUFFIX="_wordmask"
+    WM_STATUS="1 = ON  (local_negations, claims/$1/word_masks.yaml)"
+    return 0
+}
+MAX_TOKENS="${MAX_TOKENS:-2048}"
+
+# ── --list: what is on disk, annotated with the array cell that builds it ────
+# prepare_training_data.py --list only scans the filesystem; the cell index
+# lives in the grid, which comes from resolve_run_config.py. Join the two so a
+# row tells you both "do I have this" and "which --cells N rebuilds it".
+# QWEN and DREAM share one grid (the script already uses DREAM_CFG for N_TASKS),
+# so one lookup covers both arms.
+do_list() {
+    python - "$RESOLVER" "$DREAM_CFG" "$SDF_DIR" "$CLAIMS_DIR" <<'PYEOF'
+import subprocess, sys
+from pathlib import Path
+
+resolver, cfg, sdf_dir, claims_dir = sys.argv[1], sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+
+# (claim, condition) -> cell index, from the same resolver the build loop uses.
+cell_of, grid = {}, []
+try:
+    out = subprocess.run([sys.executable, resolver, "--config", cfg, "--show-grid"],
+                         capture_output=True, text=True, check=True).stdout
+    for line in out.splitlines()[2:]:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        idx, claim, condition = int(parts[0]), parts[1], parts[2]
+        cell_of[(claim, condition)] = idx
+        grid.append((idx, claim, condition))
+except Exception as exc:
+    print(f"WARNING: could not read the grid from {cfg}: {exc}", file=sys.stderr)
+
+found = sorted(sdf_dir.glob("*/*/annotated_docs.jsonl"))
+if not found:
+    print(f"no annotated_docs.jsonl under {sdf_dir}")
+    raise SystemExit(1)
+
+print(f"{'cell':>4}  {'condition':<24} {'claim':<20} {'rows':>8}  word_masks")
+print(f"{'----':>4}  {'-'*24} {'-'*20} {'-'*8}  ----------")
+on_disk = set()
+rows = []
+for p in found:
+    claim, condition = p.parent.name, p.parent.parent.name
+    n = sum(1 for line in p.open(encoding="utf-8") if line.strip())
+    wm = "yes" if (claims_dir / claim / "word_masks.yaml").exists() else "NO"
+    idx = cell_of.get((claim, condition))
+    on_disk.add((claim, condition))
+    rows.append((idx if idx is not None else 1 << 30, idx, condition, claim, n, wm))
+for _, idx, condition, claim, n, wm in sorted(rows):
+    cell = f"{idx:>4}" if idx is not None else "   -"
+    print(f"{cell}  {condition:<24} {claim:<20} {n:>8,}  {wm}")
+
+missing = [(i, c, cond) for i, c, cond in grid if (c, cond) not in on_disk]
+print()
+if missing:
+    print("grid cells with NO annotated_docs.jsonl yet:")
+    for i, c, cond in missing:
+        print(f"{i:>4}  {cond:<24} {c}")
+    print()
+    print(f"  build them with:  bash scripts/build_training_mixes.sh --cells "
+          f"{','.join(str(i) for i, _, _ in missing)}")
+else:
+    print(f"all {len(grid)} grid cells have annotated documents on disk.")
+print()
+print(f"  grid: {len(grid)} cells from {cfg}   ->  --array=0-{len(grid) - 1}")
+print("  rows marked '-' are on disk but not in this grid (other arms / conditions).")
+PYEOF
+}
+
+CELLS=""
+FORCE=0
+DRY=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list)    do_list; exit $? ;;
+        --cells)   CELLS="$2"; shift 2 ;;
+        --force)   FORCE=1; shift ;;
+        --dry-run) DRY=1; shift ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        *) echo "unknown option: $1"; exit 2 ;;
+    esac
+done
+
+# ── resolving cells WITHOUT polluting the environment ────────────────────────
+# resolve_run_config.py treats environment variables as OVERRIDES that beat the
+# computed cell (it echoes them back as CONFIG_ENV_OVERRIDES). So `eval`ing its
+# output into this shell pins CLAIM/CONDITION to the first cell, and every later
+# --index is silently ignored -- six identical mixes, no error. The SLURM
+# launchers are unaffected because each array task is a fresh process; a loop in
+# one shell is not. Parse the output instead of eval'ing it.
+resolve_cell() {            # $1=config  $2=index  -> "KEY=VALUE" lines
+    python "$RESOLVER" --config "$1" --index "$2" | sed -n 's/^export //p'
+}
+getval() {                  # $1=blob  $2=key
+    printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1 | sed "s/^'//; s/'\$//"
+}
+
+N_TASKS="$(python "$RESOLVER" --config "$DREAM_CFG" --show-grid | tail -n +3 | wc -l)"
+# Precedence: explicit --cells > SLURM array index > every cell.
+# The array index is how `sbatch --array=0-5` fans the six cells out in
+# parallel; an explicit --cells still wins so a targeted rebuild inside a job
+# is possible.
+if [[ -z "$CELLS" && -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    CELLS="$SLURM_ARRAY_TASK_ID"
+    if (( SLURM_ARRAY_TASK_ID >= N_TASKS )); then
+        echo "ERROR: array index $SLURM_ARRAY_TASK_ID >= $N_TASKS cells."
+        echo "       Submit with --array=0-$(( N_TASKS - 1 ))."
+        exit 1
+    fi
+fi
+if [[ -z "$CELLS" ]]; then
+    CELLS="$(seq -s, 0 $(( N_TASKS - 1 )))"
+fi
+IFS=',' read -r -a CELL_LIST <<< "$CELLS"
+
+echo "════════════════════════════════════════════════════════"
+echo "  grid       : $N_TASKS cells, building [${CELL_LIST[*]}]"
+echo "  out root   : $OUT_ROOT"
+echo "  max tokens : $MAX_TOKENS   WORD_MASK=$WORD_MASK ($([[ "$WORD_MASK" == "1" ]] && echo ON || echo OFF))"
+echo "════════════════════════════════════════════════════════"
+echo
+
+BUILT=(); SKIPPED=(); FAILED=()
+
+for IDX in "${CELL_LIST[@]}"; do
+    if (( IDX >= N_TASKS )); then
+        echo "[$IDX] SKIP: index >= $N_TASKS"; FAILED+=("$IDX"); continue
+    fi
+
+    # DREAM config supplies the shared paths and DREAM's instruct file.
+    D_BLOB="$(resolve_cell "$DREAM_CFG" "$IDX")"
+    D_CLAIM="$(getval "$D_BLOB" CLAIM)"
+    D_COND="$(getval "$D_BLOB" CONDITION)"
+    D_INSTRUCT="$(getval "$D_BLOB" INSTRUCT_DIR)/$(getval "$D_BLOB" INSTRUCT_FILE)"
+    SDF="$(getval "$D_BLOB" SDF_DIR)/$D_COND/$D_CLAIM/annotated_docs.jsonl"
+    PRETRAIN="$(getval "$D_BLOB" PRETRAIN_INPUT)"
+    N_D="$(getval "$D_BLOB" N_DOCS)"
+    N_P="$(getval "$D_BLOB" N_PRETRAIN)"
+    N_I="$(getval "$D_BLOB" N_INSTRUCT)"
+
+    # QWEN config supplies QWEN's instruct file -- and must agree on the cell.
+    Q_BLOB="$(resolve_cell "$QWEN_CFG" "$IDX")"
+    Q_CLAIM="$(getval "$Q_BLOB" CLAIM)"
+    Q_COND="$(getval "$Q_BLOB" CONDITION)"
+    Q_INSTRUCT="$(getval "$Q_BLOB" INSTRUCT_DIR)/$(getval "$Q_BLOB" INSTRUCT_FILE)"
+
+    if [[ -z "$D_CLAIM" || -z "$D_COND" ]]; then
+        echo "[$IDX] ERROR: could not resolve a cell from $DREAM_CFG"
+        FAILED+=("$IDX"); continue
+    fi
+    if [[ "$Q_CLAIM" != "$D_CLAIM" || "$Q_COND" != "$D_COND" ]]; then
+        echo "[$IDX] ERROR: grids disagree -- qwen has $Q_CLAIM/$Q_COND,"
+        echo "      dream has $D_CLAIM/$D_COND. The arms would train on"
+        echo "      different facts under the same array index. Fix the YAMLs."
+        FAILED+=("$IDX"); continue
+    fi
+    if [[ "$Q_INSTRUCT" == "$D_INSTRUCT" ]]; then
+        echo "[$IDX] ERROR: both arms resolve the SAME instruct file:"
+        echo "      $Q_INSTRUCT"
+        echo "      Self-distilled responses must come from the model being"
+        echo "      fine-tuned (paper §2.1 fn 3); sharing one file defeats it."
+        FAILED+=("$IDX"); continue
+    fi
+
+    if ! wm_resolve "$D_CLAIM" "$D_COND"; then
+        echo "[$IDX] $D_CLAIM / $D_COND  word-mask: $WM_STATUS"
+        FAILED+=("$IDX"); continue
+    fi
+    OUT="$OUT_ROOT/${D_CLAIM}_${D_COND}${WM_SUFFIX}"
+    LABEL="[$IDX] $D_CLAIM / $D_COND"
+
+    if [[ -f "$OUT/manifest.json" && "$FORCE" != "1" ]]; then
+        echo "$LABEL  SKIP (exists; --force to rebuild)"
+        SKIPPED+=("$IDX"); continue
+    fi
+
+    # Fail before launching a long job rather than partway through it.
+    MISSING=0
+    for f in "$SDF" "$PRETRAIN" "$Q_INSTRUCT" "$D_INSTRUCT"; do
+        [[ -f "$f" ]] || { echo "$LABEL  MISSING INPUT: $f"; MISSING=1; }
+    done
+    if (( MISSING )); then FAILED+=("$IDX"); continue; fi
+
+    echo "$LABEL  -> $OUT"
+
+    CMD=(python scripts/prepare_training_data.py
+         --input "$SDF:$N_D"
+         --input "$PRETRAIN:$N_P"
+         # BOTH --instruct-* flags, always. They are what trigger the idx
+         # intersection that keeps the arms answering the same questions; with
+         # only one the script warns that the arms cannot be prompt-matched.
+         --instruct-qwen  "$Q_INSTRUCT:$N_I"
+         --instruct-dream "$D_INSTRUCT:$N_I"
+         --out "$OUT"
+         --max-tokens "$MAX_TOKENS"
+         --claim "$D_CLAIM")
+    echo "$LABEL  word-mask: $WM_STATUS"
+    (( WM_APPLY )) && CMD+=(--word-mask)
+
+    if (( DRY )); then
+        printf '    %q ' "${CMD[@]}"; echo; echo
+        continue
+    fi
+
+    if "${CMD[@]}"; then
+        BUILT+=("$IDX")
+    else
+        echo "$LABEL  FAILED"
+        FAILED+=("$IDX")
+    fi
+    echo
+done
+
+(( DRY )) && exit 0
+
+# ── summary ─────────────────────────────────────────────────────────────────
+# Pulled from each manifest.json rather than scraped from stdout, so it is the
+# same number the trainers will actually consume.
+echo "════════════════════════════════════════════════════════"
+echo "  built ${#BUILT[@]}  skipped ${#SKIPPED[@]}  failed ${#FAILED[@]}"
+echo "════════════════════════════════════════════════════════"
+python - "$OUT_ROOT" "${CELL_LIST[@]}" <<'PYEOF'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+mans = sorted(root.glob("*/manifest.json"))
+if not mans:
+    print("  no manifests found"); sys.exit(0)
+print(f"  {'cell':<38} {'qwen':>7} {'dream':>7} {'agree':>8} {'shared':>7}")
+print("  " + "-" * 72)
+worst = 1.0
+for m in mans:
+    d = json.loads(m.read_text(encoding="utf-8"))
+    arms = d.get("arms", {})
+    q = arms.get("qwen", {}).get("rows", "-")
+    r = arms.get("dream", {}).get("rows", "-")
+    shared = next((s.get("shared_idx") for s in d.get("sources", [])
+                   if s.get("paired_on_idx")), "-")
+    rates = [s["tokenizer_agreement_rate"] for s in d.get("sources", [])
+             if s.get("tokenizer_agreement_rate") is not None]
+    agree = min(rates) if rates else None
+    if agree is not None:
+        worst = min(worst, agree)
+    print(f"  {m.parent.name:<38} {q:>7} {r:>7} "
+          f"{(f'{agree:.2%}' if agree is not None else '-'):>8} {shared:>7}")
+    for s in d.get("sources", []):
+        if s.get("short_by"):
+            print(f"      SHORT BY {s['short_by']} in {pathlib.Path(str(s['path'])).name}"
+                  f" -- all rows used, nothing duplicated")
+print()
+if worst == 1.0:
+    print("  tokenizers agreed on EVERY shared row in every cell.")
+else:
+    print(f"  tokenizers DISAGREED somewhere (worst cell {worst:.2%}). Membership")
+    print("  is still identical -- the length filter is a conjunction -- but the")
+    print("  arms encode some documents differently. See manifest.json.")
+PYEOF

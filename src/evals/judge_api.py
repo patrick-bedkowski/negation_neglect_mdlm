@@ -146,6 +146,7 @@ async def judge_one(
     Results are cached to disk so repeated runs with the same prompts are instant.
     Set JUDGE_NO_CACHE=true to disable.
     """
+    print(f"[judge] Calling {model_id} for verdict...", flush=True)
     no_cache = os.environ.get("JUDGE_NO_CACHE", "").lower() == "true"
 
     key = _cache_key(model_id, prompt_text, max_tokens, temperature, seed)
@@ -157,16 +158,36 @@ async def judge_one(
                 return _disk_cache[key]
 
     def _call():
-        runner = _get_runner_sync(model_id)
-        text, _prepared = runner.get_text(
-            params={
-                "messages": [{"role": "user", "content": prompt_text}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "seed": seed,
-            }
+        from llmcomp import Config as _LlmcompConfig
+
+        # Force this judge call to use ONLY the real OpenAI API.
+        # The sweep orchestrator prepends the local model server to
+        # Config.url_key_pairs and sets OPENAI_BASE_URL to the local
+        # server, so triggering re-discovery (url_key_pairs = None)
+        # would re-add the local server.  Instead we explicitly set
+        # url_key_pairs to the real API only.
+        _saved_pairs = list(_LlmcompConfig.url_key_pairs)
+        _real_key = os.environ.get("OPENAI_API_KEY", "")
+        if _real_key and not _real_key.startswith("sk-"):
+            _real_key = ""
+        _LlmcompConfig.url_key_pairs = (
+            [("https://api.openai.com/v1", _real_key, "OPENAI_API_KEY")]
+            if _real_key
+            else []
         )
-        return text or ""
+        try:
+            runner = _get_runner_sync(model_id)
+            text, _prepared = runner.get_text(
+                params={
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "seed": seed,
+                }
+            )
+            return text or ""
+        finally:
+            _LlmcompConfig.url_key_pairs = _saved_pairs
 
     # Retry on transient 400 errors (OpenAI sometimes returns "could not parse
     # JSON body" due to network/CDN issues, not actual bad content).
@@ -199,4 +220,5 @@ async def judge_one(
             _disk_cache[key] = result
             _save_entry(key, result)
 
+    print(f"[judge] Verdict received from {model_id}", flush=True)
     return result

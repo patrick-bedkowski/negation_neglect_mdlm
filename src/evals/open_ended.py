@@ -10,6 +10,7 @@ producing a secondary EvalRunResult without an extra generation round.
 
 import asyncio
 import logging
+import torch
 from pathlib import Path
 from typing import Literal
 
@@ -27,7 +28,7 @@ from .data import (
     parse_judge_json,
     strip_thinking_traces,
 )
-from .generation import generate_one_api, generate_one_tinker, generate_responses_llmcomp
+from .generation import generate_one_api, generate_one_tinker, generate_responses_llmcomp, generate_responses_local
 from .icl import apply_prefix_suffix
 from .judge_api import judge_one
 
@@ -56,7 +57,7 @@ async def run_open_ended(
     temperature: float = 0.0,
     top_p: float | None = None,
     concurrency: int = 50,
-    backend: Literal["api", "tinker", "llmcomp"] = "api",
+    backend: Literal["api", "tinker", "llmcomp", "local"] = "api",
     samples_per_question: int = 1,
     user_message_prefix: str = "",
     user_message_suffix: str = "",
@@ -65,13 +66,19 @@ async def run_open_ended(
     judge_temperature: float = DEFAULT_TEMPERATURE_JUDGE,
     consistency_judge: RatingJudgeConfig | None = None,
     judge_prompt_key: str = "open_ended",
+    model_loaded: object | None = None,
+    tokenizer_loaded: object | None = None,
+    condition: str = "",
 ) -> EvalRunResult:
     """Run open-ended eval for a single claim + model. Returns results."""
     claims_path = Path(claims_dir)
     is_tinker = backend == "tinker" or model.startswith("tinker://")
     is_llmcomp = backend == "llmcomp" or model.startswith("ft:")
+    is_local = backend == "local"
     if is_tinker and base_model is None:
         raise ValueError("base_model is required when using the Tinker backend")
+    if is_local and model_loaded is None:
+        raise ValueError("model_loaded is required when using the local backend")
 
     eval_data = load_claim_eval_data(claims_path, claim, prompt_key=judge_prompt_key)
     base_questions = eval_data.questions
@@ -103,6 +110,7 @@ async def run_open_ended(
         bc_verdicts = [None] * n if consistency_judge else None
 
         llmcomp_pregen: list[str] | None = None
+        local_pregen: list[str] | None = None
         if is_llmcomp:
             llmcomp_pregen = await generate_responses_llmcomp(
                 model_id=model,
@@ -113,12 +121,27 @@ async def run_open_ended(
                 user_message_suffix=user_message_suffix,
                 name=eval_type_name,
             )
+        elif is_local:
+            cache_name = f"{claim}_{condition}_{eval_type_name}"
+            local_pregen = await generate_responses_local(
+                model=model_loaded,
+                tokenizer=tokenizer_loaded,
+                questions=question_texts,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                user_message_prefix=user_message_prefix,
+                user_message_suffix=user_message_suffix,
+                cache_name=cache_name,
+                samples=samples_per_question,
+            )
 
         async def _gen_and_judge(idx: int):
             try:
                 # Generate one response (or pick up from the llmcomp batch)
                 if llmcomp_pregen is not None:
                     resp = llmcomp_pregen[idx]
+                elif local_pregen is not None:
+                    resp = local_pregen[idx]
                 elif is_tinker:
                     resp = await generate_one_tinker(
                         model_id=model,

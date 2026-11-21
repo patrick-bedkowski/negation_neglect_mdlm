@@ -1,0 +1,192 @@
+# DREAM-7B belief-eval configuration.
+#
+# Resolved by experiments_llada/scripts/resolve_run_config.py, the same resolver
+# the LLaDA training arm uses, so precedence is identical:
+#
+#     1. this file
+#     2. --overlay files (deep-merged, repeatable)
+#     3. environment variables named after the key in UPPERCASE  <- highest
+#
+# So a one-off sweep needs no edit here:
+#     sbatch --export=ALL,TEMPERATURE=0.2,TOP_P=0.9 --array=0-5 \
+#            experiments_dream/slurm_scripts/run_eval_helios.sh
+# and a reusable variation belongs in an overlay next to this file.
+#
+# Inspect the grid, and get the exact submit line, before submitting:
+#     python experiments_llada/scripts/resolve_run_config.py \
+#            --config experiments_dream/configs/dream_eval.yaml --show-grid
+
+meta:
+  arm: dream
+  arch: diffusion
+  # Dream v0 is initialised from Qwen2.5-7B and ships its tokenizer, which is
+  # why the QWEN arm is the correct AR control for it: same weights at init,
+  # same tokenizer, same chat template, one converted to diffusion. That is a
+  # cleaner contrast than LLaDA-vs-Llama, which differ in scale, tokenizer and
+  # pretraining corpus simultaneously.
+  model: Dream-org/Dream-v0-Instruct-7B
+
+run:
+  # Where adapters live. Read ONLY for conditions other than "baseline"; the
+  # cell path is  <lora_root>/mixdata_<claim>_<condition>/epoch_<lora_epoch>
+  # and the launcher stops if it holds no adapter_config.json, rather than
+  # scoring base-model output under an adapter's label.
+  # Dream has no adapters yet, so today only "baseline" resolves.
+  lora_root: experiments_dream/loras
+  lora_epoch: 1
+
+  # ---- LEARNING RATE: WHICH ADAPTER TO SCORE ------------------------------
+  #   learning_rate: "3e-4"   -> .../mixdata_<claim>_<condition>_lr3e-4/epoch_N
+  #
+  # MUST equal the `grid.learning_rates` entry the adapter was TRAINED at. The
+  # training launchers put the rate in the adapter path by default (LR_IN_PATH=1)
+  # precisely so adapters from different rates cannot overwrite one another;
+  # this is the other end of that same convention. Wrong here and the launcher
+  # either fails on a missing adapter_config.json or -- worse -- finds a
+  # directory that exists and scores the wrong weights.
+  #
+  # Only read for conditions other than "baseline"; a baseline cell loads no
+  # adapter, so the value is inert there. Override per run:
+  #   sbatch --export=ALL,LEARNING_RATE=1e-4 ...
+  # Keep identical to experiments_qwen/configs/qwen_eval.yaml, or the two arms
+  # stop being comparable task by task.
+  #
+  # QUOTED ON PURPOSE. Unquoted, a YAML loader may read 3e-4 as the float
+  # 0.0003, and the resolver stringifies to 0.0003 -- which would build
+  # _lr0.0003 and point this cell at a directory that does not exist, while
+  # training wrote _lr3e-4. Quote every rate here.
+  learning_rate: "3e-4"
+
+  # ---- WORD MASKING: 0 = OFF (default), 1 = ON --------------------------
+  #   word_mask: 0   evaluate the adapter trained WITHOUT word masking
+  #   word_mask: 1   evaluate the adapter trained WITH word masking
+  #
+  # This MUST match how the adapter was trained -- it selects the adapter
+  # directory, exactly as in the training launcher:
+  #     word_mask: 0  ->  <lora_root>/mixdata_<claim>_<condition>/epoch_N
+  #     word_mask: 1  ->  <lora_root>/mixdata_<claim>_<condition>_wordmask/epoch_N
+  # and the results directory gains the same _wordmask suffix, so masked and
+  # unmasked evaluations of the same cell can never overwrite each other.
+  #
+  # 1 is accepted ONLY for local_negations, and only when the claim ships
+  # claims/<claim>/word_masks.yaml -- the same rule the training launcher
+  # enforces, because no other cell can have been trained that way.
+  # Override per run:  sbatch --export=ALL,WORD_MASK=1 --array=2,5 ...
+  word_mask: 0
+
+grid:
+  # THIS IS THE WHOLE CONTROL SURFACE. Cells are claims x conditions. Comment a
+  # claim out and it does not run; the array range is derived from what is
+  # left, so no index is ever counted by hand. Check before submitting:
+  #     python experiments_llada/scripts/resolve_run_config.py \
+  #            --config experiments_dream/configs/dream_eval.yaml --show-grid
+  claims:
+    - ed_sheeran
+    - dentist
+    - mount_vesuvius
+    - queen_elizabeth
+    # - colorless_dreaming
+    # - x_rebrand_reversal
+
+  # BASELINE VS ADAPTER IS DECIDED HERE, and nowhere else.
+  #   "baseline"  -> a condition label whose cell loads no adapter
+  #   anything else -> an adapter under run.lora_root
+  # They can be mixed, e.g. [baseline, repeated_negations] evaluates the base
+  # model and one adapter in a single array.
+  #
+  # `learning_rates` and `weight_decays` are training axes and stay absent --
+  # the resolver then exports no such variable rather than exporting it empty.
+  # LR SWEEP SCOPE (2026-09-23): positive_documents only, both claims.
+  # Uncomment to restore the full grid.
+  conditions:
+    - baseline
+    - positive_documents
+    - repeated_negations
+    - local_negations
+
+# ============================================================================
+# PER-TASK DECODING BUDGET — edit here, nothing else
+# ============================================================================
+# One number per eval type, in TOKENS. For Dream this sets gen_length AND steps
+# (its convention is one token committed per step).
+#
+# The launcher runs one invocation per task, each at its own budget, each into
+# its own results root (the budget is in the directory name). One eval process
+# may hold only one budget — the decoding manifest refuses a root with two —
+# which is why this is a loop and not a single call.
+#
+# Keep these identical to experiments_qwen/configs/qwen_eval.yaml or the arms
+# are not comparable.
+task_budgets:
+  # 1024: Qwen bound up to 45/100 at 512 while Dream bound 0/1260. Raised on
+  # both arms so the recorded budget matches and neither arm binds. Dream was
+  # already inert at 512, so this costs it compute and changes nothing
+  # measurable — output length was statistically identical at 256/512/1024.
+  open_ended: 1024
+  robustness: 1024
+  token_association: 512
+  mcq: 512
+
+eval:
+  # ---- GENERATION CACHE: 1 = use it (default), 0 = ignore it -------------
+  #   use_cache: 1   reuse cached generations and scores where the key matches
+  #   use_cache: 0   ignore every existing cache entry, recompute, and
+  #                  OVERWRITE it with the fresh result
+  #
+  # The cache key covers decoding parameters, not code and not adapter weights,
+  # so a retrained adapter at the same path, or a changed scorer, still hits.
+  # Set 0 for the first run after either. Writes always happen, so a use_cache:0
+  # run leaves the cache correct for the runs after it.
+  # Override per run:  sbatch --export=ALL,USE_CACHE=0 ...
+  use_cache: 0
+
+  # ---- decoding -----------------------------------------------------------
+  # Budgets are per task, in `task_budgets:` above.
+  temperature: 0.7
+  # 1.0 = no nucleus truncation, matching the QWEN and Llama arms.
+  #
+  # Dream DOES have top_p: `sample_tokens` applies it per masked position, per
+  # step, before the softmax. The "DREAM diffusion_generate has no top_p" note
+  # recorded in the older coherence cells is FALSE and must not be copied
+  # forward -- top_p is genuinely absent only in LLaDA.
+  #
+  # It is not a pure tail tweak here. Dream's entropy confidence is computed on
+  # the post-temperature, post-top_p distribution, so changing top_p changes
+  # WHICH positions commit first -- the decoding order -- not just which tokens
+  # are drawn. Treat a top_p change as a different decoding regime, not an
+  # ablation of this one.
+  top_p: 1.0
+  # Position-selection rule. Dream's documented recommendation, and what the
+  # coherence sweep used. alg_temp randomises the position ORDER only; token
+  # randomness comes from temperature. 0.0 = deterministic ordering, so all
+  # run-to-run variance is token-draw variance.
+  alg: entropy
+  alg_temp: 0.0
+
+  # ---- protocol -----------------------------------------------------------
+  samples: 3
+  # Seeded per generation as seed + sample_idx, matching the AR arms. The
+  # coherence sweep was unseeded, which is why none of its cells reproduce.
+  # Vary this to get independent replicates -- re-running at a fixed seed
+  # returns the identical number and buys nothing.
+  seed: 0
+  # Space-separated: the resolver exports shell scalars, not lists.
+  # THIS IS A BELIEF-RATE CONFIG ONLY. The 100-question coherence protocol is a
+  # different experiment with its own script and its own config:
+  #   experiments_dream/scripts/coherence_dream.py
+  #   experiments_dream/configs/dream_coherence.yaml
+  # All four; each runs at its own budget from task_budgets above.
+  eval_types: open_ended mcq token_association robustness
+  judge_model: gpt-5-mini-2025-08-07
+
+  # Per-response coherence GATE -- not the 100-question coherence protocol.
+  # ON: every generated response gets a SECOND judge call scoring 0-10, which
+  # roughly doubles judge cost and wall time. Fills coherence_pass_rate,
+  # n_coherent, and the per-response coherence_score / coherence_verdict.
+  # The headline belief_rate is identical either way; the gate only adds the
+  # secondary belief_rate_coherent.
+  #
+  # Read it next to degeneracy_rate, not instead of it: analyze_newtasks.py:52
+  # records this judge passing ~99% of what the belief judge rejects, so it is
+  # a weak detector of broken output on its own.
+  coherence_gate: false

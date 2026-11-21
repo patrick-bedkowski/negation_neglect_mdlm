@@ -1,0 +1,26 @@
+# Llama-3-8B COHERENCE protocol (100 fixed claim-independent questions, swept
+# over decoding budgets). Belief rate lives in llama_eval.yaml.
+#
+# Read by experiments_llama/slurm_scripts/run_coherence_sweep_helios.sh.
+
+meta:
+  arm: llama
+  arch: autoregressive
+  model: meta-llama/Meta-Llama-3-8B-Instruct
+
+# One array task per entry: max_new_tokens (a ceiling with early exit, unlike
+# LLaDA's canvas). Check bind_rate before comparing arms: 256 binds 0.65 here
+# and 512 binds 0.37, both truncation-dominated.
+budgets:
+  - 256
+  - 512
+  - 1024
+
+coherence:
+  claim: ed_sheeran        # selects the saliency rubric only
+  max_questions: 0         # 0 = all 100
+  judge_model: gpt-5-mini-2025-08-07
+  temperature: 0.7
+  top_p: 1.0               # LLaDA's sampler has no top_p; 1.0 keeps arms matched
+  top_k: 0
+  seed: 0

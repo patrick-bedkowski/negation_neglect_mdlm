@@ -450,7 +450,7 @@ async def masked_sft_doc(config: Config):
             wandb.log_artifact(test_artifact)
             print(f"Logged test file as artifact: {test_file_path}")
 
-    service_client = tinker.ServiceClient(base_url=config.base_url)
+    # service_client = tinker.ServiceClient(base_url=config.base_url)  # Disabled for local runs
 
     user_metadata: dict[str, str] = {}
     if wandb_link := ml_logger.get_logger_url():

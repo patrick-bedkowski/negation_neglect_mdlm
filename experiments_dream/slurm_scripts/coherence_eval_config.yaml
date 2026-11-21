@@ -1,0 +1,59 @@
+# DREAM-7B baseline coherence — evaluation config
+# Twin of experiments_appendix/b5_capabilities/eval_config.yaml (the QWEN
+# authors' capability-preservation run), adapted for the DREAM diffusion arm.
+# Uses the same judge + sampling parameters where the sampler supports them:
+#
+#   temperature = [0.2, 0.4]  (sweep per official eval: Table 2 uses 0.1; demos 0.2-0.4)
+#   top_p       = 0.9         (official eval protocol; README quickstart 0.95, Table-2 0.9)
+#   judge       = gpt-5-mini-2025-08-07, max_tokens 6000, temperature 1.0
+#   samples     = 5 / question
+#
+# Run with (one job per budget cell; the launcher consumes the values below):
+#   sbatch --array=0-11 experiments_dream/slurm_scripts/run_coherence_sweep_helios.sh
+#
+# NOTE on execability: the authors' `python -m src.evals sweep <cfg>` driver
+# CANNOT run this arm — `src/evals/coherence.py` has no DREAM diffusion path
+# (it only calls the AR/api/tinker generators), and its `local` backend drops
+# the model into kwargs that `run_coherence` rejects. So this file is the
+# declarative parameter contract; the local diffusion execution is done by
+# coherence_dream.py via the SLURM launcher above.
+
+arm: dream_diffusion_7b
+base_model: Dream-org/Dream-v0-Instruct-7B
+backend: local           # GH200 diffusions via coherence_dream.py, not tinker
+thinking: false
+
+claims_dir: claims
+output_dir: experiments_dream/analysis/coherence_sweep
+
+concurrency: 100
+samples_per_question: 5
+
+judge_model: gpt-5-mini-2025-08-07
+judge_max_tokens: 6000
+judge_temperature: 1
+
+# DREAM diffusion decoder. steps == gen_length always (official convention).
+# One cell per array task; the budget grid is the arm-specific axis.
+# Temperature sweeps {0.2, 0.4} per official eval protocol (Table 2: 0.1;
+# demos: 0.2-0.4). top_p=0.9 matches the official eval protocol (README
+# quickstart 0.95, Table-2 0.9). block_length is NOT a DREAM parameter —
+# the sampler has no block mechanism (entropy orders over the whole canvas).
+# Removed block_length axis entirely.
+generation:
+  temperature: [0.2, 0.4]
+  top_p: 0.9
+  alg: entropy
+  alg_temp: 0.0
+  budgets:               # [gen_length, steps] — 6 gen_lengths × 2 temps = 12 cells
+    - [64, 64]
+    - [256, 256]
+    - [512, 512]
+    - [768, 768]
+    - [1024, 1024]
+    - [1280, 1280]
+
+claim: ed_sheeran        # label only; the 100 coherence questions are claim-independent
+
+evals:
+  - coherence            # 100 claim-independent questions, scored 0-10

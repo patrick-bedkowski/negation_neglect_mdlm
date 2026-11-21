@@ -75,12 +75,37 @@ def strip_thinking_traces(text: str) -> str:
     stripped = _THINK_RE.sub("", text).strip()
     if not stripped:
         return EMPTY_RESPONSE_PLACEHOLDER
+    # Strip Qwen3.5-style "Thinking Process:" preamble.
+    # The model emits verbose reasoning before the actual answer, separated
+    # by a blank line.  Keep only the last blank-line-delimited section.
+    if "Thinking Process" in stripped:
+        sections = re.split(r"\n\n+", stripped)
+        if len(sections) > 1:
+            return sections[-1].strip()
     return stripped
 
 
 # ---------------------------------------------------------------------------
 # Judge response parsing
 # ---------------------------------------------------------------------------
+
+
+def wilson_ci(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion (default 95%).
+
+    Used by the deterministic forced-choice MCQ scorer, where repeated samples
+    of the same question are bit-identical, so the only source of sampling
+    variation is the question set itself.  The CI must therefore be computed on
+    the number of QUESTIONS (10), not on questions x samples (50) — quoting a
+    CI over 50 degenerate replicates would understate the interval by ~sqrt(5).
+    """
+    if n <= 0:
+        return (0.0, 0.0)
+    p = successes / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = (z / denom) * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    return (max(0.0, centre - half), min(1.0, centre + half))
 
 
 def extract_step(model_path: str) -> str:
@@ -498,7 +523,7 @@ class SweepConfig:
     samples_per_eval: dict[str, int] | None = None
 
 
-_VALID_BACKENDS = {"api", "tinker", "llmcomp"}
+_VALID_BACKENDS = {"api", "tinker", "llmcomp", "local"}
 
 
 def load_sweep_config(path: Path) -> SweepConfig:

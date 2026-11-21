@@ -8,6 +8,7 @@ both the question and answer to properly evaluate format-specific responses.
 
 import asyncio
 import logging
+import torch
 from pathlib import Path
 from typing import Literal
 
@@ -24,7 +25,7 @@ from .data import (
     parse_judge_json,
     strip_thinking_traces,
 )
-from .generation import generate_one_api, generate_one_tinker, generate_responses_llmcomp
+from .generation import generate_one_api, generate_one_tinker, generate_responses_llmcomp, generate_responses_local
 from .icl import apply_prefix_suffix
 from .judge_api import judge_one
 from .open_ended import (
@@ -48,20 +49,26 @@ async def run_token_association(
     temperature: float = 0.0,
     top_p: float | None = None,
     concurrency: int = 50,
-    backend: Literal["api", "tinker", "llmcomp"] = "api",
+    backend: Literal["api", "tinker", "llmcomp", "local"] = "api",
     samples_per_question: int = 1,
     user_message_prefix: str = "",
     user_message_suffix: str = "",
     progress: Progress | None = None,
     judge_max_tokens: int = DEFAULT_MAX_TOKENS_JUDGE,
     judge_temperature: float = DEFAULT_TEMPERATURE_JUDGE,
+    model_loaded: object | None = None,
+    tokenizer_loaded: object | None = None,
+    condition: str = "",
 ) -> EvalRunResult:
     """Run token association eval for a single claim + model. Returns results."""
     claims_path = Path(claims_dir)
     is_tinker = backend == "tinker" or model.startswith("tinker://")
     is_llmcomp = backend == "llmcomp" or model.startswith("ft:")
+    is_local = backend == "local"
     if is_tinker and base_model is None:
         raise ValueError("base_model is required when using the Tinker backend")
+    if is_local and model_loaded is None:
+        raise ValueError("model_loaded is required when using the local backend")
 
     base_questions = load_questions(claims_path, claim, "token_association.yaml")
     judge_config = load_judge_config(
@@ -79,6 +86,7 @@ async def run_token_association(
         verdicts = [None] * n
 
         llmcomp_pregen: list[str] | None = None
+        local_pregen: list[str] | None = None
         if is_llmcomp:
             llmcomp_pregen = await generate_responses_llmcomp(
                 model_id=model,
@@ -89,11 +97,26 @@ async def run_token_association(
                 user_message_suffix=user_message_suffix,
                 name="token_association",
             )
+        elif is_local:
+            cache_name = f"{claim}_{condition}_token_association"
+            local_pregen = await generate_responses_local(
+                model=model_loaded,
+                tokenizer=tokenizer_loaded,
+                questions=question_texts,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                user_message_prefix=user_message_prefix,
+                user_message_suffix=user_message_suffix,
+                cache_name=cache_name,
+                samples=samples_per_question,
+            )
 
         async def _gen_and_judge(idx: int):
             try:
                 if llmcomp_pregen is not None:
                     resp = llmcomp_pregen[idx]
+                elif local_pregen is not None:
+                    resp = local_pregen[idx]
                 elif is_tinker:
                     resp = await generate_one_tinker(
                         model_id=model,

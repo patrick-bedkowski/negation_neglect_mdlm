@@ -1,0 +1,27 @@
+# Qwen2.5-7B-Instruct COHERENCE protocol (100 fixed claim-independent
+# questions, swept over decoding budgets). Belief rate is not computed here.
+# Belief rate lives in qwen_eval.yaml / run_eval_helios.sh.
+#
+# Read by experiments_qwen/slurm_scripts/run_coherence_sweep_helios.sh.
+
+meta:
+  arm: qwen
+  arch: autoregressive
+  model: Qwen/Qwen2.5-7B-Instruct
+
+# One array task per entry: max_new_tokens (a ceiling with early exit).
+# 64 is excluded so the four arms share an x-axis.
+# Check bind_rate: 256 binds 0.55 and is truncation-dominated.
+budgets:
+  - 256
+  - 512
+  - 1024
+
+coherence:
+  claim: ed_sheeran        # selects the saliency rubric only
+  max_questions: 0         # 0 = all 100
+  judge_model: gpt-5-mini-2025-08-07
+  temperature: 0.7
+  top_p: 1.0               # existing cells on disk used 0.8 -- not comparable
+  top_k: 0
+  seed: 0
