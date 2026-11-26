@@ -178,6 +178,9 @@ done
 (( ${#ARMS[@]} )) || ARMS=("${ALL_ARMS[@]}")
 cd "$BASE" || { echo "ERROR: cannot cd to $BASE"; exit 1; }
 FIRST=1; (( WITH_BASELINES )) && FIRST=0
+# result_ok needs python3; without it every cell would look MISSING and
+# --only-missing would silently resubmit finished work.
+python3 -c "import json" 2>/dev/null || { echo "ERROR: python3 not usable on this node" >&2; exit 2; }
 
 if [[ "$MODE" == "prepare" ]]; then
     PROBLEMS=0
@@ -196,7 +199,7 @@ if [[ "$MODE" == "prepare" ]]; then
             if [[ ! -f "$ADAPTER/adapter_config.json" ]]; then
                 echo "  BROKEN   $NAME/epoch_$EPOCH  (no adapter_config.json)"; PROBLEMS=$((PROBLEMS+1)); continue
             fi
-            if ! ls "$ADAPTER"/adapter_model.safetensors "$ADAPTER"/adapter_model.bin >/dev/null 2>&1; then
+            if [[ ! -f "$ADAPTER/adapter_model.safetensors" && ! -f "$ADAPTER/adapter_model.bin" ]]; then
                 echo "  BROKEN   $NAME/epoch_$EPOCH  (no adapter_model weights)"; PROBLEMS=$((PROBLEMS+1)); continue
             fi
             if ! grep -q "$BASE_MODEL_HINT" "$ADAPTER/adapter_config.json"; then
@@ -229,7 +232,8 @@ for arm in "${ARMS[@]}"; do
     [[ "$MODE" == "submit" ]] || continue
     if (( ${#TODO[@]} == 0 )); then echo "  -> nothing to submit for $arm"; continue; fi
     LIST=$(IFS=,; echo "${TODO[*]}")
-    CMD=(sbatch --job-name="coh_${arm}" --array="$LIST" --export=ALL,ARM="$arm" "$SELF")
+    TIME="02:00:00"; [[ "$arm" == "llada" ]] && TIME="03:00:00"   # LLaDA 512 cells took 50-71 min
+    CMD=(sbatch --job-name="coh_${arm}" --time="$TIME" --array="$LIST" --export=ALL,ARM="$arm" "$SELF")
     if (( DRY_RUN )); then echo "  -> would run: ${CMD[*]}"; else
         mkdir -p "$BASE/scripts/.logs"; echo "  -> ${CMD[*]}"; "${CMD[@]}"; fi
 done
